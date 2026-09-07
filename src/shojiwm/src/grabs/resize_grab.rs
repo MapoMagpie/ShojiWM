@@ -8,6 +8,7 @@ use crate::ssd::{
     WindowResizePhaseSnapshot, WindowResizePointSnapshot, WindowResizeSourceSnapshot,
 };
 use crate::state::ShojiWM;
+use crate::shoji_env;
 use smithay::{
     desktop::{Space, Window},
     input::pointer::{
@@ -28,7 +29,7 @@ use std::cell::RefCell;
 use tracing::info;
 
 fn managed_rect_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+    shoji_env::var_os("SHOJI_MANAGED_RECT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 

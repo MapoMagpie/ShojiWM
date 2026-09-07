@@ -33,6 +33,7 @@ use smithay::{
 use tracing::info;
 
 use crate::{backend::window::layer_surface_is_mapped, state::ShojiWM};
+use crate::shoji_env;
 
 const PRIMARY_OUTPUT_KEEP_WITHIN_PERCENT: i64 = 110;
 
@@ -194,28 +195,28 @@ fn synthetic_presented_states_for_window(window: &Window) -> RenderElementStates
 }
 
 fn frame_callback_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_FRAME_CALLBACK_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_FRAME_CALLBACK_DEBUG").is_some()
 }
 
 fn frame_liveness_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
+    shoji_env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn frame_throttle_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some()
 }
 
 fn scale_notify_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_SCALE_NOTIFY_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_SCALE_NOTIFY_DEBUG").is_some()
 }
 
 fn fifo_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_FIFO_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_FIFO_DEBUG").is_some()
 }
 
 fn mpv_frame_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 /// Returns the previous preferred scale for a surface (by protocol id), for change detection.

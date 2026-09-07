@@ -17,13 +17,14 @@ use smithay::{
 use tracing::{debug, info};
 
 use crate::state::{PendingLayerSurface, ShojiWM};
+use crate::shoji_env;
 
 fn layer_focus_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some()
 }
 
 fn layer_popup_root_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_LAYER_POPUP_ROOT_DEBUG")
+    shoji_env::var_os("SHOJI_LAYER_POPUP_ROOT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -227,7 +228,7 @@ pub fn handle_commit(state: &mut ShojiWM, surface: &WlSurface) {
                 "layer popup root debug: layer commit"
             );
         }
-        if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some()
+        if shoji_env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some()
             && let Some(geo) = layer_geo {
                 debug!(
                     owner = %owner,

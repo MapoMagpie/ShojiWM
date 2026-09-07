@@ -16,6 +16,7 @@ use tracing::{debug, info, trace, warn};
 use crate::backend::rounded::RoundedElementState;
 use crate::backend::visual::RectSnapMode;
 use crate::backend::visual::{inverse_transform_point, transformed_root_rect};
+use crate::shoji_env;
 
 /// Margin added on top of `closeAnimationDuration × 2` when deriving a
 /// closing snapshot's watchdog deadline; absorbs scheduler jitter around the
@@ -394,7 +395,7 @@ fn clip_debug_enabled() -> bool {
     use std::sync::OnceLock;
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SHOJI_CLIP_DEBUG").is_some())
+    *ENABLED.get_or_init(|| shoji_env::var_os("SHOJI_CLIP_DEBUG").is_some())
 }
 
 fn handler_debug_enabled() -> bool {
@@ -402,7 +403,7 @@ fn handler_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_SSD_HANDLER_DEBUG")
+        shoji_env::var_os("SHOJI_SSD_HANDLER_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -412,7 +413,7 @@ fn animation_timing_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
+        shoji_env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -422,7 +423,7 @@ fn managed_rect_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+        shoji_env::var_os("SHOJI_MANAGED_RECT_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -432,7 +433,7 @@ fn managed_rect_path_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_MANAGED_RECT_PATH_DEBUG")
+        shoji_env::var_os("SHOJI_MANAGED_RECT_PATH_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -442,8 +443,8 @@ fn runtime_dirty_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
-            .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
+        shoji_env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
+            .or_else(|| shoji_env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -453,7 +454,7 @@ fn minimize_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_MINIMIZE_DEBUG")
+        shoji_env::var_os("SHOJI_MINIMIZE_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -466,7 +467,7 @@ fn managed_animation_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_ANIMATION_DEBUG")
+        shoji_env::var_os("SHOJI_ANIMATION_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -476,7 +477,7 @@ fn hot_reload_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_HOT_RELOAD_DEBUG")
+        shoji_env::var_os("SHOJI_HOT_RELOAD_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -486,7 +487,7 @@ fn label_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_LABEL_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+        shoji_env::var_os("SHOJI_LABEL_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
 
@@ -579,8 +580,7 @@ fn animation_spike_threshold_ms() -> f64 {
 
     static THRESHOLD_MS: OnceLock<f64> = OnceLock::new();
     *THRESHOLD_MS.get_or_init(|| {
-        std::env::var("SHOJI_ANIMATION_SPIKE_THRESHOLD_MS")
-            .ok()
+        shoji_env::var("SHOJI_ANIMATION_SPIKE_THRESHOLD_MS")
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| *value > 0.0)
             .unwrap_or(12.0)
@@ -592,7 +592,7 @@ fn animation_gap_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_ANIMATION_GAP_DEBUG")
+        shoji_env::var_os("SHOJI_ANIMATION_GAP_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -8084,8 +8084,8 @@ fn label_preview(text: &str) -> String {
 }
 
 fn gap_debug_layout_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_LAYOUT_DEBUG").is_some()
-        || std::env::var_os("SHOJI_GAP_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_GAP_LAYOUT_DEBUG").is_some()
+        || shoji_env::var_os("SHOJI_GAP_DEBUG").is_some()
 }
 
 fn resolved_rect_right(rect: crate::ssd::ResolvedLogicalRect) -> f32 {

@@ -30,13 +30,15 @@ use smithay::{
 
 use crate::{
     grabs::{move_grab::MoveSurfaceGrab, resize_grab::ResizeSurfaceGrab},
+    shoji_env,
     ssd::{WindowMoveSourceSnapshot, WindowResizeSourceSnapshot},
     state::ShojiWM,
 };
 use tracing::{debug, info, warn};
 
 fn xdg_popup_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_XDG_POPUP_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_XDG_POPUP_DEBUG")
+        .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn mark_toplevel_metadata_dirty(
@@ -255,10 +257,16 @@ impl XdgShellHandler for ShojiWM {
         if !promoted
             && let Err(error) = self.close_window_in_runtime(
                 &window_id,
-                decoration.as_ref().map(|decoration| decoration.layout.root.rect),
+                decoration
+                    .as_ref()
+                    .map(|decoration| decoration.layout.root.rect),
             )
         {
-            warn!(window_id, ?error, "failed to report destroyed xdg toplevel to the runtime");
+            warn!(
+                window_id,
+                ?error,
+                "failed to report destroyed xdg toplevel to the runtime"
+            );
         }
         // Elect a successor now that the window is out of the space. Nothing
         // else on the close path touches keyboard focus, so the dead target
@@ -602,9 +610,7 @@ impl XdgShellHandler for ShojiWM {
             return;
         }
 
-        if can_receive_keyboard_focus
-            && let Some(keyboard) = keyboard.as_ref()
-        {
+        if can_receive_keyboard_focus && let Some(keyboard) = keyboard.as_ref() {
             keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
         }
         if let Some(pointer) = pointer.as_ref() {

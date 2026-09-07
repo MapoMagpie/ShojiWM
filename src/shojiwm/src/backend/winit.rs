@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use smithay::{
@@ -27,36 +28,42 @@ use tracing::{info, trace, warn};
 
 use crate::{
     ShojiWM,
-    backend::visual::{
-        WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
-        root_physical_origin, root_physical_origin_precise, transformed_root_rect,
-        window_visual_state,
+    backend::{
+        damage, damage_blink, decoration, snapshot,
+        visual::{
+            WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
+            root_physical_origin, root_physical_origin_precise, transformed_root_rect,
+            window_visual_state,
+        },
+        window as window_render,
     },
-    backend::{damage, damage_blink, decoration, snapshot, window as window_render},
     presentation::{take_presentation_feedback, update_primary_scanout_output},
+    shoji_env,
 };
 use smithay::wayland::presentation::Refresh;
 
 fn manual_invalidate_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_MANUAL_INVALIDATE_DEBUG")
+    shoji_env::var_os("SHOJI_MANUAL_INVALIDATE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn animation_timing_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
+    shoji_env::var_os("SHOJI_ANIMATION_TIMING_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn animation_spike_threshold_ms() -> f64 {
-    std::env::var("SHOJI_ANIMATION_SPIKE_THRESHOLD_MS")
-        .ok()
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| *value > 0.0)
-        .unwrap_or(12.0)
+    static THRESHOLD_MS: OnceLock<f64> = OnceLock::new();
+    *THRESHOLD_MS.get_or_init(|| {
+        shoji_env::var("SHOJI_ANIMATION_SPIKE_THRESHOLD_MS")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(12.0)
+    })
 }
 
 fn clipped_transform_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_CLIPPED_TRANSFORM_DEBUG")
+    shoji_env::var_os("SHOJI_CLIPPED_TRANSFORM_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -1391,7 +1398,7 @@ pub fn init_winit(
                                 .is_some_and(|decoration| decoration.managed_window.force_rect_size);
 
                             let client_elements = if let Some(content_clip) = content_clip {
-                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some()
+                                if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some()
                                     && let Some(decoration) = state.window_decorations.get(window) {
                                         let snapshot_title = decoration.snapshot.title.clone();
                                         let snapshot_app_id = decoration.snapshot.app_id.clone();
@@ -1480,8 +1487,8 @@ pub fn init_winit(
                                 })
                                 .unwrap_or_default();
                                 let bypass_clip =
-                                    std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some();
-                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                    shoji_env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some();
+                                if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                                     let first_geometry = clipped
                                         .first()
                                         .map(|element| match element {
@@ -1549,7 +1556,7 @@ pub fn init_winit(
                                         scale,
                                         visual_state.opacity,
                                     );
-                                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                                         let first_geometry = raw_elements.first().map(|element| {
                                             smithay::backend::renderer::element::Element::geometry(element, scale)
                                         });
@@ -1621,7 +1628,7 @@ pub fn init_winit(
                                         visual_state.opacity
                                     },
                                 );
-                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                                     let first_geometry = surfaces
                                         .first()
                                         .map(|element| smithay::backend::renderer::element::Element::geometry(element, scale));
@@ -2385,12 +2392,12 @@ fn transform_backdrop_elements(
         return elements
             .into_iter()
             .map(|element| {
-                let debug_label = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                let debug_label = if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                     Some(element.debug_label().to_string())
                 } else {
                     None
                 };
-                let pre_transform_geometry = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                let pre_transform_geometry = if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                     Some(smithay::backend::renderer::element::Element::geometry(
                         &element,
                         smithay::utils::Scale::from((1.0, 1.0)),
@@ -2428,12 +2435,12 @@ fn transform_backdrop_elements(
     elements
         .into_iter()
         .map(|element| {
-            let debug_label = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            let debug_label = if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                 Some(element.debug_label().to_string())
             } else {
                 None
             };
-            let pre_transform_geometry = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            let pre_transform_geometry = if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
                 Some(smithay::backend::renderer::element::Element::geometry(
                     &element,
                     smithay::utils::Scale::from((1.0, 1.0)),
@@ -2650,7 +2657,7 @@ fn backdrop_shader_elements_for_window(
                 },
             );
 
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
                 tracing::info!(
                     window_id = %decoration.snapshot.id,
                     title = %decoration.snapshot.title,
@@ -2794,7 +2801,7 @@ fn backdrop_shader_elements_for_window(
                     )
                     .ok()
                     .map(|element| {
-                        if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+                        if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
                             tracing::info!(
                                 window_id = %decoration.snapshot.id,
                                 title = %decoration.snapshot.title,
@@ -3067,7 +3074,7 @@ fn backdrop_shader_elements_for_window(
             )
             .ok()
             .map(|element| {
-                if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+                if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
                     tracing::info!(
                         window_id = %decoration.snapshot.id,
                         title = %decoration.snapshot.title,
@@ -3130,7 +3137,7 @@ fn protocol_background_effect_rects_for_window(
     })
     .collect::<Vec<_>>();
 
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
         let (surface_geometry, buffer_scale, buffer_delta) =
             compositor::with_states(wl_surface, |states| {
                 let geometry = states
@@ -3197,7 +3204,7 @@ fn protocol_background_effect_rects_for_layer(
     })
     .collect::<Vec<_>>();
 
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             output = %output.name(),
@@ -3501,47 +3508,47 @@ fn lower_layer_scene_elements(
                 .get(&stable_key)
                 .filter(|existing| existing.signature == signature)
                 .cloned()
-            {
-                for rect in rects {
-                    let rect_key = format!(
-                        "{}:{}:{}:{}:{}",
-                        layer_id, rect.x, rect.y, rect.width, rect.height
-                    );
-                    let rect_local = Rectangle::new(
-                        smithay::utils::Point::from((
-                            rect.x - output_geo.loc.x,
-                            rect.y - output_geo.loc.y,
-                        )),
-                        (rect.width, rect.height).into(),
-                    );
-                    if let Ok(element) = crate::backend::shader_effect::backdrop_shader_element(
-                        renderer,
-                        existing
-                            .sub_elements
-                            .get(&rect_key)
-                            .map(|entry| entry.id.clone())
-                            .unwrap_or_else(smithay::backend::renderer::element::Id::new),
-                        existing
-                            .sub_elements
-                            .get(&rect_key)
-                            .map(|entry| entry.commit_counter)
-                            .unwrap_or_default(),
-                        existing.texture.clone(),
-                        rect_local,
-                        rect_local,
-                        captured_local_rect,
-                        &config.effect,
-                        1.0,
-                        scale.x as f32,
-                        None,
-                        0.0,
-                        format!("layer-lower:{}:{}", output.name(), rect_key),
-                    ) {
-                        elements.push(WinitRenderElements::Backdrop(element));
-                    }
+        {
+            for rect in rects {
+                let rect_key = format!(
+                    "{}:{}:{}:{}:{}",
+                    layer_id, rect.x, rect.y, rect.width, rect.height
+                );
+                let rect_local = Rectangle::new(
+                    smithay::utils::Point::from((
+                        rect.x - output_geo.loc.x,
+                        rect.y - output_geo.loc.y,
+                    )),
+                    (rect.width, rect.height).into(),
+                );
+                if let Ok(element) = crate::backend::shader_effect::backdrop_shader_element(
+                    renderer,
+                    existing
+                        .sub_elements
+                        .get(&rect_key)
+                        .map(|entry| entry.id.clone())
+                        .unwrap_or_else(smithay::backend::renderer::element::Id::new),
+                    existing
+                        .sub_elements
+                        .get(&rect_key)
+                        .map(|entry| entry.commit_counter)
+                        .unwrap_or_default(),
+                    existing.texture.clone(),
+                    rect_local,
+                    rect_local,
+                    captured_local_rect,
+                    &config.effect,
+                    1.0,
+                    scale.x as f32,
+                    None,
+                    0.0,
+                    format!("layer-lower:{}:{}", output.name(), rect_key),
+                ) {
+                    elements.push(WinitRenderElements::Backdrop(element));
                 }
-                continue;
             }
+            continue;
+        }
         let mut backdrop_scene: Vec<WinitRenderElements> = Vec::new();
         for lower_layer in lower_layers.iter().skip(index + 1) {
             backdrop_scene.extend(layer_surface_scene_elements_for_capture(
@@ -3838,7 +3845,7 @@ fn configured_background_effect_elements_for_layer(
     let (_, lower_layers) = window_render::layer_surfaces_for_output(output);
     let uses_backdrop = config.effect.uses_backdrop_input();
     let uses_xray = config.effect.uses_xray_backdrop_input();
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             layer_id = %layer_id,
@@ -3920,14 +3927,12 @@ fn configured_background_effect_elements_for_layer(
             translation: Point::from((-capture_origin_physical.x, -capture_origin_physical.y)),
             opacity: 1.0,
         };
-        backdrop_scene.extend(
-            transform_window_elements(
-                lower_layer_elements,
-                capture_visual,
-                WinitRenderElements::Window,
-                WinitRenderElements::TransformedWindow,
-            ),
-        );
+        backdrop_scene.extend(transform_window_elements(
+            lower_layer_elements,
+            capture_visual,
+            WinitRenderElements::Window,
+            WinitRenderElements::TransformedWindow,
+        ));
         capture_scene_texture_for_effect(
             renderer,
             "winit-layer-top-backdrop",
@@ -4025,60 +4030,60 @@ fn configured_background_effect_elements_for_layer(
             .get(&stable_key)
             .filter(|existing| existing.signature == signature)
             .cloned()
-        {
-            return rects
-                .into_iter()
-                .filter_map(|rect| {
-                    let rect_key = format!(
-                        "{}:{}:{}:{}:{}",
-                        layer_id, rect.x, rect.y, rect.width, rect.height
+    {
+        return rects
+            .into_iter()
+            .filter_map(|rect| {
+                let rect_key = format!(
+                    "{}:{}:{}:{}:{}",
+                    layer_id, rect.x, rect.y, rect.width, rect.height
+                );
+                let rect_local = Rectangle::new(
+                    smithay::utils::Point::from((
+                        rect.x - output_geo.loc.x,
+                        rect.y - output_geo.loc.y,
+                    )),
+                    (rect.width, rect.height).into(),
+                );
+                if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+                    tracing::info!(
+                        layer_surface = ?layer_surface.wl_surface().id(),
+                        output = %output.name(),
+                        rect = ?rect,
+                        rect_local = ?rect_local,
+                        captured_local_rect = ?captured_local_rect,
+                        from_cache = true,
+                        "backdrop debug: layer effect element"
                     );
-                    let rect_local = Rectangle::new(
-                        smithay::utils::Point::from((
-                            rect.x - output_geo.loc.x,
-                            rect.y - output_geo.loc.y,
-                        )),
-                        (rect.width, rect.height).into(),
-                    );
-                    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
-                        tracing::info!(
-                            layer_surface = ?layer_surface.wl_surface().id(),
-                            output = %output.name(),
-                            rect = ?rect,
-                            rect_local = ?rect_local,
-                            captured_local_rect = ?captured_local_rect,
-                            from_cache = true,
-                            "backdrop debug: layer effect element"
-                        );
-                    }
-                    crate::backend::shader_effect::backdrop_shader_element(
-                        renderer,
-                        existing
-                            .sub_elements
-                            .get(&rect_key)
-                            .map(|entry| entry.id.clone())
-                            .unwrap_or_else(smithay::backend::renderer::element::Id::new),
-                        existing
-                            .sub_elements
-                            .get(&rect_key)
-                            .map(|entry| entry.commit_counter)
-                            .unwrap_or_default(),
-                        existing.texture.clone(),
-                        rect_local,
-                        rect_local,
-                        captured_local_rect,
-                        &config.effect,
-                        alpha,
-                        scale.x as f32,
-                        None,
-                        0.0,
-                        format!("layer-lower:{}:{}", output.name(), rect_key),
-                    )
-                    .ok()
-                    .map(WinitRenderElements::Backdrop)
-                })
-                .collect();
-        }
+                }
+                crate::backend::shader_effect::backdrop_shader_element(
+                    renderer,
+                    existing
+                        .sub_elements
+                        .get(&rect_key)
+                        .map(|entry| entry.id.clone())
+                        .unwrap_or_else(smithay::backend::renderer::element::Id::new),
+                    existing
+                        .sub_elements
+                        .get(&rect_key)
+                        .map(|entry| entry.commit_counter)
+                        .unwrap_or_default(),
+                    existing.texture.clone(),
+                    rect_local,
+                    rect_local,
+                    captured_local_rect,
+                    &config.effect,
+                    alpha,
+                    scale.x as f32,
+                    None,
+                    0.0,
+                    format!("layer-lower:{}:{}", output.name(), rect_key),
+                )
+                .ok()
+                .map(WinitRenderElements::Backdrop)
+            })
+            .collect();
+    }
     let layer_source_texture = config
         .effect
         .uses_layer_source_input()
@@ -4163,7 +4168,7 @@ fn configured_background_effect_elements_for_layer(
     let Some(texture) = texture else {
         return Vec::new();
     };
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             output = %output.name(),
@@ -4246,7 +4251,7 @@ fn configured_background_effect_elements_for_layer(
                 smithay::utils::Point::from((rect.x - output_geo.loc.x, rect.y - output_geo.loc.y)),
                 (rect.width, rect.height).into(),
             );
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
                 tracing::info!(
                     layer_surface = ?layer_surface.wl_surface().id(),
                     output = %output.name(),
@@ -4723,7 +4728,7 @@ fn configured_background_effect_elements_for_window(
                 effect_rect.height,
                 scale,
             );
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if shoji_env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
                 tracing::info!(
                     window_id = %decoration.snapshot.id,
                     title = %decoration.snapshot.title,
@@ -5032,46 +5037,40 @@ fn window_scene_elements_for_capture(
                 }
             }
             elements.extend(transform_clipped_elements(clipped_elements, visual_state));
-            elements.extend(
-                transform_window_elements(
-                    raw_elements,
-                    visual_state,
-                    WinitRenderElements::Window,
-                    WinitRenderElements::TransformedWindow,
-                ),
-            );
+            elements.extend(transform_window_elements(
+                raw_elements,
+                visual_state,
+                WinitRenderElements::Window,
+                WinitRenderElements::TransformedWindow,
+            ));
         } else {
-            elements.extend(
-                transform_window_elements(
-                    window_render::surface_elements(
-                        window,
-                        renderer,
-                        physical_location,
-                        scale,
-                        visual_state.opacity,
-                    ),
-                    visual_state,
-                    WinitRenderElements::Window,
-                    WinitRenderElements::TransformedWindow,
+            elements.extend(transform_window_elements(
+                window_render::surface_elements(
+                    window,
+                    renderer,
+                    physical_location,
+                    scale,
+                    visual_state.opacity,
                 ),
-            );
+                visual_state,
+                WinitRenderElements::Window,
+                WinitRenderElements::TransformedWindow,
+            ));
         }
     }
 
-    elements.extend(
-        transform_window_elements(
-            window_render::popup_elements(
-                window,
-                renderer,
-                physical_location,
-                scale,
-                visual_state.opacity,
-            ),
-            visual_state,
-            WinitRenderElements::Window,
-            WinitRenderElements::TransformedWindow,
+    elements.extend(transform_window_elements(
+        window_render::popup_elements(
+            window,
+            renderer,
+            physical_location,
+            scale,
+            visual_state.opacity,
         ),
-    );
+        visual_state,
+        WinitRenderElements::Window,
+        WinitRenderElements::TransformedWindow,
+    ));
 
     elements
 }
@@ -5136,11 +5135,12 @@ fn capture_live_snapshot_for_window(
             .insert(snapshot_id.clone(), snapshot);
         if has_client_content
             && let Some(snapshot) = state.live_window_snapshots.get(&snapshot_id)
-                && let Ok(complete_snapshot) = snapshot::duplicate_snapshot(renderer, snapshot) {
-                    state
-                        .complete_window_snapshots
-                        .insert(snapshot_id, complete_snapshot);
-                }
+            && let Ok(complete_snapshot) = snapshot::duplicate_snapshot(renderer, snapshot)
+        {
+            state
+                .complete_window_snapshots
+                .insert(snapshot_id, complete_snapshot);
+        }
     }
 
     Ok(())

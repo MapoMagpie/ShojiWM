@@ -3,6 +3,7 @@ use crate::{
     handlers::{layer_shell, xdg_shell},
     state::{ClientState, CursorOverrideApplied, ShojiWM},
 };
+use crate::shoji_env;
 use calloop::Interest;
 use smithay::{
     backend::renderer::{
@@ -36,25 +37,25 @@ use std::{
 use tracing::{debug, info, trace};
 
 fn commit_rate_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_COMMIT_RATE_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_COMMIT_RATE_DEBUG").is_some()
 }
 
 fn mpv_frame_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn frame_liveness_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
+    shoji_env::var_os("SHOJI_FRAME_LIVENESS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn browser_geometry_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_BROWSER_GEOMETRY_DEBUG")
+    shoji_env::var_os("SHOJI_BROWSER_GEOMETRY_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn x11_browser_cpu_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_X11_BROWSER_CPU_DEBUG")
+    shoji_env::var_os("SHOJI_X11_BROWSER_CPU_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -446,7 +447,7 @@ impl CompositorHandler for ShojiWM {
                 );
             }
             let commit_time = std::time::Duration::from(self.clock.now());
-            if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+            if shoji_env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
                 let previous_commit_time =
                     previous_transform_snapshot_source_damage_time(&snapshot.id, commit_time);
                 let delta_ms = previous_commit_time

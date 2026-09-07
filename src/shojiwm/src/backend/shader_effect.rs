@@ -39,6 +39,7 @@ use crate::ssd::{
     EffectStateResizePolicy, EffectStateTexture, EffectStateTextureFormat, LogicalRect, NoiseKind,
     NoiseStage, ShaderModule, ShaderStage, ShaderUniformValue,
 };
+use crate::shoji_env;
 
 #[derive(Debug, Clone)]
 pub struct CachedShaderEffect {
@@ -322,7 +323,7 @@ fn snapshot_fallback_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         gpu_timing_debug_enabled()
-            || std::env::var_os("SHOJI_SNAPSHOT_FALLBACK_DEBUG")
+            || shoji_env::var_os("SHOJI_SNAPSHOT_FALLBACK_DEBUG")
                 .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -536,7 +537,7 @@ impl GpuTimingState {
 pub(crate) fn gpu_timing_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_GPU_TIMING_DEBUG")
+        shoji_env::var_os("SHOJI_GPU_TIMING_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -545,7 +546,7 @@ pub(crate) fn gpu_element_timing_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         gpu_timing_debug_enabled()
-            && std::env::var_os("SHOJI_GPU_ELEMENT_TIMING_DEBUG")
+            && shoji_env::var_os("SHOJI_GPU_ELEMENT_TIMING_DEBUG")
                 .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -1369,7 +1370,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             sample_src.size.h as f32 / full_size.h.max(1) as f32,
         ];
 
-        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
             // Rate-limited: these run every frame per backdrop element.
             use std::sync::atomic::{AtomicUsize, Ordering};
             static DRAW_LOG_TICK: AtomicUsize = AtomicUsize::new(0);
@@ -1392,7 +1393,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                     used_rendered = inner.rendered.is_some(),
                     "gap debug framebuffer backdrop display draw"
                 );
-                if std::env::var_os("SHOJI_GAP_TEXTURE_READBACK").is_some() {
+                if shoji_env::var_os("SHOJI_GAP_TEXTURE_READBACK").is_some() {
                     // Read the right-edge columns of the pipeline output and
                     // the raw capture. If the output's last column matches the
                     // raw capture instead of blurred content, the blur/effect
@@ -3166,7 +3167,7 @@ pub fn backdrop_shader_element_with_geometry(
         sample_width_px as f32 / captured_width_px.max(1) as f32,
         sample_height_px as f32 / captured_height_px.max(1) as f32,
     ];
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             debug_label = %debug_label,
             texture_size = ?texture_size,
@@ -3799,7 +3800,7 @@ fn run_effect_pipeline(
         sample_region
     };
 
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             effect_input = ?effect.input,
             ctx_size = ?ctx.size,
@@ -3814,7 +3815,7 @@ fn run_effect_pipeline(
     // Rate-limit per input size so cheap always-running pipelines (layer
     // bars) do not starve the rarely-invalidated window pipelines out of the
     // dump budget.
-    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+    let stage_readback = shoji_env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
         use std::collections::HashMap;
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
@@ -4870,7 +4871,7 @@ fn preblur_using_pyramid(
 ) -> Result<GlesTexture, ShaderEffectError> {
     prepare_blur_pyramid(renderer, pyramid, source_size, passes)?;
 
-    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+    let stage_readback = shoji_env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TICK: AtomicUsize = AtomicUsize::new(0);
         TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(600)

@@ -36,11 +36,12 @@ use crate::{
     runtime_pointer::RuntimePointerConfigUpdate,
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
     runtime_workspace::{RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate},
+    shoji_env,
 };
 use smithay::reexports::calloop::channel::Sender as CalloopSender;
 
 fn managed_rect_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
+    shoji_env::var_os("SHOJI_MANAGED_RECT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -1553,11 +1554,12 @@ impl EmbeddedDecorationEvaluator {
         display_state: std::collections::BTreeMap<String, WaylandOutputSnapshot>,
     ) {
         if let Ok(mut guard) = self.display_state.lock()
-            && *guard != display_state {
-                *guard = display_state;
-                self.runtime_state_generation
-                    .fetch_add(1, Ordering::Release);
-            }
+            && *guard != display_state
+        {
+            *guard = display_state;
+            self.runtime_state_generation
+                .fetch_add(1, Ordering::Release);
+        }
     }
 
     pub fn set_input_state(
@@ -1565,11 +1567,12 @@ impl EmbeddedDecorationEvaluator {
         input_state: std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     ) {
         if let Ok(mut guard) = self.input_state.lock()
-            && *guard != input_state {
-                *guard = input_state;
-                self.runtime_state_generation
-                    .fetch_add(1, Ordering::Release);
-            }
+            && *guard != input_state
+        {
+            *guard = input_state;
+            self.runtime_state_generation
+                .fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Retire the current isolate and hand back an evaluator that shares this
@@ -1985,7 +1988,11 @@ impl EmbeddedDecorationEvaluator {
     fn ensure_pointer_move_async_worker(&self) {
         // The worker is now process-lifetime, so this only ever flips once.
         // Reading first keeps the steady state off a cacheline the worker owns.
-        if self.pointer_move_async.worker_started.load(Ordering::Relaxed) {
+        if self
+            .pointer_move_async
+            .worker_started
+            .load(Ordering::Relaxed)
+        {
             return;
         }
         if self
@@ -2700,7 +2707,7 @@ impl RuntimeProtocolStats {
 fn runtime_protocol_stats_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_RUNTIME_PROTOCOL_STATS")
+        shoji_env::var_os("SHOJI_RUNTIME_PROTOCOL_STATS")
             .is_some_and(|value| value != "0" && value != "off" && !value.is_empty())
     })
 }
@@ -5359,10 +5366,8 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
 
     #[test]
     fn reactivating_focused_floating_window_requests_minimize() {
-        let actions = activate_toggle_fixture(
-            true,
-            crate::ssd::WindowActivateRequestSourceSnapshot::Api,
-        );
+        let actions =
+            activate_toggle_fixture(true, crate::ssd::WindowActivateRequestSourceSnapshot::Api);
         assert!(
             has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
             "dock activation of the focused floating window should minimize it: {actions:?}"
@@ -5419,10 +5424,8 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
 
     #[test]
     fn activating_unfocused_floating_window_focuses_it() {
-        let actions = activate_toggle_fixture(
-            false,
-            crate::ssd::WindowActivateRequestSourceSnapshot::Api,
-        );
+        let actions =
+            activate_toggle_fixture(false, crate::ssd::WindowActivateRequestSourceSnapshot::Api);
         assert!(
             !has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
             "activating an unfocused window must not minimize it: {actions:?}"
@@ -5464,7 +5467,11 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .window_activate_request(&focused, &event, 200)
             .expect("first activate should evaluate");
         assert!(
-            has_action(&first.actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            has_action(
+                &first.actions,
+                "0xa",
+                crate::ssd::WaylandWindowAction::Minimize
+            ),
             "first activation should toggle the focused window into minimize: {:?}",
             first.actions
         );
@@ -5490,12 +5497,20 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .window_activate_request(&focused, &event, 300)
             .expect("second activate should evaluate");
         assert!(
-            !has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            !has_action(
+                &second.actions,
+                "0xa",
+                crate::ssd::WaylandWindowAction::Minimize
+            ),
             "re-activating the minimized window must not re-minimize it: {:?}",
             second.actions
         );
         assert!(
-            has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Focus),
+            has_action(
+                &second.actions,
+                "0xa",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "re-activating the minimized window should restore and focus it: {:?}",
             second.actions
         );
@@ -5666,10 +5681,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                     bottom: false,
                 },
                 start_pointer: WindowResizePointSnapshot { x: 800.0, y: 300.0 },
-                current_pointer: WindowResizePointSnapshot {
-                    x: width,
-                    y: 300.0,
-                },
+                current_pointer: WindowResizePointSnapshot { x: width, y: 300.0 },
                 delta: WindowResizePointSnapshot {
                     x: width - 800.0,
                     y: 0.0,
@@ -5695,12 +5707,20 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             "tile-focus-right-quick should be a known binding"
         );
         assert!(
-            !has_action(&first.actions, "0xc", crate::ssd::WaylandWindowAction::Focus),
+            !has_action(
+                &first.actions,
+                "0xc",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "an overflowing tile must be panned into view, not skipped: {:?}",
             first.actions
         );
         assert!(
-            has_action(&first.actions, "0xb", crate::ssd::WaylandWindowAction::Focus),
+            has_action(
+                &first.actions,
+                "0xb",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "the overflowing tile should keep focus while panning: {:?}",
             first.actions
         );
@@ -5711,7 +5731,11 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-right-quick", now + 100)
             .expect("second focus-right should evaluate");
         assert!(
-            has_action(&second.actions, "0xc", crate::ssd::WaylandWindowAction::Focus),
+            has_action(
+                &second.actions,
+                "0xc",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "a fully-visible tile should advance focus to the neighbor: {:?}",
             second.actions
         );
@@ -5761,7 +5785,11 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-left-quick", now)
             .expect("first focus-left should evaluate");
         assert!(
-            has_action(&first.actions, "0xb", crate::ssd::WaylandWindowAction::Focus),
+            has_action(
+                &first.actions,
+                "0xb",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "a fully-visible maximized tile must advance on the first press: {:?}",
             first.actions
         );
@@ -5770,7 +5798,11 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-left-quick", now + 100)
             .expect("second focus-left should evaluate");
         assert!(
-            has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Focus),
+            has_action(
+                &second.actions,
+                "0xa",
+                crate::ssd::WaylandWindowAction::Focus
+            ),
             "every subsequent press must advance one tile as well: {:?}",
             second.actions
         );
@@ -5784,9 +5816,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// straight through.
     #[test]
     fn workspace_scroll_gesture_snaps_to_tile_edges_at_low_speed() {
-        use crate::ssd::window_model::{
-            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-        };
+        use crate::ssd::window_model::{GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot};
 
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -5820,25 +5850,23 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             now += 100;
         }
 
-        let swipe = |phase: GestureSwipePhaseSnapshot,
-                     delta_x: f64,
-                     velocity_x: f64,
-                     timestamp: u64| {
-            GestureSwipeEventSnapshot {
-                phase,
-                fingers: 3,
-                position: None,
-                delta_x,
-                delta_y: 0.0,
-                total_x: delta_x,
-                total_y: 0.0,
-                velocity_x,
-                velocity_y: 0.0,
-                output_name: Some("TEST-1".into()),
-                device: None,
-                timestamp,
-            }
-        };
+        let swipe =
+            |phase: GestureSwipePhaseSnapshot, delta_x: f64, velocity_x: f64, timestamp: u64| {
+                GestureSwipeEventSnapshot {
+                    phase,
+                    fingers: 3,
+                    position: None,
+                    delta_x,
+                    delta_y: 0.0,
+                    total_x: delta_x,
+                    total_y: 0.0,
+                    velocity_x,
+                    velocity_y: 0.0,
+                    output_name: Some("TEST-1".into()),
+                    device: None,
+                    timestamp,
+                }
+            };
         // The repo config maps scroll delta as -delta_x * 1.5 and compares
         // -velocity_x * 1.5 against the 300 px/s snap threshold.
         // Read rects the way the compositor does after a managed-window-only
@@ -5916,7 +5944,10 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         // Lift while caught: no kinetic glide, the catch holds.
         now += 10;
         evaluator
-            .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::End, 0.0, -100.0, now), now)
+            .gesture_swipe(
+                &swipe(GestureSwipePhaseSnapshot::End, 0.0, -100.0, now),
+                now,
+            )
             .expect("end should evaluate");
         assert_eq!(
             rect_x("0xc", now + 1),
@@ -5951,9 +5982,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// the screen center.
     #[test]
     fn workspace_kinetic_scroll_snaps_center_window_flush_to_leaning_left_edge() {
-        use crate::ssd::window_model::{
-            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-        };
+        use crate::ssd::window_model::{GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot};
 
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -5984,25 +6013,23 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             now += 100;
         }
 
-        let swipe = |phase: GestureSwipePhaseSnapshot,
-                     delta_x: f64,
-                     velocity_x: f64,
-                     timestamp: u64| {
-            GestureSwipeEventSnapshot {
-                phase,
-                fingers: 3,
-                position: None,
-                delta_x,
-                delta_y: 0.0,
-                total_x: delta_x,
-                total_y: 0.0,
-                velocity_x,
-                velocity_y: 0.0,
-                output_name: Some("TEST-1".into()),
-                device: None,
-                timestamp,
-            }
-        };
+        let swipe =
+            |phase: GestureSwipePhaseSnapshot, delta_x: f64, velocity_x: f64, timestamp: u64| {
+                GestureSwipeEventSnapshot {
+                    phase,
+                    fingers: 3,
+                    position: None,
+                    delta_x,
+                    delta_y: 0.0,
+                    total_x: delta_x,
+                    total_y: 0.0,
+                    velocity_x,
+                    velocity_y: 0.0,
+                    output_name: Some("TEST-1".into()),
+                    device: None,
+                    timestamp,
+                }
+            };
 
         // Drag to scroll ~516 and release at 150 px/s so the settle engages
         // at the release position. There the screen center (~1462) is
@@ -6022,10 +6049,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         }
         now += 10;
         evaluator
-            .gesture_swipe(
-                &swipe(GestureSwipePhaseSnapshot::End, 0.0, 150.0, now),
-                now,
-            )
+            .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::End, 0.0, 150.0, now), now)
             .expect("end should evaluate");
 
         for _ in 0..250 {
@@ -6056,9 +6080,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// leaning-edge position is exactly where the scroll already rests.
     #[test]
     fn workspace_kinetic_scroll_never_yanks_fully_visible_tile_for_maximized_neighbor() {
-        use crate::ssd::window_model::{
-            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-        };
+        use crate::ssd::window_model::{GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot};
 
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -6088,25 +6110,23 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             now += 100;
         }
 
-        let swipe = |phase: GestureSwipePhaseSnapshot,
-                     delta_x: f64,
-                     velocity_x: f64,
-                     timestamp: u64| {
-            GestureSwipeEventSnapshot {
-                phase,
-                fingers: 3,
-                position: None,
-                delta_x,
-                delta_y: 0.0,
-                total_x: delta_x,
-                total_y: 0.0,
-                velocity_x,
-                velocity_y: 0.0,
-                output_name: Some("TEST-1".into()),
-                device: None,
-                timestamp,
-            }
-        };
+        let swipe =
+            |phase: GestureSwipePhaseSnapshot, delta_x: f64, velocity_x: f64, timestamp: u64| {
+                GestureSwipeEventSnapshot {
+                    phase,
+                    fingers: 3,
+                    position: None,
+                    delta_x,
+                    delta_y: 0.0,
+                    total_x: delta_x,
+                    total_y: 0.0,
+                    velocity_x,
+                    velocity_y: 0.0,
+                    output_name: Some("TEST-1".into()),
+                    device: None,
+                    timestamp,
+                }
+            };
 
         // Opening 0xb scrolled it fully into view at the right end (scroll
         // 824, flush at the viewport right edge); the maximized 0xa pokes off
@@ -6161,9 +6181,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// the snap threshold.
     #[test]
     fn workspace_kinetic_scroll_settles_maximized_tile_at_center() {
-        use crate::ssd::window_model::{
-            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-        };
+        use crate::ssd::window_model::{GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot};
 
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -6194,25 +6212,23 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             now += 100;
         }
 
-        let swipe = |phase: GestureSwipePhaseSnapshot,
-                     delta_x: f64,
-                     velocity_x: f64,
-                     timestamp: u64| {
-            GestureSwipeEventSnapshot {
-                phase,
-                fingers: 3,
-                position: None,
-                delta_x,
-                delta_y: 0.0,
-                total_x: delta_x,
-                total_y: 0.0,
-                velocity_x,
-                velocity_y: 0.0,
-                output_name: Some("TEST-1".into()),
-                device: None,
-                timestamp,
-            }
-        };
+        let swipe =
+            |phase: GestureSwipePhaseSnapshot, delta_x: f64, velocity_x: f64, timestamp: u64| {
+                GestureSwipeEventSnapshot {
+                    phase,
+                    fingers: 3,
+                    position: None,
+                    delta_x,
+                    delta_y: 0.0,
+                    total_x: delta_x,
+                    total_y: 0.0,
+                    velocity_x,
+                    velocity_y: 0.0,
+                    output_name: Some("TEST-1".into()),
+                    device: None,
+                    timestamp,
+                }
+            };
 
         // Three maximized tiles, 1904px wide with centers 1916px apart:
         // 0xb spans [1916, 3820] and is centered at scroll offset 1920.
@@ -6271,10 +6287,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .rect
             .expect("tiled window should have a managed rect")
             .x;
-        assert_eq!(
-            x, 8.0,
-            "the maximized tile must settle centered on screen"
-        );
+        assert_eq!(x, 8.0, "the maximized tile must settle centered on screen");
     }
 
     /// Kinetic settle, non-maximized anchor: the tile whose center is
@@ -6282,9 +6295,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// screen edge on the side it leans toward — here the right edge.
     #[test]
     fn workspace_kinetic_scroll_snaps_center_window_flush_to_leaning_right_edge() {
-        use crate::ssd::window_model::{
-            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
-        };
+        use crate::ssd::window_model::{GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot};
 
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -6315,25 +6326,23 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             now += 100;
         }
 
-        let swipe = |phase: GestureSwipePhaseSnapshot,
-                     delta_x: f64,
-                     velocity_x: f64,
-                     timestamp: u64| {
-            GestureSwipeEventSnapshot {
-                phase,
-                fingers: 3,
-                position: None,
-                delta_x,
-                delta_y: 0.0,
-                total_x: delta_x,
-                total_y: 0.0,
-                velocity_x,
-                velocity_y: 0.0,
-                output_name: Some("TEST-1".into()),
-                device: None,
-                timestamp,
-            }
-        };
+        let swipe =
+            |phase: GestureSwipePhaseSnapshot, delta_x: f64, velocity_x: f64, timestamp: u64| {
+                GestureSwipeEventSnapshot {
+                    phase,
+                    fingers: 3,
+                    position: None,
+                    delta_x,
+                    delta_y: 0.0,
+                    total_x: delta_x,
+                    total_y: 0.0,
+                    velocity_x,
+                    velocity_y: 0.0,
+                    output_name: Some("TEST-1".into()),
+                    device: None,
+                    timestamp,
+                }
+            };
 
         // Drag to scroll ~996 and release at 150 px/s — below any realistic
         // snap threshold, so the settle engages right at the release
@@ -6354,10 +6363,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         }
         now += 10;
         evaluator
-            .gesture_swipe(
-                &swipe(GestureSwipePhaseSnapshot::End, 0.0, 150.0, now),
-                now,
-            )
+            .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::End, 0.0, 150.0, now), now)
             .expect("end should evaluate");
 
         for _ in 0..250 {
@@ -6455,7 +6461,13 @@ COMPOSITOR.key.bind("first", "Super+T", () => {{}});
         let binding_ids = |update: &Option<RuntimeKeyBindingConfigUpdate>| -> Vec<String> {
             update
                 .as_ref()
-                .map(|update| update.entries.iter().map(|entry| entry.id.clone()).collect())
+                .map(|update| {
+                    update
+                        .entries
+                        .iter()
+                        .map(|entry| entry.id.clone())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 
@@ -6526,7 +6538,13 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
         let binding_ids = |update: &Option<RuntimeKeyBindingConfigUpdate>| -> Vec<String> {
             update
                 .as_ref()
-                .map(|update| update.entries.iter().map(|entry| entry.id.clone()).collect())
+                .map(|update| {
+                    update
+                        .entries
+                        .iter()
+                        .map(|entry| entry.id.clone())
+                        .collect()
+                })
                 .unwrap_or_default()
         };
 
@@ -7112,8 +7130,8 @@ COMPOSITOR.window.composition = () => <Box />;
             .expect("repository root should exist");
         // Keep an encoded-looking segment in the path so the runtime's manual
         // file URL conversion cannot accidentally decode it into a space.
-        let test_dir = std::env::temp_dir()
-            .join(format!("shojiwm-ipc%20reload-test-{}", std::process::id()));
+        let test_dir =
+            std::env::temp_dir().join(format!("shojiwm-ipc%20reload-test-{}", std::process::id()));
         std::fs::create_dir_all(&test_dir).expect("test directory should be created");
 
         let mut baseline = 0usize;

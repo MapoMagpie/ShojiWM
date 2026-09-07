@@ -9,19 +9,23 @@ use smithay::{
 use tracing::trace;
 
 use crate::{
-    backend::rounded::{RoundedClip, RoundedRectSpec, RoundedShapeKind, StableRoundedElement},
-    backend::shader_effect::{
-        ShaderEffectError, ShaderEffectSpec, StableBackdropFramebufferElement,
-        StableShaderEffectElement,
+    backend::{
+        rounded::{RoundedClip, RoundedRectSpec, RoundedShapeKind, StableRoundedElement},
+        shader_effect::{
+            ShaderEffectError, ShaderEffectSpec, StableBackdropFramebufferElement,
+            StableShaderEffectElement,
+        },
+        text,
+        visual::{
+            RectSnapMode, relative_physical_rect_from_root,
+            relative_physical_rect_from_root_precise,
+            relative_physical_rect_from_root_snapped_edges, snapped_logical_radius,
+            snapped_logical_rect_for_element, snapped_logical_rect_from_relative_physical,
+            snapped_precise_logical_rect_in_element_space,
+            snapped_precise_logical_rect_in_root_frame_area_space,
+        },
     },
-    backend::text,
-    backend::visual::{
-        RectSnapMode, relative_physical_rect_from_root, relative_physical_rect_from_root_precise,
-        relative_physical_rect_from_root_snapped_edges, snapped_logical_radius,
-        snapped_logical_rect_for_element, snapped_logical_rect_from_relative_physical,
-        snapped_precise_logical_rect_in_element_space,
-        snapped_precise_logical_rect_in_root_frame_area_space,
-    },
+    shoji_env,
     ssd::{ComputedDecorationNode, LogicalRect, StylePosition, WindowDecorationState},
 };
 
@@ -41,35 +45,35 @@ pub enum DecorationSceneError {
 }
 
 fn gap_disable_decoration_clip_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_DISABLE_DECORATION_CLIP").is_some()
+    shoji_env::var_os("SHOJI_GAP_DISABLE_DECORATION_CLIP").is_some()
 }
 
 fn gap_disable_border_inner_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_DISABLE_BORDER_INNER").is_some()
+    shoji_env::var_os("SHOJI_GAP_DISABLE_BORDER_INNER").is_some()
 }
 
 fn gap_disable_titlebar_clip_enabled(height: i32) -> bool {
-    std::env::var_os("SHOJI_GAP_DISABLE_TITLEBAR_CLIP").is_some() && height == 30
+    shoji_env::var_os("SHOJI_GAP_DISABLE_TITLEBAR_CLIP").is_some() && height == 30
 }
 
 fn gap_show_border_inner_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_SHOW_BORDER_INNER").is_some()
+    shoji_env::var_os("SHOJI_GAP_SHOW_BORDER_INNER").is_some()
 }
 
 fn gap_show_titlebar_clip_enabled(height: i32) -> bool {
-    std::env::var_os("SHOJI_GAP_SHOW_TITLEBAR_CLIP").is_some() && height == 30
+    shoji_env::var_os("SHOJI_GAP_SHOW_TITLEBAR_CLIP").is_some() && height == 30
 }
 
 fn gap_show_border_shell_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_SHOW_BORDER_SHELL").is_some()
+    shoji_env::var_os("SHOJI_GAP_SHOW_BORDER_SHELL").is_some()
 }
 
 fn gap_show_border_shell_only_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_SHOW_BORDER_SHELL_ONLY").is_some()
+    shoji_env::var_os("SHOJI_GAP_SHOW_BORDER_SHELL_ONLY").is_some()
 }
 
 fn gap_shrink_border_hole_px() -> f32 {
-    std::env::var_os("SHOJI_GAP_SHRINK_BORDER_HOLE")
+    shoji_env::var_os("SHOJI_GAP_SHRINK_BORDER_HOLE")
         .and_then(|value| value.to_str().and_then(|value| value.parse::<f32>().ok()))
         .unwrap_or(0.0)
         .max(0.0)
@@ -112,8 +116,13 @@ fn border_outer_geometry_from_inner(
     scale: Scale<f64>,
     border_width: f32,
 ) -> Rectangle<i32, Physical> {
-    let inner_geometry =
-        relative_physical_rect_from_root_precise(inner_rect_precise, root_rect, root_subpixel, output_geo, scale);
+    let inner_geometry = relative_physical_rect_from_root_precise(
+        inner_rect_precise,
+        root_rect,
+        root_subpixel,
+        output_geo,
+        scale,
+    );
     let border_x = ((border_width.max(0.0) as f64) * scale.x.abs().max(0.0001))
         .round()
         .max(0.0) as i32;
@@ -170,7 +179,11 @@ fn paired_outer_geometry_from_border_buffer(
         .or_else(|| {
             border_cached.hole_rect.map(|hole_rect| {
                 let inner_geometry = relative_physical_rect_from_root_snapped_edges(
-                    hole_rect, root_rect, root_subpixel, output_geo, scale,
+                    hole_rect,
+                    root_rect,
+                    root_subpixel,
+                    output_geo,
+                    scale,
                 );
                 let border_x = ((border_cached.border_width.max(0.0) as f64)
                     * scale.x.abs().max(0.0001))
@@ -216,7 +229,15 @@ fn cached_outer_geometry(
 ) -> Rectangle<i32, Physical> {
     cached
         .rect_precise
-        .map(|rect| relative_physical_rect_from_root_precise(rect, root_rect, root_subpixel, output_geo, scale))
+        .map(|rect| {
+            relative_physical_rect_from_root_precise(
+                rect,
+                root_rect,
+                root_subpixel,
+                output_geo,
+                scale,
+            )
+        })
         .unwrap_or_else(|| {
             relative_physical_rect_from_root_snapped_edges(
                 cached.rect,
@@ -239,10 +260,16 @@ fn border_outer_geometry(
     if matches!(border_fit, crate::ssd::BorderFit::Normal) && !cached.shared_inner_hole {
         cached_outer_geometry(cached, root_rect, root_subpixel, output_geo, scale)
     } else {
-        paired_outer_geometry_from_border_buffer(cached, root_rect, root_subpixel, output_geo, scale)
-            .unwrap_or_else(|| {
-                cached_outer_geometry(cached, root_rect, root_subpixel, output_geo, scale)
-            })
+        paired_outer_geometry_from_border_buffer(
+            cached,
+            root_rect,
+            root_subpixel,
+            output_geo,
+            scale,
+        )
+        .unwrap_or_else(|| {
+            cached_outer_geometry(cached, root_rect, root_subpixel, output_geo, scale)
+        })
     }
 }
 
@@ -280,8 +307,13 @@ fn render_inner_clip_from_precise_anchors(
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
 ) -> RoundedClip {
-    let inner_geometry =
-        relative_physical_rect_from_root_precise(inner_rect_precise, root_rect, root_subpixel, output_geo, scale);
+    let inner_geometry = relative_physical_rect_from_root_precise(
+        inner_rect_precise,
+        root_rect,
+        root_subpixel,
+        output_geo,
+        scale,
+    );
     let outer_width_px = outer_geometry.size.w.max(1) as f32;
     let outer_height_px = outer_geometry.size.h.max(1) as f32;
     let outer_width = outer_rect_precise.width.max(0.0001);
@@ -1492,7 +1524,7 @@ fn rounded_rect_element(
             0.0
         },
     };
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             stable_key = %cached.stable_key,
             source_kind = %cached.source_kind,
@@ -1501,7 +1533,7 @@ fn rounded_rect_element(
         );
     }
     let element = state.element(renderer, spec)?;
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         let geometry = smithay::backend::renderer::element::Element::geometry(&element, scale);
         let root_local_rect_precise =
             cached
@@ -1977,7 +2009,7 @@ fn shader_effect_element(
         .shader_cache
         .entry(cached.stable_key.clone())
         .or_default();
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         tracing::info!(
             stable_key = %cached.stable_key,
             spec = ?spec,
@@ -1986,7 +2018,7 @@ fn shader_effect_element(
     }
     let debug_clip_rect = spec.clip_rect;
     let element = state.element(renderer, spec)?;
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
         let geometry = smithay::backend::renderer::element::Element::geometry(&element, scale);
         let root_local_rect_precise =
             cached

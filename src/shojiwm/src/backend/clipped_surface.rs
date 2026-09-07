@@ -14,7 +14,7 @@ use smithay::{
 use crate::backend::visual::{
     PreciseLogicalRect, SnappedLogicalRect, snapped_precise_logical_rect_for_element,
 };
-use crate::ssd::ContentClip;
+use crate::{shoji_env, ssd::ContentClip};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SampleUvCompensation {
@@ -152,9 +152,9 @@ pub struct ClippedSurfaceElement {
 struct ClippedSurfaceProgram(GlesTexProgram);
 
 fn clipped_uniforms_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_CLIPPED_UNIFORMS_DEBUG")
+    shoji_env::var_os("SHOJI_CLIPPED_UNIFORMS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
-        || std::env::var_os("SHOJI_GAP_DEBUG")
+        || shoji_env::var_os("SHOJI_GAP_DEBUG")
             .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -370,12 +370,16 @@ impl ClippedSurfaceElement {
             // below) makes it flip by ±1px with the window's position phase
             // at fractional scales, so the corner mask trembles against the
             // window while it moves.
-            let elem_w_px = (element_rect_precise.width * output_scale_x).round().max(1.0);
-            let elem_h_px = (element_rect_precise.height * output_scale_y).round().max(1.0);
+            let elem_w_px = (element_rect_precise.width * output_scale_x)
+                .round()
+                .max(1.0);
+            let elem_h_px = (element_rect_precise.height * output_scale_y)
+                .round()
+                .max(1.0);
             let logical_per_px_x = element_rect_precise.width.max(0.0001) / elem_w_px;
             let logical_per_px_y = element_rect_precise.height.max(0.0001) / elem_h_px;
-            let left_px = ((clip.mask_rect_precise.x - clip.rect_precise.x) * output_scale_x)
-                .round();
+            let left_px =
+                ((clip.mask_rect_precise.x - clip.rect_precise.x) * output_scale_x).round();
             let top_px =
                 ((clip.mask_rect_precise.y - clip.rect_precise.y) * output_scale_y).round();
             let right_px = (((clip.mask_rect_precise.x + clip.mask_rect_precise.width)
@@ -453,7 +457,7 @@ impl ClippedSurfaceElement {
             sampled_pixels,
             projected_pixels,
         );
-        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
             tracing::info!(
                 debug_label = ?debug_label,
                 output_origin = ?output_origin,
@@ -493,7 +497,7 @@ impl ClippedSurfaceElement {
         // coordinates as the decoration pass.
         let inner = ClippedSurfaceInner::Mapped(inner);
 
-        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
             match &inner {
                 ClippedSurfaceInner::Mapped(mapped) => {
                     tracing::info!(
@@ -733,7 +737,7 @@ impl Element for ClippedSurfaceElement {
             ClippedSurfaceInner::Mapped(inner) => inner.damage_since(scale, commit),
         };
 
-        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_GAP_DEBUG").is_some() {
             match &self.inner {
                 ClippedSurfaceInner::Mapped(inner) => {
                     tracing::info!(
@@ -781,7 +785,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
         match &self.inner {
             ClippedSurfaceInner::Mapped(inner) => {
                 let uniforms = self.uniforms();
-                if std::env::var_os("SHOJI_GAP_DEBUG")
+                if shoji_env::var_os("SHOJI_GAP_DEBUG")
                     .is_some_and(|value| value != "0" && !value.is_empty())
                 {
                     let view = inner.view();
@@ -828,7 +832,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceElement {
                     cache,
                 );
                 frame.clear_tex_program_override();
-                if std::env::var_os("SHOJI_GAP_DEBUG")
+                if shoji_env::var_os("SHOJI_GAP_DEBUG")
                     .is_some_and(|value| value != "0" && !value.is_empty())
                 {
                     tracing::info!(

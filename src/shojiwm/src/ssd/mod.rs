@@ -19,6 +19,7 @@ mod window_model;
 use smithay::utils::Logical;
 
 use crate::backend::text::{LabelSpec, measure_label_intrinsic};
+use crate::shoji_env;
 
 pub use bridge::{
     DecorationBridgeError, WireCompiledEffect, WireDecorationChild, WireDecorationNode, WireProps,
@@ -1904,7 +1905,7 @@ fn layout_box_children(
 
     let mut cursor = direction.main_origin_resolved(content_rect) + main_offset;
     let mut children = vec![None; node.children.len()];
-    let layout_debug_enabled = std::env::var_os("SHOJI_GAP_LAYOUT_CHILD_DEBUG").is_some();
+    let layout_debug_enabled = shoji_env::var_os("SHOJI_GAP_LAYOUT_CHILD_DEBUG").is_some();
     let direction_name = match direction {
         LayoutDirection::Row => "row",
         LayoutDirection::Column => "column",

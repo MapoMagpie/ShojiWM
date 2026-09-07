@@ -26,18 +26,15 @@ use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::{
-    backend::visual::{inverse_transform_point, transformed_root_rect},
-    grabs::{
+    backend::visual::{inverse_transform_point, transformed_root_rect}, grabs::{
         move_grab::MoveSurfaceGrab,
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
-    },
-    ssd::{
+    }, shoji_env, ssd::{
         DecorationEvaluator, DecorationHitTestResult, GestureSwipeEventSnapshot,
         GestureSwipePhaseSnapshot, LogicalPoint, PointerModifierStateSnapshot,
         PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
         WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
-    },
-    state::{ShojiWM, TrackedDecorationInteractionTarget},
+    }, state::{ShojiWM, TrackedDecorationInteractionTarget},
 };
 
 enum KeyboardAction {
@@ -62,11 +59,11 @@ fn compositor_pointer_grab_start_data(
 }
 
 fn layer_focus_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some()
 }
 
 fn pointer_button_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_POINTER_BUTTON_DEBUG").is_some()
+    shoji_env::var_os("SHOJI_POINTER_BUTTON_DEBUG").is_some()
 }
 
 const POINTER_TRAILING_EDGE_INSET: f64 = 0.5;
@@ -78,7 +75,7 @@ const POINTER_TRAILING_EDGE_INSET: f64 = 0.5;
 /// `to_i32_floor()` for the corresponding containment rule.
 /// Gate for the pointer input-to-photon latency diagnostic.
 pub fn latency_trace_enabled() -> bool {
-    std::env::var_os("SHOJI_LATENCY_TRACE").is_some()
+    shoji_env::var_os("SHOJI_LATENCY_TRACE").is_some()
 }
 
 fn constrain_pointer_location_to_outputs(
@@ -130,12 +127,12 @@ fn modifier_class_of_keysym(keysym: u32) -> Option<crate::runtime_key_binding::M
 }
 
 fn unfocused_popup_focus_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_UNFOCUSED_POPUP_FOCUS_DEBUG")
+    shoji_env::var_os("SHOJI_UNFOCUSED_POPUP_FOCUS_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn stack_hit_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_STACK_HIT_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_STACK_HIT_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 impl ShojiWM {
@@ -1542,7 +1539,7 @@ impl ShojiWM {
                         "pointer button forwarded and flushed"
                     );
                 }
-                if std::env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() && button == 273 {
+                if shoji_env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() && button == 273 {
                     debug!(
                         state = ?button_state,
                         pointer_location = ?pointer.current_location(),

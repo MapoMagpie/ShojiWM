@@ -119,7 +119,6 @@ use crate::ssd::{
     RuntimeEventConfigUpdate, WaylandOutputSnapshot, WaylandWindowSnapshot, WindowDecorationState,
     WindowPositionSnapshot,
 };
-use crate::xwayland_satellite::{SatelliteInstance, satellite_requested, spawn_satellite};
 use crate::{
     backend::{
         async_assets::{AsyncAssetResult, spawn_async_asset_worker},
@@ -134,6 +133,8 @@ use crate::{
     },
     cursor::Cursor,
     drawing::PointerElement,
+    shoji_env,
+    xwayland_satellite::{SatelliteInstance, satellite_requested, spawn_satellite},
 };
 use tracing::{debug, error, info, warn};
 
@@ -144,8 +145,8 @@ fn runtime_dirty_debug_enabled() -> bool {
 
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
-            .or_else(|| std::env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
+        shoji_env::var_os("SHOJI_RUNTIME_DIRTY_DEBUG")
+            .or_else(|| shoji_env::var_os("SHOJI_SSD_SUPPRESSION_DEBUG"))
             .is_some_and(|value| value != "0" && !value.is_empty())
     })
 }
@@ -230,7 +231,7 @@ pub struct PendingLayerSurface {
 }
 
 fn popup_lifecycle_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_POPUP_LIFECYCLE_DEBUG")
+    shoji_env::var_os("SHOJI_POPUP_LIFECYCLE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -788,9 +789,10 @@ impl ShojiWM {
             });
 
         if let Some(keyboard) = self.seat.get_keyboard()
-            && keyboard.current_focus().as_ref() != focus.as_ref() {
-                keyboard.set_focus(self, focus, serial);
-            }
+            && keyboard.current_focus().as_ref() != focus.as_ref()
+        {
+            keyboard.set_focus(self, focus, serial);
+        }
     }
 
     fn window_root_surface(window: &Window) -> Option<WlSurface> {
@@ -888,10 +890,11 @@ impl ShojiWM {
             && matches!(
                 layer.cached_state().keyboard_interactivity,
                 smithay::wayland::shell::wlr_layer::KeyboardInteractivity::OnDemand
-            ) {
-                self.layer_shell_on_demand_focus = Some(layer);
-                return;
-            }
+            )
+        {
+            self.layer_shell_on_demand_focus = Some(layer);
+            return;
+        }
 
         self.layer_shell_on_demand_focus = None;
     }
@@ -937,8 +940,7 @@ impl ShojiWM {
     }
 
     fn window_was_used_by_user(&self, window: &Window) -> bool {
-        Self::window_root_surface(window)
-            .is_some_and(|root| self.focus_chain.contains(&root))
+        Self::window_root_surface(window).is_some_and(|root| self.focus_chain.contains(&root))
     }
 
     /// Record that the user acted on `window`: a pointer press on it, a key
@@ -1493,10 +1495,10 @@ impl ShojiWM {
         Self::register_runtime_wake_signal(event_loop);
 
         let damage_blink_enabled = std::env::args().any(|arg| arg == "--damage-blink")
-            || std::env::var_os("SHOJI_DAMAGE_BLINK")
+            || shoji_env::var_os("SHOJI_DAMAGE_BLINK")
                 .is_some_and(|value| value != "0" && !value.is_empty());
         let force_full_damage = std::env::args().any(|arg| arg == "--force-full-damage")
-            || std::env::var_os("SHOJI_FORCE_FULL_DAMAGE")
+            || shoji_env::var_os("SHOJI_FORCE_FULL_DAMAGE")
                 .is_some_and(|value| value != "0" && !value.is_empty());
 
         let (async_asset_tx, async_asset_rx) = channel();
@@ -1554,8 +1556,6 @@ impl ShojiWM {
                 ChannelEvent::Closed => {}
             })
             .expect("Failed to init async asset worker.");
-
-        
 
         Self {
             start_time,
@@ -2438,11 +2438,11 @@ impl ShojiWM {
         };
 
         let next = current.fresh_like();
-        if let Err(error) =
-            next.lifecycle_enable("reload", Some(&persisted))
-                .map(|invocation| {
-                    self.consume_runtime_lifecycle_invocation(invocation);
-                })
+        if let Err(error) = next
+            .lifecycle_enable("reload", Some(&persisted))
+            .map(|invocation| {
+                self.consume_runtime_lifecycle_invocation(invocation);
+            })
         {
             warn!(?error, "failed to hot reload TypeScript config");
             self.config_error_report =
@@ -2725,7 +2725,9 @@ impl ShojiWM {
 
         let mut extend_output_names = outputs
             .iter()
-            .filter(|&output| self.runtime_output_mode_setting(&output.name()) == RuntimeOutputMode::Extend)
+            .filter(|&output| {
+                self.runtime_output_mode_setting(&output.name()) == RuntimeOutputMode::Extend
+            })
             .map(|output| output.name())
             .collect::<std::collections::BTreeSet<_>>();
         if extend_output_names.is_empty()
@@ -3324,14 +3326,15 @@ impl ShojiWM {
         // Reap fire-and-forget Once/spawn children as they exit. We don't
         // care about their exit status, just that they don't sit around as
         // zombies — same try_wait() polling as the Service loop above.
-        self.runtime_pending_reap.retain_mut(|child| match child.try_wait() {
-            Ok(Some(_status)) => false,
-            Ok(None) => true,
-            Err(error) => {
-                warn!(?error, "failed to poll fire-and-forget runtime process");
-                false
-            }
-        });
+        self.runtime_pending_reap
+            .retain_mut(|child| match child.try_wait() {
+                Ok(Some(_status)) => false,
+                Ok(None) => true,
+                Err(error) => {
+                    warn!(?error, "failed to poll fire-and-forget runtime process");
+                    false
+                }
+            });
 
         self.reconcile_runtime_processes();
     }
@@ -3372,9 +3375,10 @@ impl ShojiWM {
 
             if should_remove || should_restart {
                 if let Some(mut service) = self.runtime_managed_services.remove(&service_id)
-                    && let Err(error) = kill_runtime_service(&mut service) {
-                        warn!(?error, service_id, "failed to stop runtime service");
-                    }
+                    && let Err(error) = kill_runtime_service(&mut service)
+                {
+                    warn!(?error, service_id, "failed to stop runtime service");
+                }
                 self.runtime_process_suppressed_services.remove(&service_id);
             }
         }
@@ -4040,7 +4044,7 @@ impl ShojiWM {
     #[track_caller]
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
-        if std::env::var_os("SHOJI_REDRAW_STATS")
+        if shoji_env::var_os("SHOJI_REDRAW_STATS")
             .is_some_and(|value| value != "0" && !value.is_empty())
         {
             let key = format!("{}:{}", caller.file(), caller.line());
@@ -4071,7 +4075,7 @@ impl ShojiWM {
         }
 
         if !self.needs_redraw
-            && std::env::var_os("SHOJI_REDRAW_REASON_DEBUG")
+            && shoji_env::var_os("SHOJI_REDRAW_REASON_DEBUG")
                 .is_some_and(|value| value != "0" && !value.is_empty())
         {
             info!(
@@ -4107,7 +4111,7 @@ impl ShojiWM {
             created_at: Duration::from(self.clock.now()),
             committed_at: None,
         });
-        if std::env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
+        if shoji_env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
             let now = Duration::from(self.clock.now());
             info!(
                 surface_id,
@@ -4125,7 +4129,7 @@ impl ShojiWM {
                 "right click trace: xdg popup created"
             );
         }
-        if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
             tracing::info!(surface_id, "xdg popup latency: created");
         }
     }
@@ -4144,7 +4148,7 @@ impl ShojiWM {
         }
         self.right_click_debug.location = Some(location);
 
-        if std::env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
+        if shoji_env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
             info!(
                 source,
                 pressed,
@@ -4156,19 +4160,20 @@ impl ShojiWM {
 
     pub fn note_xdg_popup_committed(&mut self, surface_id: u32) {
         if let Some(popup_debug) = self.popup_latency_debug.as_mut()
-            && popup_debug.surface_id == surface_id {
-                popup_debug.committed_at = Some(Duration::from(self.clock.now()));
-                if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
-                    tracing::info!(
-                        surface_id,
-                        created_to_commit_ms = popup_debug
-                            .committed_at
-                            .and_then(|commit| commit.checked_sub(popup_debug.created_at))
-                            .map(|delta| delta.as_secs_f64() * 1000.0),
-                        "xdg popup latency: committed"
-                    );
-                }
+            && popup_debug.surface_id == surface_id
+        {
+            popup_debug.committed_at = Some(Duration::from(self.clock.now()));
+            if shoji_env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
+                tracing::info!(
+                    surface_id,
+                    created_to_commit_ms = popup_debug
+                        .committed_at
+                        .and_then(|commit| commit.checked_sub(popup_debug.created_at))
+                        .map(|delta| delta.as_secs_f64() * 1000.0),
+                    "xdg popup latency: committed"
+                );
             }
+        }
     }
 
     fn popup_kind_name(popup: &PopupKind) -> &'static str {
@@ -4454,7 +4459,7 @@ impl ShojiWM {
             })
             .collect::<Vec<_>>();
 
-        if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
             let element_location = self.space.element_location(window);
             let geometry = window.geometry();
             tracing::info!(
@@ -4711,11 +4716,7 @@ impl WaylandClientIdentity {
         };
 
         let mut byte = [0_u8; 1];
-        let peer_state = match recv(
-            socket,
-            &mut byte,
-            RecvFlags::PEEK | RecvFlags::DONTWAIT,
-        ) {
+        let peer_state = match recv(socket, &mut byte, RecvFlags::PEEK | RecvFlags::DONTWAIT) {
             Ok((_, 0)) => "peer-closed".to_owned(),
             Ok((_, count)) => format!("peer-open-pending-data:{count}"),
             Err(error) if error == smithay::reexports::rustix::io::Errno::AGAIN => {

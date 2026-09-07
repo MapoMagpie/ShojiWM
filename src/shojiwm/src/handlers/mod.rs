@@ -62,6 +62,7 @@ use smithay::output::WeakOutput;
 use smithay::{backend::{allocator::dmabuf::Dmabuf, renderer::ImportDma}};
 
 use crate::state::ShojiWM;
+use crate::shoji_env;
 
 impl SeatHandler for ShojiWM {
     type KeyboardFocus = WlSurface;
@@ -130,7 +131,7 @@ impl SeatHandler for ShojiWM {
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
-        if std::env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some() {
+        if shoji_env::var_os("SHOJI_LAYER_FOCUS_DEBUG").is_some() {
             tracing::debug!(
                 focused_surface = focused.map(|surface| surface.id().protocol_id()),
                 "keyboard focus changed"

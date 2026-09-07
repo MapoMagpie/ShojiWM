@@ -37,13 +37,10 @@ use smithay::{
 use tracing::{error, info, trace, warn};
 
 use crate::{
-    activation_environment::publish_activation_environment,
-    backend::tty::{
+    activation_environment::publish_activation_environment, backend::tty::{
         device_added, device_changed, device_removed, pause_tty_session, render_if_needed,
         resume_tty_session, try_fast_cursor_move,
-    },
-    config::tty_output_names_match,
-    state::ShojiWM,
+    }, config::tty_output_names_match, shoji_env, state::ShojiWM,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +59,7 @@ impl ShojiWMBackend {
 }
 
 fn tty_maintenance_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_TTY_MAINTENANCE_DEBUG")
+    shoji_env::var_os("SHOJI_TTY_MAINTENANCE_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 

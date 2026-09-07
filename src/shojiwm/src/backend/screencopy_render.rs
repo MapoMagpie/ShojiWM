@@ -23,6 +23,7 @@ use smithay::wayland::shm;
 use crate::backend::tty::TtyRenderElements;
 use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManagerState};
 use crate::state::ShojiWM;
+use crate::shoji_env;
 
 /// Render and submit all queued screencopies that target `output`.
 ///
@@ -45,7 +46,7 @@ pub fn process_screencopy_queue_for_output(
     cursor_elements: &[TtyRenderElements],
 ) {
     timescope::scope!("screencopy queue output");
-    let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
+    let profile = shoji_env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let entry_at = std::time::Instant::now();
     let mut processed = 0usize;
     let mut waited = 0usize;
@@ -242,7 +243,7 @@ fn render_to_dmabuf(
     elements: &[impl RenderElement<GlesRenderer>],
 ) -> Result<SyncPoint, Box<dyn std::error::Error>> {
     timescope::scope!("screencopy render_to_dmabuf");
-    let profile = std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
+    let profile = shoji_env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some();
     let bind_at = std::time::Instant::now();
     let mut target = renderer.bind(&mut dmabuf)?;
     let bind_ms = bind_at.elapsed().as_secs_f64() * 1000.0;

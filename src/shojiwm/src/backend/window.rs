@@ -39,7 +39,7 @@ use smithay::{
 };
 use tracing::{info, warn};
 
-use crate::{backend::clipped_surface::ClippedSurfaceElement, ssd::ContentClip};
+use crate::{backend::clipped_surface::ClippedSurfaceElement, shoji_env, ssd::ContentClip};
 
 pub enum WindowClipElement {
     Clipped(ClippedSurfaceElement),
@@ -47,15 +47,15 @@ pub enum WindowClipElement {
 }
 
 fn popup_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_POPUP_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_POPUP_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn gap_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
+    shoji_env::var_os("SHOJI_GAP_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
 fn clip_selection_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_CLIP_SELECTION_DEBUG")
+    shoji_env::var_os("SHOJI_CLIP_SELECTION_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
@@ -631,7 +631,7 @@ pub fn debug_surface_elements<R>(
     R: Renderer + ImportAll,
     R::TextureId: Clone + 'static,
 {
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_none() {
+    if shoji_env::var_os("SHOJI_GAP_DEBUG").is_none() {
         return;
     }
 
@@ -866,7 +866,7 @@ pub fn clipped_surface_elements(
     let clip = clip.filter(|clip| clip.clips_surface);
 
     let elements = surface_elements(window, renderer, location, output_scale, alpha);
-    if clip.is_none() || std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some() {
+    if clip.is_none() || shoji_env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some() {
         return Ok(elements.into_iter().map(WindowClipElement::Raw).collect());
     }
 
@@ -897,10 +897,7 @@ pub fn clipped_surface_elements(
         .iter()
         .map(|element| Element::geometry(element, output_scale))
         .collect::<Vec<_>>();
-    let element_srcs = elements
-        .iter()
-        .map(Element::src)
-        .collect::<Vec<_>>();
+    let element_srcs = elements.iter().map(Element::src).collect::<Vec<_>>();
     let selected_indices = geometry
         .map(|forced_geometry| {
             let best_score = element_geometries

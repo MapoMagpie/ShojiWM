@@ -47,6 +47,7 @@ pub mod runtime_key_binding;
 pub mod runtime_pointer;
 pub mod runtime_process;
 pub mod runtime_workspace;
+pub mod shoji_env;
 pub mod ssd;
 pub mod state;
 pub mod window_decoration;
@@ -74,6 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     apply_runtime_overrides(&args);
     init_runtime_paths(&args);
     sanitize_inherited_compositor_environment();
+    // Freeze SHOJI_* environment lookups: every later read is served from this
+    // snapshot instead of scanning the live environment on each call.
+    shoji_env::capture();
 
     let backend = if args.tty {
         ShojiWMBackend::TTY

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{
     backend::visual::window_visual_state,
+    shoji_env,
     ssd::{LogicalRect, WindowDecorationState, WindowTransform},
 };
 
@@ -198,7 +199,7 @@ pub fn capture_snapshot<E: RenderElement<GlesRenderer>>(
             let before = damage.current_commit();
             damage.add(rects.iter().copied());
             let after = damage.current_commit();
-            if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+            if shoji_env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
                 tracing::info!(
                     commit_before = ?before,
                     commit_after = ?after,
@@ -207,7 +208,7 @@ pub fn capture_snapshot<E: RenderElement<GlesRenderer>>(
                     "transform snapshot capture damage added"
                 );
             }
-        } else if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+        } else if shoji_env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
             let commit = snapshot.damage.lock().unwrap().current_commit();
             tracing::info!(
                 commit = ?commit,
@@ -215,7 +216,7 @@ pub fn capture_snapshot<E: RenderElement<GlesRenderer>>(
                 "transform snapshot capture: empty damage rects (no visual change)"
             );
         }
-    } else if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+    } else if shoji_env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
         let commit = snapshot.damage.lock().unwrap().current_commit();
         tracing::info!(
             commit = ?commit,
