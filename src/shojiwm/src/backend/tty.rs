@@ -1001,7 +1001,9 @@ struct SurfaceData {
     /// its next buffer, i.e. possibly while the GPU is still sampling the old one. Drivers with
     /// implicit dma-buf fences (Mesa) make the client's next render wait anyway; the NVIDIA
     /// proprietary driver has none, so the client cleared and re-rendered a buffer we were still
-    /// compositing — a window that flashed transparent for one frame.
+    /// compositing — a window that flashed transparent for one frame. Only surfaces that use
+    /// `linux-drm-syncobj-v1` are held; see `collect_client_buffers_for_hold` for what that
+    /// leaves uncovered.
     held_client_buffers: Vec<smithay::backend::renderer::utils::Buffer>,
     frame_callback_timer_armed: bool,
     frame_callback_timer_generation: u64,
@@ -1506,28 +1508,51 @@ pub fn device_added(
     Ok(())
 }
 
-/// Every client buffer the next render of `output` can sample: the windows drawn on it
-/// (`windows`, with their popups and subsurfaces), its layer surfaces, its session-lock surface
-/// and a surface cursor while the pointer is on it. See `SurfaceData::held_client_buffers` for
-/// why they are held past the render.
+/// Every client buffer of an explicit-sync surface that the next render of `output` can
+/// sample: the windows drawn on it (`windows`, with their popups and subsurfaces), its layer
+/// surfaces, its session-lock surface and a surface cursor while the pointer is on it. See
+/// `SurfaceData::held_client_buffers` for why they are held past the render.
 ///
 /// Only what this output draws is held. Holding every window in the space kept windows on a
 /// fast panel waiting for the slowest output's flip (a 30 Hz TV). Toplevel image-copy captures,
 /// which can sample windows on other outputs, need no hold: they read back into shm, which waits
 /// for the GPU before the capture completes.
+///
+/// Only surfaces that use `linux-drm-syncobj-v1` are held: their release point is signalled from
+/// the CPU when the buffer drops, and nothing orders it after our GPU read. When we render with
+/// Mesa, an implicit-sync dma-buf carries that read as a fence a Mesa client waits on before
+/// rendering into it again, and an shm buffer is copied during the render, so holding those only
+/// delays their release. The NVIDIA proprietary driver takes no part in implicit sync (see
+/// `ShojiWM::drm_syncobj_state` and `SurfaceData::held_client_buffers`), so without explicit
+/// sync the hold is lost for a client rendering on it, and for every implicit-sync dma-buf while
+/// we render on it. Such an NVIDIA client was not synchronised on acquire either: the pre-commit
+/// hook's dma-buf fence wait finds nothing to wait on.
 fn collect_client_buffers_for_hold(
     state: &ShojiWM,
     output: &Output,
     windows: &[smithay::desktop::Window],
 ) -> Vec<smithay::backend::renderer::utils::Buffer> {
     use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+    use smithay::reexports::wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
     use smithay::wayland::compositor::{SurfaceData, TraversalAction, with_surface_tree_downward};
+    use std::cell::RefCell;
 
     let mut held = Vec::new();
     // Read through the `SurfaceData` the traversal already holds. Going back in through
     // `with_states` / `with_renderer_surface_state` for the same surface re-locks its mutex
     // from inside the traversal and deadlocks the compositor on its first frame.
     let mut hold = |states: &SurfaceData| {
+        // smithay inserts this once the client creates a syncobj surface, and leaves it (as
+        // `None`) if that object is destroyed later: a buffer committed before then still
+        // carries its release point, so a surface that ever had one is still held (along with
+        // any later implicit or shm buffers it attaches, which is harmless).
+        if states
+            .data_map
+            .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+            .is_none()
+        {
+            return;
+        }
         if let Some(buffer) = states
             .data_map
             .get::<RendererSurfaceStateUserData>()
