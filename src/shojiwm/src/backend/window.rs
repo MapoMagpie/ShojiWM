@@ -272,16 +272,26 @@ fn region_bounds_within_layer(
     ))
 }
 
+/// Layer surfaces for the passes above and below the windows, front-to-back.
+///
+/// Each pass is ordered by layer first (Overlay over Top, Bottom over
+/// Background) and by bind order only within a layer, newest in front. Taking
+/// the whole map in bind order instead let a Background surface bound after a
+/// Bottom one draw over it: a shell reload re-binding its wallpaper buried a
+/// Bottom-layer panel on the same output until that panel re-bound too.
 pub fn layer_surfaces_for_output(
     output: &smithay::output::Output,
 ) -> (Vec<LayerSurface>, Vec<LayerSurface>) {
     let map = layer_map_for_output(output);
-    let (lower, upper): (Vec<LayerSurface>, Vec<LayerSurface>) = map
-        .layers()
-        .rev()
-        .filter(|surface| layer_surface_is_mapped(surface))
-        .cloned()
-        .partition(|surface| matches!(surface.layer(), WlrLayer::Background | WlrLayer::Bottom));
+    let ordered = |layers: &[WlrLayer]| -> Vec<LayerSurface> {
+        layers
+            .iter()
+            .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+            .filter(layer_surface_is_mapped)
+            .collect()
+    };
+    let upper = ordered(&[WlrLayer::Overlay, WlrLayer::Top]);
+    let lower = ordered(&[WlrLayer::Bottom, WlrLayer::Background]);
     (upper, lower)
 }
 
