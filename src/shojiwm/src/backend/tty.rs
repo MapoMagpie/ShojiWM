@@ -2010,22 +2010,25 @@ fn submit_deferred_frame(
         Some(err) => {
             // The held frame is gone either way; put the surface back into a
             // state where a fresh render can recover through the normal
-            // (fully error-handled) path. `EmptyFrame` means a follow-up
-            // render emptied the staged frame — its own no-damage handling
-            // already ran, so stay quiet about it.
+            // (fully error-handled) path. `EmptyFrame` is expected and stays
+            // quiet, but still redraws: besides a follow-up render emptying
+            // the staged frame, smithay's modeset bandwidth fallback in
+            // `use_mode` consumes the staged frame of every output and
+            // commits a black one, which would otherwise stay on screen
+            // until the next input or client commit. After a genuine
+            // no-damage replacement the redraw is one empty render.
             surface.frame_pending = false;
             surface.redraw_state = TtyRedrawState::Idle;
             let output_name = surface.output.name();
             use smithay::backend::drm::compositor::FrameError;
-            let empty = matches!(err, FrameError::EmptyFrame);
-            if !empty {
+            if !matches!(err, FrameError::EmptyFrame) {
                 warn!(
                     output = %output_name,
                     ?err,
                     "deferred frame submission failed; falling back to a fresh render"
                 );
-                state.schedule_redraw();
             }
+            state.schedule_redraw();
         }
     }
 }
