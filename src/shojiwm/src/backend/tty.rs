@@ -13541,7 +13541,22 @@ pub fn apply_tty_output_mode(
                     &DrmOutputRenderElements::default(),
                 )?;
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
-            surface.redraw_state = TtyRedrawState::Queued;
+            if surface.deferred_submit.take().is_some() {
+                // Staged for a deadline commit but not committed: nothing is in flight. Drop it
+                // (its timer sees the new generation and returns) and render the new mode now,
+                // instead of committing a frame sized for the old one.
+                surface.deferred_submit_generation =
+                    surface.deferred_submit_generation.wrapping_add(1);
+                surface.frame_pending = false;
+                surface.redraw_state = TtyRedrawState::Queued;
+            } else if surface.frame_pending {
+                // A committed frame is still waiting for its flip. Rendering now would put a
+                // second frame in flight, which `frame_pending` and `held_client_buffers` both
+                // assume never happens; `frame_finish` redraws once it has flipped.
+                surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed: true };
+            } else {
+                surface.redraw_state = TtyRedrawState::Queued;
+            }
             return Ok(true);
         }
     }
