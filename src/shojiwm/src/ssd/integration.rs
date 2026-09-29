@@ -870,7 +870,7 @@ impl DecorationEvaluator for DecorationRuntimeEvaluator {
 
     fn scheduler_tick(
         &self,
-        now_ms: u64,
+        now_ms: f64,
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
         match self {
             Self::Static(_) => Ok(DecorationSchedulerTick::default()),
@@ -2072,7 +2072,7 @@ impl ShojiWM {
         self.managed_window_animation_sequence =
             self.managed_window_animation_sequence.wrapping_add(1);
         let channel = animation.channel.clone();
-        let started_at_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        let started_at_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
         let had_any_existing = self
             .managed_window_animations
             .get(&window_id)
@@ -2352,7 +2352,7 @@ impl ShojiWM {
 
     fn advance_managed_window_animations(
         &mut self,
-        now_ms: u64,
+        now_ms: f64,
     ) -> std::collections::HashSet<String> {
         let mut dirty_rect_window_ids = std::collections::HashSet::new();
         if self.managed_window_animations.is_empty() {
@@ -4317,7 +4317,14 @@ impl ShojiWM {
         }
         managed_rect_apply_window_ids.extend({
             timescope::scope!("ssd advance window animations");
-            self.advance_managed_window_animations(now_ms)
+            // The frame's presentation time when a render asked for this refresh; the
+            // wall clock otherwise. Never before the wall clock: an animation started
+            // since the frame was predicted must not sample before its own start.
+            let wall_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
+            let animation_now_ms = self
+                .animation_frame_time_ms
+                .map_or(wall_ms, |frame_ms| frame_ms.max(wall_ms));
+            self.advance_managed_window_animations(animation_now_ms)
         });
         if managed_rect_debug_enabled() {
             let mut apply_ids = managed_rect_apply_window_ids
@@ -5888,7 +5895,7 @@ fn managed_rect_snapshot_to_logical_rect(rect: ManagedWindowRectSnapshot) -> Log
     LogicalRect::new(left, top, right - left, bottom - top)
 }
 
-fn managed_animation_progress(active: &ActiveManagedWindowAnimation, now_ms: u64) -> (f64, bool) {
+fn managed_animation_progress(active: &ActiveManagedWindowAnimation, now_ms: f64) -> (f64, bool) {
     let duration = active
         .animation
         .rect
@@ -5912,8 +5919,8 @@ fn managed_animation_progress(active: &ActiveManagedWindowAnimation, now_ms: u64
         .max()
         .unwrap_or(1)
         .max(1);
-    let elapsed = now_ms.saturating_sub(active.started_at_ms);
-    let raw = (elapsed as f64 / duration as f64).clamp(0.0, 1.0);
+    let elapsed = (now_ms - active.started_at_ms).max(0.0);
+    let raw = (elapsed / duration as f64).clamp(0.0, 1.0);
     let eased = sample_easing(
         active
             .animation
@@ -5937,7 +5944,7 @@ fn managed_animation_progress(active: &ActiveManagedWindowAnimation, now_ms: u64
             .unwrap_or_default(),
         raw,
     );
-    (eased, elapsed < duration)
+    (eased, elapsed < duration as f64)
 }
 
 fn sample_rect_animation(
@@ -9504,6 +9511,30 @@ mod tests {
         }
     }
 
+    /// 120 Hz frames are 8.33 ms apart; whole-millisecond sampling stepped a linear
+    /// 250 ms animation by 3.2 % and 3.6 % of its distance in turn.
+    #[test]
+    fn managed_animation_progress_keeps_fractional_frame_times() {
+        let animation = test_rect_animation(
+            "default",
+            1,
+            ManagedWindowAnimationMode::Override,
+            test_rect(0.0, 0.0, 100.0, 100.0),
+            test_rect(250.0, 0.0, 100.0, 100.0),
+        );
+        let frame_ms = 1000.0 / 120.0;
+        let steps = (1..=6)
+            .map(|frame| {
+                let before = managed_animation_progress(&animation, (frame - 1) as f64 * frame_ms).0;
+                let after = managed_animation_progress(&animation, frame as f64 * frame_ms).0;
+                after - before
+            })
+            .collect::<Vec<_>>();
+        for step in &steps {
+            assert!((step - frame_ms / 250.0).abs() < 1e-9, "uneven steps: {steps:?}");
+        }
+    }
+
     fn test_rect(x: f64, y: f64, width: f64, height: f64) -> ManagedWindowRectSnapshot {
         ManagedWindowRectSnapshot {
             x,
@@ -9522,7 +9553,7 @@ mod tests {
     ) -> ActiveManagedWindowAnimation {
         ActiveManagedWindowAnimation {
             sequence,
-            started_at_ms: 0,
+            started_at_ms: 0.0,
             animation: ManagedWindowAnimationSnapshot {
                 channel: channel.into(),
                 rect: Some(ManagedWindowRectAnimationSnapshot {

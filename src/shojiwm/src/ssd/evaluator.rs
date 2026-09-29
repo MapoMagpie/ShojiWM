@@ -89,7 +89,7 @@ pub trait DecorationEvaluator {
 
     fn scheduler_tick(
         &self,
-        _now_ms: u64,
+        _now_ms: f64,
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
         Ok(DecorationSchedulerTick::default())
     }
@@ -2483,7 +2483,7 @@ impl EmbeddedDecorationRuntime {
     fn write_scheduler_fast_request(
         &mut self,
         request_id: u64,
-        now_ms: u64,
+        now_ms: f64,
     ) -> Result<(), DecorationEvaluationError> {
         timescope::scope!("runtime write scheduler fast request");
         self.child
@@ -3356,7 +3356,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
 
     fn scheduler_tick(
         &self,
-        now_ms: u64,
+        now_ms: f64,
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
@@ -6029,6 +6029,117 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         );
     }
 
+    /// Frame-driven kinetic scrolling: ticks stamped with fractional frame
+    /// times (the compositor's predicted presentation times) move the glide by
+    /// exactly one frame's worth each, even with wall-clock requests that run
+    /// behind them in between. Whole-millisecond ticks used to step 16, 16, 17
+    /// ms and the timer landed them anywhere between two frames.
+    #[test]
+    fn workspace_kinetic_scroll_steps_once_per_fractional_frame_tick() {
+        use crate::ssd::window_model::{
+            GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
+        };
+
+        let evaluator = real_config_evaluator();
+        let mut display_state = std::collections::BTreeMap::new();
+        display_state.insert("TEST-1".to_string(), test_output_snapshot("TEST-1"));
+        evaluator.set_display_state(display_state);
+        evaluator
+            .lifecycle_enable("reload", Some(&tiled_workspace_persisted_state()))
+            .expect("tiled lifecycle should succeed");
+
+        let mut now = 0;
+        let mut previous: Option<&str> = None;
+        for id in ["0xa", "0xb", "0xc", "0xd"] {
+            let window = make_named_window(id, "kitty", false, false);
+            evaluator
+                .evaluate_window_preview(&window, now)
+                .expect("preview should evaluate");
+            if let Some(previous) = previous {
+                let unfocused = make_named_window(previous, "kitty", false, false);
+                evaluator
+                    .evaluate_window(&unfocused, now + 25)
+                    .expect("defocus evaluation should succeed");
+            }
+            let focused = make_named_window(id, "kitty", true, false);
+            evaluator
+                .evaluate_window(&focused, now + 50)
+                .expect("evaluation should succeed");
+            previous = Some(id);
+            now += 100;
+        }
+
+        let swipe = |phase: GestureSwipePhaseSnapshot, velocity_x: f64, timestamp: u64| {
+            let delta_x = if phase == GestureSwipePhaseSnapshot::Update { 15.0 } else { 0.0 };
+            GestureSwipeEventSnapshot {
+                phase,
+                fingers: 3,
+                position: None,
+                delta_x,
+                delta_y: 0.0,
+                total_x: delta_x,
+                total_y: 0.0,
+                velocity_x,
+                velocity_y: 0.0,
+                output_name: Some("TEST-1".into()),
+                device: None,
+                timestamp,
+            }
+        };
+        const RELEASE_VELOCITY: f64 = 1500.0;
+        evaluator
+            .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::Begin, 0.0, now), now)
+            .expect("begin should evaluate");
+        for _ in 0..4 {
+            now += 10;
+            evaluator
+                .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::Update, RELEASE_VELOCITY, now), now)
+                .expect("update should evaluate");
+        }
+        now += 10;
+        evaluator
+            // The persisted workspace starts scrolled to its end, so the glide
+            // runs back toward the start: the tiles move right.
+            .gesture_swipe(&swipe(GestureSwipePhaseSnapshot::End, RELEASE_VELOCITY, now), now)
+            .expect("end should evaluate");
+
+        // The test output runs at 60 Hz: one frame is 16.67 ms, which no whole
+        // millisecond interval matches.
+        let frame_ms = 1000.0 / 60.0;
+        let time_constant_ms = 360.0;
+        let rect_x = |at: u64| {
+            evaluator
+                .evaluate_cached_window("0xa", None, at, false)
+                .expect("cached evaluation should succeed")
+                .managed_window
+                .rect
+                .expect("tiled window should have a managed rect")
+                .x
+        };
+        let release_ms = now as f64;
+        let mut last_x = rect_x(now);
+        for frame in 1..=15 {
+            let frame_time = release_ms + frame as f64 * frame_ms;
+            // A wall-clock request from just before this frame's presentation
+            // time; it must not pull the scheduler clock back.
+            rect_x(frame_time.floor() as u64 - 4);
+            evaluator
+                .scheduler_tick(frame_time)
+                .expect("scheduler tick should evaluate");
+            let x = rect_x(frame_time.floor() as u64);
+            let velocity =
+                RELEASE_VELOCITY * (-(frame as f64) * frame_ms / time_constant_ms).exp();
+            let expected_step = velocity * frame_ms / 1000.0;
+            let step = x - last_x;
+            assert!(
+                (step - expected_step).abs() <= 1.01,
+                "frame {frame}: the glide moved {step} px, one frame at this \
+                 velocity is {expected_step} px"
+            );
+            last_x = x;
+        }
+    }
+
     /// Kinetic settle, non-maximized anchor leaning the other way: the
     /// center-closest tile snaps flush to the LEFT edge when it sits left of
     /// the screen center.
@@ -6114,7 +6225,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now)
+                .scheduler_tick(now as f64)
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6221,7 +6332,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now)
+                .scheduler_tick(now as f64)
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6344,7 +6455,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now)
+                .scheduler_tick(now as f64)
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6448,7 +6559,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now)
+                .scheduler_tick(now as f64)
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6803,14 +6914,14 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
             }));
             // Other runtime traffic must not consume the pending layout update.
             evaluator.evaluate_window(&make_window(false), 0).unwrap();
-            evaluator.scheduler_tick(1).unwrap();
+            evaluator.scheduler_tick(1.0).unwrap();
             assert!(!evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
                 index, name: name.into(),
             }));
-            evaluator.scheduler_tick(2).unwrap();
+            evaluator.scheduler_tick(2.0).unwrap();
             // A full state payload must not re-emit an unchanged layout either.
             evaluator.runtime_state_generation.fetch_add(1, Ordering::Release);
-            evaluator.scheduler_tick(3).unwrap();
+            evaluator.scheduler_tick(3.0).unwrap();
         }
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
             index: 0, name: "English (US)".into(),
@@ -6818,7 +6929,7 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
             index: 1, name: "German".into(),
         });
-        evaluator.scheduler_tick(4).unwrap();
+        evaluator.scheduler_tick(4.0).unwrap();
         let state = evaluator.lifecycle_disable("reload").unwrap();
         assert_eq!(state["layouts"], serde_json::json!([
             { "index": 0, "name": "English (US)" },
@@ -6827,8 +6938,8 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
         ]));
         let reloaded = evaluator.fresh_like();
         reloaded.lifecycle_enable("reload", None).unwrap();
-        reloaded.scheduler_tick(5).unwrap();
-        reloaded.scheduler_tick(6).unwrap();
+        reloaded.scheduler_tick(5.0).unwrap();
+        reloaded.scheduler_tick(6.0).unwrap();
         let state = reloaded.lifecycle_disable("shutdown").unwrap();
         assert_eq!(state["layouts"], serde_json::json!([
             { "index": 1, "name": "German" },
@@ -6884,7 +6995,7 @@ COMPOSITOR.window.composition = (window) => {
             .evaluate_window(&window, 0)
             .expect("initial native composition should evaluate");
         let tick = evaluator
-            .scheduler_tick(16)
+            .scheduler_tick(16.0)
             .expect("animation scheduler should advance");
         assert!(tick.dirty_window_ids.iter().any(|id| id == &window.id));
 
@@ -6979,7 +7090,7 @@ COMPOSITOR.window.composition = (window) => {
             .evaluate_window(&window, 0)
             .expect("initial native composition should evaluate");
         let tick = evaluator
-            .scheduler_tick(16)
+            .scheduler_tick(16.0)
             .expect("animation scheduler should advance");
         assert!(
             tick.dirty_window_node_ids
@@ -7095,7 +7206,7 @@ COMPOSITOR.effect.window = (window) => ({
             .effect_uniform_patch_count();
 
         evaluator
-            .scheduler_tick(16)
+            .scheduler_tick(16.0)
             .expect("animation scheduler should advance");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 16, false)

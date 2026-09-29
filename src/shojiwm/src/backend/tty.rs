@@ -205,6 +205,67 @@ fn mpv_frame_debug_enabled() -> bool {
     std::env::var_os("SHOJI_MPV_FRAME_DEBUG").is_some_and(|value| value != "0" && !value.is_empty())
 }
 
+/// Flip observations kept per output for `vblank_grid`.
+const VBLANK_GRID_HISTORY: usize = 32;
+/// How late an observation may be and still count as handled promptly.
+const VBLANK_GRID_PROMPT: Duration = Duration::from_millis(1);
+
+/// Places the latest flip-completion observation on the output's vblank grid.
+///
+/// An observation may be the time its event was handled rather than a driver timestamp:
+/// never earlier than the real vblank, later by a varying delay (up to most of a frame
+/// while the main thread is busy). Most events are handled promptly, so the grid phase is
+/// the one the most recent observations land just after (within `VBLANK_GRID_PROMPT`),
+/// taken from among the observations themselves; ties go to the one that leaves them
+/// least late in total. A lone offset cannot tell a late event from an early grid, but a
+/// few dozen of them can.
+///
+/// Returns the vblank the latest flip completed at and the first vblank after the
+/// observation, which is when a frame rendered now can be shown.
+fn vblank_grid(
+    history: &std::collections::VecDeque<Duration>,
+    observed: Duration,
+    period: Duration,
+) -> (Duration, Duration) {
+    if period.is_zero() || history.is_empty() {
+        return (observed, observed + period);
+    }
+    let period_s = period.as_secs_f64();
+    let lateness = |time: Duration, phase: Duration| {
+        (time.as_secs_f64() - phase.as_secs_f64()).rem_euclid(period_s)
+    };
+    let prompt_s = VBLANK_GRID_PROMPT.as_secs_f64();
+    let fit = |phase: Duration| -> (usize, f64) {
+        let mut prompt = 0;
+        let mut total = 0.0;
+        for time in history {
+            let late = lateness(*time, phase);
+            if late <= prompt_s {
+                prompt += 1;
+            }
+            total += late;
+        }
+        (prompt, total)
+    };
+    let phase = history
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            let (left_prompt, left_total) = fit(*left);
+            let (right_prompt, right_total) = fit(*right);
+            left_prompt
+                .cmp(&right_prompt)
+                .then_with(|| right_total.total_cmp(&left_total))
+        })
+        .unwrap_or(observed);
+    let vblank = observed - Duration::from_secs_f64(lateness(observed, phase));
+    let mut next = vblank + period;
+    while next <= observed {
+        next += period;
+    }
+    (vblank, next)
+}
+
 fn sanitize_next_frame_target(
     next_frame_target: Option<Duration>,
     fallback_frame_time: Duration,
@@ -1015,6 +1076,10 @@ struct SurfaceData {
     redraw_state: TtyRedrawState,
     frame_duration: Duration,
     next_frame_target: Option<Duration>,
+    /// Recent flip-completion observations; see `vblank_grid`.
+    vblank_observations: std::collections::VecDeque<Duration>,
+    /// The last `next_frame_target` derived from the vblank grid.
+    last_grid_frame_target: Option<Duration>,
     estimated_render_duration: Duration,
     last_presented_at: Option<Duration>,
     last_frame_callback_at: Option<Duration>,
@@ -1571,6 +1636,63 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 }
 
 #[cfg(test)]
+mod vblank_grid_tests {
+    use super::{VBLANK_GRID_HISTORY, vblank_grid};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    const PERIOD_US: f64 = 1_000_000.0 / 120.0;
+
+    fn us(value: f64) -> Duration {
+        Duration::from_secs_f64(value / 1_000_000.0)
+    }
+
+    /// Feeds flips completing at real vblanks `1 s + n * period`, each observed `delay`
+    /// later, and returns each predicted next-frame time in microseconds.
+    fn predictions(delays: &[f64]) -> Vec<f64> {
+        let period = us(PERIOD_US);
+        let mut history = VecDeque::new();
+        delays
+            .iter()
+            .enumerate()
+            .map(|(index, delay)| {
+                let observed = us(1_000_000.0 + index as f64 * PERIOD_US + delay);
+                if history.len() == VBLANK_GRID_HISTORY {
+                    history.pop_front();
+                }
+                history.push_back(observed);
+                vblank_grid(&history, observed, period).1.as_secs_f64() * 1_000_000.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn late_events_still_predict_frames_on_the_grid() {
+        // Mostly prompt, with the multi-millisecond delays seen under load mixed in.
+        let delays = [
+            100.0, 250.0, 4000.0, 180.0, 5000.0, 300.0, 120.0, 7000.0, 150.0, 6100.0, 200.0,
+            2500.0, 110.0, 400.0,
+        ];
+        // Settled after a few flips: every prediction is the vblank after the one the
+        // flip completed at, on the phase of the promptest observation so far.
+        for (index, target) in predictions(&delays).iter().enumerate().skip(2) {
+            let expected = 1_000_000.0 + (index + 1) as f64 * PERIOD_US + 100.0;
+            assert!(
+                (target - expected).abs() < 1.0,
+                "frame {index}: predicted {target} us, the grid says {expected} us"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_first_event_is_corrected_by_the_next_on_time_one() {
+        let targets = predictions(&[2800.0, 200.0]);
+        let expected = 1_000_000.0 + 2.0 * PERIOD_US + 200.0;
+        assert!((targets[1] - expected).abs() < 1.0, "predicted {} us", targets[1]);
+    }
+}
+
+#[cfg(test)]
 mod implicit_sync_tests {
     use super::drivers_take_part_in_implicit_sync as trusted;
 
@@ -1738,7 +1860,45 @@ fn frame_finish(
             DrmEventTime::Realtime(_) => None,
         })
         .unwrap_or_else(|| Duration::from(state.clock.now()));
-    surface.next_frame_target = Some(presentation_clock + surface.frame_duration);
+    // The next frame's presentation time, on the output's vblank grid. It is what frame
+    // callbacks report and what frame-driven runtime work (kinetic scrolling) is stamped
+    // with, so it has to advance by whole refresh periods: `presentation_clock` itself is
+    // only as good as the driver's timestamp, and NVIDIA's flip events carry none, which
+    // leaves the time this event was dispatched — late by however long the main thread
+    // was busy. Stepping a glide by those gaps (8, 12, 10.7, 10 ms while the display
+    // flipped every 8.33) was the judder in kinetic scrolling.
+    if surface.vblank_observations.len() == VBLANK_GRID_HISTORY {
+        surface.vblank_observations.pop_front();
+    }
+    surface.vblank_observations.push_back(presentation_clock);
+    let (grid_vblank, mut next_frame_target) = vblank_grid(
+        &surface.vblank_observations,
+        presentation_clock,
+        surface.frame_duration,
+    );
+    // Each flip is a frame of its own, so it cannot share a presentation time with the
+    // previous one; that happens when a phase re-estimate or an event handled after the
+    // following vblank lands both on the same grid point.
+    if let Some(last) = surface.last_grid_frame_target
+        && next_frame_target < last + surface.frame_duration / 2
+    {
+        next_frame_target = last + surface.frame_duration;
+    }
+    surface.last_grid_frame_target = Some(next_frame_target);
+    surface.next_frame_target = Some(next_frame_target);
+    if ShojiWM::motion_trace_enabled() {
+        info!(
+            output = %surface.output.name(),
+            presented_ms = presentation_clock.as_secs_f64() * 1000.0,
+            grid_ms = grid_vblank.as_secs_f64() * 1000.0,
+            next_frame_target_ms = next_frame_target.as_secs_f64() * 1000.0,
+            timestamped = metadata
+                .as_ref()
+                .is_some_and(|metadata| matches!(metadata.time, DrmEventTime::Monotonic(_))),
+            sequence = present_sequence,
+            "motion trace: vblank"
+        );
+    }
     // Track how far the kernel timestamp runs ahead of the event delivery
     // (zero on drivers whose events arrive after their timestamp); the cursor
     // commit deadline subtracts this so its lead time is real, not
@@ -3246,6 +3406,34 @@ fn render_surface(
     {
         surface.last_decoration_refresh_at = Some(Instant::now());
     }
+    let mut motion_trace_frame_tick: Option<(f64, bool)> = None;
+    // Frame-driven runtime work (kinetic scrolling, poll-driven animations) steps here, at
+    // the time this frame will be shown, so the refresh below lays out exactly that step.
+    // See `tick_runtime_scheduler_for_frame`.
+    if redraw_state_at_entry == TtyRedrawState::Queued
+        && let Some(surface) = state
+            .tty_backends
+            .get(&node)
+            .and_then(|backend| backend.surfaces.get(&crtc))
+    {
+        let frame_duration = surface.frame_duration;
+        let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
+        let (frame_time, _) = sanitize_next_frame_target(
+            surface.next_frame_target,
+            fallback_frame_time,
+            frame_duration,
+        );
+        let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
+        // Usually already stepped for this frame right after the previous flip was queued.
+        let preticked = state
+            .runtime_scheduler_pretick_ms
+            .take()
+            .is_some_and(|pretick_ms| (pretick_ms - frame_time_ms).abs() < 1.0);
+        let ticked = preticked || state.tick_runtime_scheduler_for_frame(frame_time_ms);
+        motion_trace_frame_tick = Some((frame_time_ms, ticked));
+        // Rust-side window animations (rect / offset / opacity) sample at the same time.
+        state.animation_frame_time_ms = Some(frame_time_ms);
+    }
 
     let decoration_refresh_started_at = Instant::now();
     {
@@ -3271,6 +3459,7 @@ fn render_surface(
             report_tty_config_error(state, err);
         }
     }
+    state.animation_frame_time_ms = None;
     // Output configuration is reactive. Evaluating the TypeScript runtime above can unmap this
     // output (for example, disabling the internal panel when a dock output appears). Do not carry
     // the stale DRM render request into scene preparation after that transition.
@@ -3306,6 +3495,9 @@ fn render_surface(
         }
     }
     let layer_effects_elapsed_ms = layer_effects_started_at.elapsed().as_secs_f64() * 1000.0;
+    if ShojiWM::motion_trace_enabled() {
+        log_motion_trace_frame(state, &output, motion_trace_frame_tick);
+    }
 
     let Some(output_geo) = state.space.output_geometry(&output) else {
         retire_unmapped_surface(state, node, crtc);
@@ -7508,6 +7700,30 @@ fn render_surface(
                 Some(frame_callback_sequence),
             );
             let _ = state.display_handle.flush_clients();
+            // Step frame-driven runtime work for the *next* frame now, while this flip is
+            // pending and the main thread would otherwise idle. Done at the start of the
+            // next render instead, the runtime round trip — and a kinetic step lays out
+            // every tile, so it grows with the window count — sat between the vblank and
+            // the flip commit and made crowded workspaces miss vblanks. The next render
+            // finds it done (`runtime_scheduler_pretick_ms`) and only catches up when its
+            // frame turned out to be a different one.
+            if ShojiWM::motion_trace_enabled() {
+                let wall_ms = callback_time.as_secs_f64() * 1000.0;
+                let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
+                info!(
+                    output = %output.name(),
+                    frame_time_ms,
+                    wall_ms,
+                    // Negative: the flip was committed after the vblank it was meant for.
+                    slack_ms = frame_time_ms - wall_ms,
+                    total_cpu_elapsed_ms = total_cpu_elapsed.as_secs_f64() * 1000.0,
+                    "motion trace: queued"
+                );
+            }
+            let next_frame_time_ms = (frame_time + frame_duration).as_secs_f64() * 1000.0;
+            if state.tick_runtime_scheduler_for_frame(next_frame_time_ms) {
+                state.runtime_scheduler_pretick_ms = Some(next_frame_time_ms);
+            }
         } else {
             if frame_liveness_debug_enabled() {
                 tracing::info!(
@@ -11883,6 +12099,45 @@ fn lower_layer_scene_elements(
     Ok(elements)
 }
 
+/// DEBUG (kinetic judder): one line per rendered frame with the frame's predicted
+/// presentation time, whether it ticked the runtime scheduler, and where each visible
+/// managed window sits (TS-declared x, and the physical x rendering will use).
+fn log_motion_trace_frame(state: &ShojiWM, output: &Output, frame_tick: Option<(f64, bool)>) {
+    let scale = output.current_scale().fractional_scale();
+    let output_x = state
+        .space
+        .output_geometry(output)
+        .map(|geo| geo.loc.x)
+        .unwrap_or_default();
+    let mut windows = state
+        .window_decorations
+        .values()
+        .filter(|decoration| {
+            decoration.managed_window.visible && !decoration.managed_window.idle
+        })
+        .filter_map(|decoration| {
+            let rect = decoration.managed_window.rect.as_ref()?;
+            let root_x = decoration.layout.root.rect.x as f64 + decoration.root_subpixel_offset.left;
+            Some(format!(
+                "{}:ts={:.3}:root={:.3}:phys={:.2}",
+                decoration.snapshot.id,
+                rect.x,
+                root_x,
+                (root_x - output_x as f64) * scale,
+            ))
+        })
+        .collect::<Vec<_>>();
+    windows.sort();
+    info!(
+        output = %output.name(),
+        frame_time_ms = ?frame_tick.map(|(time, _)| time),
+        ticked = ?frame_tick.map(|(_, ticked)| ticked),
+        wall_ms = Duration::from(state.clock.now()).as_secs_f64() * 1000.0,
+        windows = %windows.join(" "),
+        "motion trace: frame"
+    );
+}
+
 fn upper_layer_scene_elements(
     renderer: &mut GlesRenderer,
     space: &smithay::desktop::Space<smithay::desktop::Window>,
@@ -13629,6 +13884,8 @@ fn connector_connected(
         redraw_state: TtyRedrawState::Idle,
         frame_duration,
         next_frame_target: None,
+        vblank_observations: std::collections::VecDeque::with_capacity(VBLANK_GRID_HISTORY),
+        last_grid_frame_target: None,
         estimated_render_duration: Duration::from_millis(4),
         last_presented_at: None,
         last_frame_callback_at: None,

@@ -222,7 +222,8 @@ pub struct PopupLifecycleDebugEntry {
 #[derive(Debug, Clone)]
 pub struct ActiveManagedWindowAnimation {
     pub sequence: u64,
-    pub started_at_ms: u64,
+    /// Monotonic clock, fractional milliseconds (see `animation_frame_time_ms`).
+    pub started_at_ms: f64,
     pub animation: ManagedWindowAnimationSnapshot,
 }
 
@@ -378,6 +379,20 @@ pub struct ShojiWM {
     pub runtime_scheduler_kick_generation: u64,
     pub runtime_scheduler_kick_active: bool,
     pub runtime_scheduler_kick_interval_ms: Option<u64>,
+    /// When the runtime's next poll falls due (scheduler clock, ms); `None` when unknown.
+    /// Lets a rendered frame skip the runtime round trip while nothing is due.
+    pub runtime_scheduler_next_due_ms: Option<f64>,
+    /// While the TTY backend refreshes an output for a frame it is about to render: that
+    /// frame's predicted presentation time (monotonic, fractional ms). Rust-side window
+    /// animations sample at it, so each frame shows exactly the progress of the moment it
+    /// reaches the screen instead of the moment the render happened to start.
+    pub animation_frame_time_ms: Option<f64>,
+    /// The presentation time a frame-driven scheduler tick already ran for, ahead of the
+    /// render that will show it (see the TTY backend's queue path).
+    pub runtime_scheduler_pretick_ms: Option<f64>,
+    /// When a rendered frame last ticked the runtime scheduler. While frames keep doing
+    /// that, the scheduler timers stand down (see `frame_driven_runtime_scheduler_active`).
+    pub runtime_scheduler_last_frame_tick_at: Option<Instant>,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_globals: HashMap<String, GlobalId>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
@@ -1703,6 +1718,10 @@ impl ShojiWM {
             runtime_managed_only_window_ids: Default::default(),
             runtime_node_only_window_ids: Default::default(),
             runtime_scheduler_enabled: false,
+            runtime_scheduler_next_due_ms: None,
+            animation_frame_time_ms: None,
+            runtime_scheduler_pretick_ms: None,
+            runtime_scheduler_last_frame_tick_at: None,
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
             runtime_scheduler_kick_interval_ms: None,
@@ -2368,7 +2387,71 @@ impl ShojiWM {
     /// the runtime wake source: an IPC handler in TS just mutated state and we
     /// need to pull the resulting dirty actions through before the next idle
     /// poll would naturally fire (~250 ms later).
+    /// DEBUG (kinetic judder): whether `$XDG_RUNTIME_DIR/shoji-motion-trace` exists, which
+    /// turns on the per-frame "motion trace" log lines. Checked at most every 250 ms.
+    pub(crate) fn motion_trace_enabled() -> bool {
+        thread_local! {
+            static CACHE: std::cell::Cell<(Option<Instant>, bool)> =
+                const { std::cell::Cell::new((None, false)) };
+        }
+        CACHE.with(|cache| {
+            let (checked_at, enabled) = cache.get();
+            if checked_at.is_some_and(|at| at.elapsed() < Duration::from_millis(250)) {
+                return enabled;
+            }
+            let enabled = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(|dir| std::path::Path::new(&dir).join("shoji-motion-trace").exists())
+                .unwrap_or(false);
+            cache.set((Some(Instant::now()), enabled));
+            enabled
+        })
+    }
+
+    /// Ticks the runtime scheduler for a frame about to be rendered, at that frame's
+    /// predicted presentation time, if a poll is due by then.
+    ///
+    /// Frame-by-frame work in the runtime (kinetic scrolling, `createPoll`-driven
+    /// animations) used to run only from the scheduler timers. Those fire on their own
+    /// whole-millisecond cadence, not the output's, so a step landed at a varying point
+    /// between two vblanks: some frames showed a step computed a few microseconds
+    /// earlier, others one computed almost a frame earlier, and a frame now and then got
+    /// two steps or none. At a steady 120 fps that reads as judder. Ticking here, once per
+    /// rendered frame and stamped with the time the frame will be shown, gives each frame
+    /// exactly the motion that belongs to it. The step's dirty windows are then picked up
+    /// by the decoration refresh that follows in the same render.
+    pub(crate) fn tick_runtime_scheduler_for_frame(&mut self, frame_time_ms: f64) -> bool {
+        // Only for a poll the scheduler reported as due by this frame. Evaluations also
+        // switch `runtime_scheduler_enabled` on (a window with a running animation reports
+        // "next poll: now") without registering any poll; ticking for those put a runtime
+        // turn in every animated frame, and each turn handed back every window whose
+        // position signals the animation had moved — as full re-evaluations. Window
+        // animations already re-evaluate what they need in the decoration refresh.
+        let due = self
+            .runtime_scheduler_next_due_ms
+            .is_some_and(|due_ms| due_ms <= frame_time_ms + 0.5);
+        if !self.runtime_scheduler_enabled || !due {
+            return false;
+        }
+        self.runtime_scheduler_last_frame_tick_at = Some(Instant::now());
+        let _ = self.tick_runtime_scheduler_at(false, Some(frame_time_ms));
+        true
+    }
+
+    /// Whether rendered frames are currently ticking the runtime scheduler, in which case
+    /// the timers leave it to them: a timer tick in between would put a step at a time no
+    /// frame shows. Two frames without a frame tick hand the scheduler back to the timers,
+    /// so polls still run when nothing is being rendered.
+    fn frame_driven_runtime_scheduler_active(&self) -> bool {
+        let window = Duration::from_millis(self.runtime_frame_sync_interval_ms() * 2 + 2);
+        self.runtime_scheduler_last_frame_tick_at
+            .is_some_and(|at| at.elapsed() < window)
+    }
+
     fn tick_runtime_scheduler_with(&mut self, force: bool) -> u64 {
+        self.tick_runtime_scheduler_at(force, None)
+    }
+
+    fn tick_runtime_scheduler_at(&mut self, force: bool, frame_time_ms: Option<f64>) -> u64 {
         self.sync_keyboard_layout();
         self.refresh_runtime_processes();
         let managed_window_animation_active = !self.managed_window_animations.is_empty();
@@ -2390,7 +2473,8 @@ impl ShojiWM {
             return self.runtime_frame_sync_interval_ms();
         }
 
-        let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
+        let now_ms = frame_time_ms
+            .unwrap_or_else(|| Duration::from(self.clock.now()).as_secs_f64() * 1000.0);
         self.sync_runtime_display_state();
         let tick = match self.decoration_evaluator.scheduler_tick(now_ms) {
             Ok(tick) => tick,
@@ -2457,7 +2541,22 @@ impl ShojiWM {
             self.schedule_redraw();
         }
 
+        if Self::motion_trace_enabled() {
+            info!(
+                source = if frame_time_ms.is_some() { "frame" } else { "timer" },
+                tick_ms = now_ms,
+                wall_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0,
+                dirty = tick.dirty,
+                next_poll_in_ms = ?tick.next_poll_in_ms,
+                "motion trace: scheduler tick"
+            );
+        }
         self.runtime_scheduler_enabled = tick.next_poll_in_ms.is_some();
+        // Measured from this tick's timestamp; the runtime's clock may already be a little
+        // ahead of it, which only makes the estimate early (a frame then asks, and the
+        // runtime finds nothing due).
+        self.runtime_scheduler_next_due_ms =
+            tick.next_poll_in_ms.map(|delay| now_ms + delay as f64);
         self.runtime_scheduler_interval_ms(tick.next_poll_in_ms)
     }
 
@@ -2470,6 +2569,12 @@ impl ShojiWM {
             return;
         }
 
+        let now_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
+        let due_ms = now_ms + next_poll_in_ms.unwrap_or_default() as f64;
+        self.runtime_scheduler_next_due_ms = Some(
+            self.runtime_scheduler_next_due_ms
+                .map_or(due_ms, |current| current.min(due_ms)),
+        );
         self.runtime_scheduler_kick_generation =
             self.runtime_scheduler_kick_generation.wrapping_add(1);
         let generation = self.runtime_scheduler_kick_generation;
@@ -2488,6 +2593,11 @@ impl ShojiWM {
                 // itself for 250 ms while a kick is active, so dropping both creates a visible
                 // hand-off gap when pointer motion stops. One forced runtime tick establishes
                 // the authoritative global animation state before deciding whether to stop.
+                if state.frame_driven_runtime_scheduler_active() {
+                    let interval_ms = state.runtime_frame_sync_interval_ms();
+                    state.runtime_scheduler_kick_interval_ms = Some(interval_ms);
+                    return TimeoutAction::ToDuration(Duration::from_millis(interval_ms));
+                }
                 let next_interval_ms = state.tick_runtime_scheduler_with(true);
                 if state.runtime_scheduler_kick_generation != generation
                     || !state.runtime_scheduler_enabled
@@ -2554,6 +2664,12 @@ impl ShojiWM {
                 if state.runtime_scheduler_kick_active && state.runtime_scheduler_enabled {
                     state.refresh_runtime_processes();
                     return TimeoutAction::ToDuration(Duration::from_millis(250));
+                }
+                if state.frame_driven_runtime_scheduler_active() {
+                    state.refresh_runtime_processes();
+                    return TimeoutAction::ToDuration(Duration::from_millis(
+                        state.runtime_frame_sync_interval_ms(),
+                    ));
                 }
                 let next_interval_ms = state.tick_runtime_scheduler();
                 TimeoutAction::ToDuration(Duration::from_millis(next_interval_ms))

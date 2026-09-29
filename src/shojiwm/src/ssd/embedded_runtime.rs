@@ -218,7 +218,9 @@ pub enum NativeInteractionRequest {
 pub struct NativeSchedulerRequest {
     pub request_id: u64,
     pub kind: &'static str,
-    pub now_ms: u64,
+    /// Fractional: frame-driven ticks carry a presentation time between whole
+    /// milliseconds, and truncating it would step 8, 8, 9 ms at 120 Hz.
+    pub now_ms: f64,
     pub display_state: std::collections::BTreeMap<String, WaylandOutputSnapshot>,
     pub input_state: std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,7 +241,7 @@ enum BridgeRequest {
     },
     SchedulerFast {
         request_id: u64,
-        now_ms: u64,
+        now_ms: f64,
     },
 }
 
@@ -959,8 +961,8 @@ impl RuntimeRequestEnvelope {
             return -1.0;
         };
         match request.as_ref() {
-            Some(BridgeRequest::CachedFast { now_ms, .. })
-            | Some(BridgeRequest::SchedulerFast { now_ms, .. }) => *now_ms as f64,
+            Some(BridgeRequest::CachedFast { now_ms, .. }) => *now_ms as f64,
+            Some(BridgeRequest::SchedulerFast { now_ms, .. }) => *now_ms,
             _ => -1.0,
         }
     }
@@ -2753,7 +2755,7 @@ impl EmbeddedRuntime {
             .map_err(|_| self.failure_message("embedded runtime request channel closed"))
     }
 
-    pub fn write_scheduler_fast_request(&self, request_id: u64, now_ms: u64) -> Result<(), String> {
+    pub fn write_scheduler_fast_request(&self, request_id: u64, now_ms: f64) -> Result<(), String> {
         self.requests
             .as_ref()
             .ok_or_else(|| "embedded runtime is closed".to_owned())?

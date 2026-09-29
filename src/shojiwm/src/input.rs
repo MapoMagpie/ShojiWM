@@ -449,6 +449,15 @@ impl ShojiWM {
             return;
         }
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
+        if crate::state::ShojiWM::motion_trace_enabled() {
+            info!(
+                phase = ?event.phase,
+                delta_x = event.delta_x,
+                velocity_x = event.velocity_x,
+                wall_ms = std::time::Duration::from(self.clock.now()).as_secs_f64() * 1000.0,
+                "motion trace: swipe"
+            );
+        }
         if self.runtime_gesture_swipe_enabled {
             match self.decoration_evaluator.gesture_swipe(&event, now_ms) {
                 Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),

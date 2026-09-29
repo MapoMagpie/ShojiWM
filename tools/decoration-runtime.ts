@@ -1301,7 +1301,12 @@ function hasRuntimeTimestamp(
   return "nowMs" in request;
 }
 
-function beginRuntimeTurn(nowMs: number): void {
+function beginRuntimeTurn(requestNowMs: number): void {
+  // Monotonic: frame-driven scheduler ticks carry the frame's predicted
+  // presentation time, which runs up to a frame ahead of the wall-clock
+  // timestamps other requests carry. Letting those pull the clock back would
+  // hand polls and animations a negative or doubled step.
+  const nowMs = Math.max(currentSchedulerTimeMs, requestNowMs);
   currentSchedulerTimeMs = nowMs;
   if (lastAnimationAdvanceMs === nowMs) {
     return;
@@ -1629,7 +1634,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
                   events,
                   effectConfig,
                   request.snapshot,
-                  request.nowMs,
+                  currentSchedulerTimeMs,
                 )
               : evaluatePreconfigure(
                   composition,
@@ -1733,7 +1738,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
             if (request.keyboardLayout) {
               events.emitKeyboardLayoutChange(request.keyboardLayout);
             }
-            const tick = processSchedulerTick(request.nowMs);
+            const tick = processSchedulerTick(currentSchedulerTimeMs);
             if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
@@ -3790,7 +3795,9 @@ function collectRuntimeMutationState(): {
     if (poll.handle.cancelled) {
       continue;
     }
-    const delay = Math.max(1, poll.nextRunAtMs - currentSchedulerTimeMs);
+    // Whole milliseconds: the compositor's timers take integers, and the
+    // scheduler clock is fractional once frames drive it.
+    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - currentSchedulerTimeMs));
     nextPollInMs =
       nextPollInMs === undefined ? delay : Math.min(nextPollInMs, delay);
   }
@@ -4385,7 +4392,9 @@ function peekNextPollDelay(): number | undefined {
     if (poll.handle.cancelled) {
       continue;
     }
-    const delay = Math.max(1, poll.nextRunAtMs - currentSchedulerTimeMs);
+    // Whole milliseconds: the compositor's timers take integers, and the
+    // scheduler clock is fractional once frames drive it.
+    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - currentSchedulerTimeMs));
     nextPollInMs =
       nextPollInMs === undefined ? delay : Math.min(nextPollInMs, delay);
   }
