@@ -129,6 +129,12 @@ pub fn spawn_external_satellite(
 pub fn reserve_embedded_satellite(
     events: Sender<SatelliteEvent>,
 ) -> Result<SatelliteInstance, Box<dyn std::error::Error>> {
+    // Satellite runs `Xwayland` from `PATH`. Without it no run can ever serve
+    // the display, and an exported `DISPLAY` whose socket nobody answers makes
+    // every X11 client (fcitx5, Chromium, ...) hang in its connection setup.
+    if find_in_path(XWAYLAND_BINARY).is_none() {
+        return Err(format!("{XWAYLAND_BINARY} not found in PATH").into());
+    }
     ensure_x11_unix_dir()?;
     let (display_number, _lock_fd, lock_guard, abstract_listener, unix_listener, unix_guard) =
         reserve_x11_display(0)?;
@@ -149,6 +155,8 @@ pub fn reserve_embedded_satellite(
             started_at: None,
             restart_delay: INITIAL_RESTART_DELAY,
             generation: 0,
+            ready: false,
+            failed_starts: 0,
         }),
         display_name,
         display_number,
@@ -176,6 +184,11 @@ const INITIAL_RESTART_DELAY: Duration = Duration::from_millis(500);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 /// A run this long counts as healthy and resets the restart delay.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// Consecutive runs that end before Xwayland is ready, after which satellite
+/// is given up on.
+const MAX_FAILED_STARTS: u32 = 3;
+/// The Xwayland executable satellite runs.
+const XWAYLAND_BINARY: &str = "Xwayland";
 
 /// xwayland-satellite running in-process.
 ///
@@ -195,6 +208,10 @@ pub struct EmbeddedSatellite {
     restart_delay: Duration,
     /// Identifies the current run, so a late event from an older one is ignored.
     generation: u64,
+    /// Whether the current run reported Xwayland ready.
+    ready: bool,
+    /// Consecutive runs that ended before Xwayland was ready.
+    failed_starts: u32,
 }
 
 impl EmbeddedSatellite {
@@ -212,6 +229,7 @@ impl EmbeddedSatellite {
             .map(OwnedFd::try_clone)
             .collect::<io::Result<Vec<_>>>()?;
         self.generation += 1;
+        self.ready = false;
         let generation = self.generation;
         let data = EmbeddedRunData {
             display: self.display_name.clone(),
@@ -243,6 +261,22 @@ impl EmbeddedSatellite {
         Ok(compositor_end)
     }
 
+    /// The current run reported Xwayland ready.
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
+        self.failed_starts = 0;
+    }
+
+    /// The current run ended. Returns `false` when satellite should be given
+    /// up on: Xwayland never came up in several runs in a row, so the display
+    /// would only keep X11 clients waiting.
+    pub fn run_ended(&mut self) -> bool {
+        if !self.ready {
+            self.failed_starts += 1;
+        }
+        self.failed_starts < MAX_FAILED_STARTS
+    }
+
     /// How long to wait before restarting after the current run ended: short
     /// after a long healthy run, growing while satellite keeps failing fast.
     pub fn next_restart_delay(&mut self) -> Duration {
@@ -256,6 +290,17 @@ impl EmbeddedSatellite {
         };
         self.restart_delay
     }
+}
+
+/// The first executable file named `name` in `PATH`.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| {
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// `-glamor` for Xwayland, from `SHOJI_XWAYLAND_SATELLITE_GLAMOR`.

@@ -97,6 +97,73 @@ pub fn publish_activation_environment_keys(reason: &'static str, keys: &[&str]) 
     }
 }
 
+/// Withdraw `keys` from the systemd and D-Bus activation environments, after
+/// they were published but no longer hold. systemd can unset a variable; the
+/// D-Bus activation environment can only be overwritten, so it gets an empty
+/// value, which X11 and Wayland client libraries treat like an unset one.
+pub fn withdraw_activation_environment_keys(reason: &'static str, keys: &[&str]) {
+    if std::env::var_os("SHOJI_PUBLISH_ACTIVATION_ENV")
+        .is_some_and(|value| value == "0" || value == "off")
+    {
+        return;
+    }
+
+    let keys = keys
+        .iter()
+        .copied()
+        .filter(|key| is_valid_env_key(key))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return;
+    }
+
+    match Command::new("systemctl")
+        .args(["--user", "unset-environment"])
+        .args(&keys)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            debug!(?keys, reason, "withdrew systemd activation environment");
+        }
+        Ok(output) => debug!(
+            ?keys,
+            reason,
+            status = ?output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "failed to withdraw systemd activation environment"
+        ),
+        Err(error) => debug!(
+            ?keys,
+            reason,
+            ?error,
+            "failed to run systemctl to withdraw activation environment"
+        ),
+    }
+
+    let assignments = keys.iter().map(|key| format!("{key}=")).collect::<Vec<_>>();
+    match Command::new("dbus-update-activation-environment")
+        .args(&assignments)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            debug!(?keys, reason, "withdrew D-Bus activation environment");
+        }
+        Ok(output) => warn!(
+            ?keys,
+            reason,
+            status = ?output.status,
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "failed to withdraw D-Bus activation environment"
+        ),
+        Err(error) => warn!(
+            ?keys,
+            reason,
+            ?error,
+            "failed to run dbus-update-activation-environment"
+        ),
+    }
+}
+
 fn run_dbus_update_activation_environment(
     flags: &[&str],
     keys: &[&str],

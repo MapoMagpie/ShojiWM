@@ -87,7 +87,9 @@ use smithay::{
 };
 use xcursor::parser::Image;
 
-use crate::activation_environment::publish_activation_environment;
+use crate::activation_environment::{
+    publish_activation_environment, withdraw_activation_environment_keys,
+};
 use crate::backend::tty::{
     apply_tty_output_mode, tty_connected_outputs, tty_output_available_modes,
 };
@@ -2136,6 +2138,13 @@ impl ShojiWM {
                     generation,
                     "embedded xwayland-satellite ready"
                 );
+                if let Some(embedded) = self
+                    .xwayland_satellite
+                    .as_mut()
+                    .and_then(|instance| instance.embedded.as_mut())
+                {
+                    embedded.mark_ready();
+                }
             }
             SatelliteEvent::Exited {
                 generation,
@@ -2149,13 +2158,36 @@ impl ShojiWM {
                         "embedded xwayland-satellite exited (Xwayland stopped)"
                     );
                 }
-                self.schedule_satellite_restart();
+                let retry = self
+                    .xwayland_satellite
+                    .as_mut()
+                    .and_then(|instance| instance.embedded.as_mut())
+                    .is_some_and(EmbeddedSatellite::run_ended);
+                if retry {
+                    self.schedule_satellite_restart();
+                } else {
+                    self.give_up_embedded_satellite();
+                }
             }
             event => debug!(
                 ?event,
                 "ignoring event from a previous xwayland-satellite run"
             ),
         }
+    }
+
+    /// Stop serving the X11 display after Xwayland repeatedly failed to come
+    /// up. Closing the listening sockets fails pending X11 connections instead
+    /// of leaving them waiting, and withdrawing `DISPLAY` keeps later clients
+    /// on Wayland.
+    fn give_up_embedded_satellite(&mut self) {
+        error!(
+            "Xwayland never became ready in xwayland-satellite; X11 support is disabled for this session"
+        );
+        self.xwayland_satellite = None;
+        self.xdisplay = None;
+        crate::process_env::remove_var("DISPLAY");
+        withdraw_activation_environment_keys("xwayland-satellite-gave-up", &["DISPLAY"]);
     }
 
     fn schedule_satellite_restart(&mut self) {
