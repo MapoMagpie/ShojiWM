@@ -346,6 +346,10 @@ pub struct ShojiWM {
     pub window_source_damage: Vec<OwnedDamageRect>,
     pub lower_layer_source_damage: Vec<OwnedDamageRect>,
     pub upper_layer_source_damage: Vec<OwnedDamageRect>,
+    /// Global rect of each mapped layer surface at its last commit, keyed by
+    /// `layer_runtime_id`. A commit that moves or resizes the surface damages both
+    /// rects instead of just what the client damaged.
+    pub layer_source_rects: HashMap<String, LogicalRect>,
     pub pending_decoration_damage: Vec<LogicalRect>,
     pub decoration_evaluator: DecorationRuntimeEvaluator,
     pub dmabuf_state: DmabufState,
@@ -1682,6 +1686,7 @@ impl ShojiWM {
             window_source_damage: Vec::new(),
             lower_layer_source_damage: Vec::new(),
             upper_layer_source_damage: Vec::new(),
+            layer_source_rects: HashMap::new(),
             pending_decoration_damage: Vec::new(),
             decoration_evaluator,
             dmabuf_state: DmabufState::new(),
@@ -4329,7 +4334,7 @@ impl ShojiWM {
             created_at: Duration::from(self.clock.now()),
             committed_at: None,
         });
-        if std::env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
+        if crate::env_flag!("SHOJI_RIGHT_CLICK_TRACE") {
             let now = Duration::from(self.clock.now());
             info!(
                 surface_id,
@@ -4347,7 +4352,7 @@ impl ShojiWM {
                 "right click trace: xdg popup created"
             );
         }
-        if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
+        if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG") {
             tracing::info!(surface_id, "xdg popup latency: created");
         }
     }
@@ -4366,7 +4371,7 @@ impl ShojiWM {
         }
         self.right_click_debug.location = Some(location);
 
-        if std::env::var_os("SHOJI_RIGHT_CLICK_TRACE").is_some() {
+        if crate::env_flag!("SHOJI_RIGHT_CLICK_TRACE") {
             info!(
                 source,
                 pressed,
@@ -4380,7 +4385,7 @@ impl ShojiWM {
         if let Some(popup_debug) = self.popup_latency_debug.as_mut()
             && popup_debug.surface_id == surface_id {
                 popup_debug.committed_at = Some(Duration::from(self.clock.now()));
-                if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG") {
                     tracing::info!(
                         surface_id,
                         created_to_commit_ms = popup_debug
@@ -4676,7 +4681,7 @@ impl ShojiWM {
             })
             .collect::<Vec<_>>();
 
-        if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+        if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") {
             let element_location = self.space.element_location(window);
             let geometry = window.geometry();
             tracing::info!(

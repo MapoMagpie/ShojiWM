@@ -1748,7 +1748,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
             sample_src.size.h as f32 / full_size.h.max(1) as f32,
         ];
 
-        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+        if crate::env_flag!("SHOJI_GAP_DEBUG") {
             // Rate-limited: these run every frame per backdrop element.
             use std::sync::atomic::{AtomicUsize, Ordering};
             static DRAW_LOG_TICK: AtomicUsize = AtomicUsize::new(0);
@@ -1771,7 +1771,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                     used_rendered = inner.rendered.is_some(),
                     "gap debug framebuffer backdrop display draw"
                 );
-                if std::env::var_os("SHOJI_GAP_TEXTURE_READBACK").is_some() {
+                if crate::env_flag!("SHOJI_GAP_TEXTURE_READBACK") {
                     // Read the right-edge columns of the pipeline output and
                     // the raw capture. If the output's last column matches the
                     // raw capture instead of blurred content, the blur/effect
@@ -3872,7 +3872,7 @@ pub fn backdrop_shader_element_with_geometry(
         sample_width_px as f32 / captured_width_px.max(1) as f32,
         sample_height_px as f32 / captured_height_px.max(1) as f32,
     ];
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if crate::env_flag!("SHOJI_GAP_DEBUG") {
         tracing::info!(
             debug_label = %debug_label,
             texture_size = ?texture_size,
@@ -4616,7 +4616,7 @@ fn run_effect_pipeline_inner(
         sample_region
     };
 
-    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+    if crate::env_flag!("SHOJI_GAP_DEBUG") {
         tracing::info!(
             effect_input = ?effect.input,
             ctx_size = ?ctx.size,
@@ -4631,7 +4631,7 @@ fn run_effect_pipeline_inner(
     // Rate-limit per input size so cheap always-running pipelines (layer
     // bars) do not starve the rarely-invalidated window pipelines out of the
     // dump budget.
-    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+    let stage_readback = crate::env_flag!("SHOJI_GAP_STAGE_READBACK") && {
         use std::collections::HashMap;
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
@@ -5747,7 +5747,7 @@ fn preblur_using_pyramid(
 ) -> Result<GlesTexture, ShaderEffectError> {
     prepare_blur_pyramid(renderer, pyramid, source_size, passes)?;
 
-    let stage_readback = std::env::var_os("SHOJI_GAP_STAGE_READBACK").is_some() && {
+    let stage_readback = crate::env_flag!("SHOJI_GAP_STAGE_READBACK") && {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static TICK: AtomicUsize = AtomicUsize::new(0);
         TICK.fetch_add(1, Ordering::Relaxed).is_multiple_of(600)

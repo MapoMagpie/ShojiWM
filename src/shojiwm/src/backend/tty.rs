@@ -1,4 +1,6 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
+
+use crate::backend::signature::{SignatureHasher, hash_debug};
 use std::{
     collections::HashMap,
     os::fd::AsRawFd,
@@ -612,7 +614,7 @@ fn describe_underlying_storage(storage: Option<UnderlyingStorage<'_>>) -> String
             let Ok(dmabuf) = smithay::wayland::dmabuf::get_dmabuf(buffer) else {
                 return format!("wayland wl_buffer={wl_buffer_id:?} storage=non-dmabuf");
             };
-            let mut hasher = DefaultHasher::new();
+            let mut hasher = SignatureHasher::default();
             dmabuf.hash(&mut hasher);
             let dmabuf_id = hasher.finish();
             let size = smithay::backend::allocator::Buffer::size(dmabuf);
@@ -1377,7 +1379,7 @@ pub fn device_added(
         // the advertised modifiers to LINEAR/INVALID so consumers cannot
         // negotiate a compressed format.
         let formats: smithay::backend::allocator::format::FormatSet =
-            if std::env::var_os("SHOJI_DMABUF_FEEDBACK_LINEAR_ONLY").is_some() {
+            if crate::env_flag!("SHOJI_DMABUF_FEEDBACK_LINEAR_ONLY") {
                 use smithay::backend::allocator::Modifier;
                 all_formats
                     .iter()
@@ -1860,7 +1862,7 @@ fn frame_finish(
             "animation gap: tty frame_finish queue wait"
         );
     }
-    if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some()
+    if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG")
         && let Some(popup_debug) = state.popup_latency_debug.take() {
             tracing::info!(
                 surface_id = popup_debug.surface_id,
@@ -2398,7 +2400,7 @@ pub fn render_if_needed(
         );
     }
 
-    if std::env::var_os("SHOJI_XDG_POPUP_LATENCY_DEBUG").is_some()
+    if crate::env_flag!("SHOJI_XDG_POPUP_LATENCY_DEBUG")
         && let Some(popup_debug) = state.popup_latency_debug {
             let now = Duration::from(state.clock.now());
             tracing::info!(
@@ -3012,7 +3014,7 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
                     );
                 }
             }
-            if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some()
+            if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG")
                 && previous_state != surface.redraw_state
             {
                 tracing::info!(
@@ -3063,7 +3065,7 @@ fn note_render_surface_skipped(
             surface.skipped_while_pending_count =
                 surface.skipped_while_pending_count.saturating_add(1);
         }
-        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
             tracing::info!(
                 output = %output.name(),
                 redraw_state = ?redraw_state,
@@ -3139,7 +3141,7 @@ fn render_surface(
     }
     {
         timescope::scope!("tty render_surface debug gates");
-        if std::env::var_os("SHOJI_SCREENCOPY_PROFILE").is_some() {
+        if crate::env_flag!("SHOJI_SCREENCOPY_PROFILE") {
             let frame_pending = state
                 .tty_backends
                 .get(&node)
@@ -3379,7 +3381,7 @@ fn render_surface(
         let blink_visible = state.damage_blink_rects_for_output(&output).to_vec();
         let has_visible_x11_chrome = output_has_visible_x11_chrome(state, &output);
         let mut extra_damage = state.pending_decoration_damage.clone();
-        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() && !extra_damage.is_empty()
+        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") && !extra_damage.is_empty()
         {
             tracing::info!(
                 output = %output.name(),
@@ -3631,7 +3633,6 @@ fn render_surface(
                 &state.window_source_damage,
                 &state.lower_layer_source_damage,
                 &state.upper_layer_source_damage,
-                state.lower_layer_scene_generation,
                 &state.configured_layer_effects,
                 state.configured_background_effect.as_ref(),
                 &output,
@@ -3677,7 +3678,7 @@ fn render_surface(
         let mut snapshot_transform_changed_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        let close_debug = std::env::var_os("SHOJI_CLOSE_DEBUG").is_some();
+        let close_debug = crate::env_flag!("SHOJI_CLOSE_DEBUG");
         if close_debug && !closing_window_snapshots.is_empty() {
             tracing::info!(
                 output = %output.name(),
@@ -3844,7 +3845,7 @@ fn render_surface(
                 .len();
                 window_timing.direct_surface_lookup_ms =
                     direct_surface_lookup_started_at.elapsed().as_secs_f64() * 1000.0;
-                if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") {
                     let title = window_decorations
                         .get(window)
                         .map(|d| d.snapshot.title.clone())
@@ -4032,7 +4033,6 @@ fn render_surface(
                         &state.window_commit_times,
                         &state.window_source_damage,
                         &state.lower_layer_source_damage,
-                        state.lower_layer_scene_generation,
                         &output,
                         output_geo,
                         scale,
@@ -4060,7 +4060,6 @@ fn render_surface(
                                     &state.window_commit_times,
                                     &state.window_source_damage,
                                     &state.lower_layer_source_damage,
-                                    state.lower_layer_scene_generation,
                                     &output,
                                     output_geo,
                                     scale,
@@ -4089,7 +4088,7 @@ fn render_surface(
                                 root_origin,
                                 composition_visual,
                             )?;
-                            if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                            if crate::env_flag!("SHOJI_GAP_READBACK_DEBUG")
                                 && !use_full_window_snapshot
                                 && let Some(first_geometry) = items.first().map(|item| {
                                     smithay::backend::renderer::element::Element::geometry(
@@ -4184,7 +4183,7 @@ fn render_surface(
                                     element,
                                     decoration::DecorationSceneElements::Backdrop(_)
                                 );
-                                let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some()
+                                let debug_stable = if crate::env_flag!("SHOJI_GAP_DEBUG")
                                 {
                                     decoration_state
                                         .buffers
@@ -4249,7 +4248,7 @@ fn render_surface(
                                         "gap debug tty transformed decoration geometry"
                                     );
                                 }
-                                if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                                if crate::env_flag!("SHOJI_GAP_READBACK_DEBUG")
                                     && !use_full_window_snapshot
                                     && let Some(first_geometry) = items.first().map(|item| {
                                         smithay::backend::renderer::element::Element::geometry(
@@ -4302,7 +4301,7 @@ fn render_surface(
                         },
                     )? {
                         if let Some(root_origin) = root_origin {
-                            let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                            let debug_stable = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                                 Some(
                                     window_decorations
                                         .get(window)
@@ -4319,7 +4318,7 @@ fn render_surface(
                                 None
                             };
                             let pre_transform_geometry =
-                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                if crate::env_flag!("SHOJI_GAP_DEBUG") {
                                     Some(smithay::backend::renderer::element::Element::geometry(
                                         &element, scale,
                                     ))
@@ -4393,7 +4392,7 @@ fn render_surface(
                         },
                     )? {
                         if let Some(root_origin) = root_origin {
-                            let debug_stable = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                            let debug_stable = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                                 Some(
                                     window_decorations
                                         .get(window)
@@ -4410,7 +4409,7 @@ fn render_surface(
                                 None
                             };
                             let pre_transform_geometry =
-                                if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                                if crate::env_flag!("SHOJI_GAP_DEBUG") {
                                     Some(smithay::backend::renderer::element::Element::geometry(
                                         &element, scale,
                                     ))
@@ -4474,7 +4473,7 @@ fn render_surface(
                     ordered_backdrop_elements.sort_by_key(|(order, _)| *order);
                     snapshot_ui_items.sort_by_key(|(order, _)| *order);
                     snapshot_backdrop_items.sort_by_key(|(order, _)| *order);
-                    if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                    if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                         let first_backdrop =
                             ordered_backdrop_elements.first().map(|(_, element)| {
                                 smithay::backend::renderer::element::Element::geometry(
@@ -4507,7 +4506,7 @@ fn render_surface(
                             "transform snapshot tty branch composition"
                         );
                     }
-                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                    if crate::env_flag!("SHOJI_GAP_DEBUG") {
                         let first_backdrop =
                             ordered_backdrop_elements.first().map(|(_, element)| {
                                 smithay::backend::renderer::element::Element::geometry(
@@ -4640,7 +4639,7 @@ fn render_surface(
                         full_snapshot_scene_started_at.elapsed().as_secs_f64() * 1000.0;
                     full_rect
                     .and_then(|full_rect| {
-                        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                             let existing_signature = complete_window_snapshots
                                 .get(&window_id)
                                 .map(|snapshot| snapshot.scene_signature);
@@ -4669,7 +4668,7 @@ fn render_surface(
                                 // and passes the intersection check.
                                 existing.rect = full_rect;
                                 complete_window_snapshots.insert(window_id.clone(), existing.clone());
-                                if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                                if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                                     let commit = existing.damage.lock().unwrap().current_commit();
                                     tracing::info!(
                                         window_id = %window_id,
@@ -4681,7 +4680,7 @@ fn render_surface(
                                 return Some(existing);
                             }
                         let existing_complete = complete_window_snapshots.remove(&window_id);
-                        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                             let first_snapshot_geometry = snapshot_scene.first().map(|element| {
                                 smithay::backend::renderer::element::Element::geometry(
                                     element, scale,
@@ -4723,7 +4722,7 @@ fn render_surface(
                         window_timing.full_snapshot_capture_ms +=
                             capture_started_at.elapsed().as_secs_f64() * 1000.0;
                         captured.ok().flatten().map(|mut snapshot| {
-                            if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                            if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                                 let commit = snapshot.damage.lock().unwrap().current_commit();
                                 tracing::info!(
                                     window_id = %window_id,
@@ -4737,7 +4736,7 @@ fn render_surface(
                         })
                     })
                     .and_then(|snapshot| {
-                        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                             let commit = snapshot.damage.lock().unwrap().current_commit();
                             tracing::info!(
                                 window_id = %window_id,
@@ -4758,7 +4757,7 @@ fn render_surface(
                     })
                     .unwrap_or_default()
                 } else if let Some(content_clip) = content_clip {
-                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some()
+                    if crate::env_flag!("SHOJI_GAP_DEBUG")
                         && let Some(decoration) = window_decorations.get(window) {
                             let border_buffer = decoration.buffers.iter().find(|buffer| {
                                 buffer.source_kind == "window-border" && buffer.border_width > 0.0
@@ -5071,8 +5070,8 @@ fn render_surface(
                         warn!(?error, "failed to build clipped surface elements");
                     })
                     .unwrap_or_default();
-                    let bypass_clip = std::env::var_os("SHOJI_GAP_BYPASS_CLIP").is_some();
-                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                    let bypass_clip = crate::env_flag!("SHOJI_GAP_BYPASS_CLIP");
+                    if crate::env_flag!("SHOJI_GAP_DEBUG") {
                         let first_geometry = clipped.first().map(|element| match element {
                             window_render::WindowClipElement::Clipped(element) => {
                                 smithay::backend::renderer::element::Element::geometry(
@@ -5427,7 +5426,7 @@ fn render_surface(
                             scale,
                             visual_state.opacity,
                         );
-                        if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                        if crate::env_flag!("SHOJI_GAP_DEBUG") {
                             let first_geometry = raw_elements.first().map(|element| {
                                 smithay::backend::renderer::element::Element::geometry(
                                     element, scale,
@@ -5519,7 +5518,7 @@ fn render_surface(
                             })
                             .collect()
                     };
-                    if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                    if crate::env_flag!("SHOJI_GAP_READBACK_DEBUG")
                         && let Some(first_geometry) = transformed.first().map(|element| {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         }) {
@@ -5542,7 +5541,7 @@ fn render_surface(
                         scale,
                         visual_state.opacity,
                     );
-                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                    if crate::env_flag!("SHOJI_GAP_DEBUG") {
                         let first_geometry = surfaces.first().map(|element| {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         });
@@ -5570,7 +5569,7 @@ fn render_surface(
                         });
                     let transformed =
                         transform_policy_window_elements(surfaces, ignore_opaque, visual_state);
-                    if std::env::var_os("SHOJI_GAP_READBACK_DEBUG").is_some()
+                    if crate::env_flag!("SHOJI_GAP_READBACK_DEBUG")
                         && let Some(first_geometry) = transformed.first().map(|element| {
                             smithay::backend::renderer::element::Element::geometry(element, scale)
                         }) {
@@ -5752,7 +5751,6 @@ fn render_surface(
                         &state.window_commit_times,
                         &state.window_source_damage,
                         &state.lower_layer_source_damage,
-                        state.lower_layer_scene_generation,
                         &output,
                         output_geo,
                         scale,
@@ -5773,7 +5771,6 @@ fn render_surface(
                                 &state.window_commit_times,
                                 &state.window_source_damage,
                                 &state.lower_layer_source_damage,
-                                state.lower_layer_scene_generation,
                                 &output,
                                 output_geo,
                                 scale,
@@ -6433,7 +6430,6 @@ fn render_surface(
                 scale,
                 state.configured_background_effect.as_ref(),
                 &state.lower_layer_source_damage,
-                state.lower_layer_scene_generation,
                 &mut state.layer_backdrop_cache,
                 &state.configured_layer_effects,
                 &mut state.layer_effect_cache,
@@ -7038,7 +7034,7 @@ fn render_surface(
                 "direct scanout debug: fullscreen frame result"
             );
         }
-        if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some()
+        if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG")
             && (frame_transform_snapshot_window_count > 0 || frame_had_transform_snapshot_damage)
         {
             tracing::info!(
@@ -7173,7 +7169,7 @@ fn render_surface(
                     "tty frame liveness: damage frame rendered",
                 );
             }
-            if std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_FRAME_THROTTLE_DEBUG") {
                 tracing::info!(
                     output = %output.name(),
                     states_count = effective_render_states.states.len(),
@@ -7199,7 +7195,7 @@ fn render_surface(
                 };
                 use smithay::desktop::utils::update_surface_primary_scanout_output;
 
-                if std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_FRAME_THROTTLE_DEBUG") {
                     tracing::info!(
                         output = %output.name(),
                         snapshot_ids_count = state.transform_snapshot_window_ids.len(),
@@ -7223,7 +7219,7 @@ fn render_surface(
                     .cloned()
                     .collect();
 
-                if std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_FRAME_THROTTLE_DEBUG") {
                     for window in &snapshot_windows {
                         let app_id = window
                             .toplevel()
@@ -7521,7 +7517,7 @@ fn render_surface(
                     "tty frame liveness: no-damage frame rendered",
                 );
             }
-            if std::env::var_os("SHOJI_FRAME_THROTTLE_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_FRAME_THROTTLE_DEBUG") {
                 tracing::info!(
                     output = %output.name(),
                     states_count = result.states.states.len(),
@@ -7949,7 +7945,7 @@ fn subsurface_effect_elements(
     };
     let frame_rect =
         transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = SignatureHasher::default();
     window_effect_signature(placement, rect, effect, scale, group).hash(&mut hasher);
     (
         frame_rect.x - rect.x,
@@ -8144,12 +8140,12 @@ fn transform_backdrop_elements(
         return Ok(elements
             .into_iter()
             .map(|element| {
-                let debug_label = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                let debug_label = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                     Some(element.debug_label().to_string())
                 } else {
                     None
                 };
-                let pre_transform_geometry = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                let pre_transform_geometry = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                     Some(smithay::backend::renderer::element::Element::geometry(
                         &element,
                         Scale::from((1.0, 1.0)),
@@ -8198,12 +8194,12 @@ fn transform_backdrop_elements(
     Ok(elements
         .into_iter()
         .map(|element| {
-            let debug_label = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            let debug_label = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                 Some(element.debug_label().to_string())
             } else {
                 None
             };
-            let pre_transform_geometry = if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            let pre_transform_geometry = if crate::env_flag!("SHOJI_GAP_DEBUG") {
                 Some(smithay::backend::renderer::element::Element::geometry(
                     &element,
                     Scale::from((1.0, 1.0)),
@@ -8400,7 +8396,7 @@ fn log_gap_readback_probe(
 static GAP_FINAL_READBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn gap_final_readback_debug_enabled() -> bool {
-    std::env::var_os("SHOJI_GAP_FINAL_READBACK_DEBUG").is_some()
+    crate::env_flag!("SHOJI_GAP_FINAL_READBACK_DEBUG")
 }
 
 fn translate_physical_rect(
@@ -9006,7 +9002,7 @@ fn window_effect_signature(
     scale: smithay::utils::Scale<f64>,
     window_elements: &[TtyRenderElements],
 ) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = SignatureHasher::default();
     placement.hash(&mut hasher);
     (
         window_rect.x,
@@ -9022,7 +9018,7 @@ fn window_effect_signature(
         effect.outsets.bottom,
     )
         .hash(&mut hasher);
-    format!("{:?}", effect.effect).hash(&mut hasher);
+    hash_debug(&mut hasher, &effect.effect);
     scale.x.to_bits().hash(&mut hasher);
     scale.y.to_bits().hash(&mut hasher);
     snapshot::render_element_scene_signature(window_elements, scale).hash(&mut hasher);
@@ -9880,7 +9876,6 @@ fn backdrop_shader_elements_for_window(
     _window_commit_times: &std::collections::HashMap<smithay::desktop::Window, std::time::Duration>,
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
-    lower_layer_scene_generation: u64,
     output: &Output,
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
@@ -9941,7 +9936,7 @@ fn backdrop_shader_elements_for_window(
             let uses_xray = cached.shader.uses_xray_backdrop_input();
             let render_as_backdrop = uses_backdrop || uses_xray;
             let root_rect = decoration.layout.root.rect;
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = SignatureHasher::default();
             cached.stable_key.hash(&mut hasher);
             let display_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
@@ -9992,10 +9987,7 @@ fn backdrop_shader_elements_for_window(
                 .hash(&mut hasher);
             let blur_padding = cached.shader.capture_padding.max(0);
             (blur_padding, cached.clip_radius).hash(&mut hasher);
-            if uses_backdrop || uses_xray {
-                lower_layer_scene_generation.hash(&mut hasher);
-            }
-            format!("{:?}", cached.shader).hash(&mut hasher);
+            hash_debug(&mut hasher, &cached.shader);
             let capture_geo = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
                     source_effect_rect.x - blur_padding,
@@ -10058,7 +10050,7 @@ fn backdrop_shader_elements_for_window(
                 }
                 entries
             };
-            if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
+            if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
                 tracing::info!(
                     stable_key = %cached.stable_key,
                     source_effect_rect = ?source_effect_rect,
@@ -10078,7 +10070,7 @@ fn backdrop_shader_elements_for_window(
                 ),
                 &source_damage_entries,
             );
-            if std::env::var_os("SHOJI_SOURCE_DAMAGE_DEBUG").is_some() && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
+            if crate::env_flag!("SHOJI_SOURCE_DAMAGE_DEBUG") && (uses_backdrop || uses_xray) && !source_damage_entries.is_empty() {
                 tracing::info!(
                     stable_key = %cached.stable_key,
                     source_damage_hit,
@@ -10090,7 +10082,7 @@ fn backdrop_shader_elements_for_window(
                 .and_then(|d| d.backdrop_cache.get(&cache_key))
                 .cloned();
 
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
                     window_id = %decoration.snapshot.id,
                     title = %decoration.snapshot.title,
@@ -10237,7 +10229,7 @@ fn backdrop_shader_elements_for_window(
                             ),
                         )
                         .ok()?;
-                    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+                    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                         tracing::info!(
                             window_id = %decoration.snapshot.id,
                             title = %decoration.snapshot.title,
@@ -10252,7 +10244,7 @@ fn backdrop_shader_elements_for_window(
                             "backdrop debug: window shader element"
                         );
                     }
-                    if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+                    if crate::env_flag!("SHOJI_GAP_DEBUG") {
                         let geometry =
                             smithay::backend::renderer::element::Element::geometry(&element, scale);
                         let sample_region_screen = (
@@ -10409,7 +10401,7 @@ fn backdrop_shader_elements_for_window(
                 )
                     .into(),
             );
-            if std::env::var_os("SHOJI_GAP_SHADER_READBACK_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
                     renderer,
                     &input_texture,
@@ -10425,7 +10417,7 @@ fn backdrop_shader_elements_for_window(
                     &cached.stable_key,
                 );
             }
-            if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_DEBUG") {
                 let (backdrop_union, backdrop_first) =
                     debug_scene_geometry_snapshot(&backdrop_scene, scale);
                 let (xray_union, xray_first) = debug_scene_geometry_snapshot(&xray_scene, scale);
@@ -10449,7 +10441,7 @@ fn backdrop_shader_elements_for_window(
                 final_backdrop_screen_rect.size.w,
                 final_backdrop_screen_rect.size.h,
             );
-            if std::env::var_os("SHOJI_GAP_SHADER_READBACK_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
                     renderer,
                     &input_texture,
@@ -10479,7 +10471,7 @@ fn backdrop_shader_elements_for_window(
                 &cached.shader,
             )
             .ok()?;
-            if std::env::var_os("SHOJI_GAP_SHADER_READBACK_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
                     renderer,
                     &texture,
@@ -10610,7 +10602,7 @@ fn backdrop_shader_elements_for_window(
                 ),
             )
             .ok()?;
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
                     window_id = %decoration.snapshot.id,
                     title = %decoration.snapshot.title,
@@ -10626,7 +10618,7 @@ fn backdrop_shader_elements_for_window(
                     "backdrop debug: window shader element"
                 );
             }
-            if std::env::var_os("SHOJI_GAP_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_DEBUG") {
                 let geometry =
                     smithay::backend::renderer::element::Element::geometry(&element, scale);
                 let sample_region_screen = (
@@ -10711,7 +10703,7 @@ fn protocol_background_effect_rects_for_window(
     })
     .collect::<Vec<_>>();
 
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
         let (surface_geometry, buffer_scale, buffer_delta) =
             compositor::with_states(wl_surface, |states| {
                 let geometry = states
@@ -10778,7 +10770,7 @@ fn protocol_background_effect_rects_for_layer(
     })
     .collect::<Vec<_>>();
 
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             output = %output.name(),
@@ -10869,7 +10861,7 @@ fn contributor_window_scene_rect(
 }
 
 fn hash_window_scene_contributors(
-    hasher: &mut std::collections::hash_map::DefaultHasher,
+    hasher: &mut SignatureHasher,
     space: &smithay::desktop::Space<smithay::desktop::Window>,
     window_decorations: &std::collections::HashMap<
         smithay::desktop::Window,
@@ -10893,7 +10885,7 @@ fn hash_window_scene_contributors(
 }
 
 fn hash_layer_scene_contributors(
-    hasher: &mut std::collections::hash_map::DefaultHasher,
+    hasher: &mut SignatureHasher,
     output: &Output,
     layers: &[smithay::desktop::LayerSurface],
     effect_rect: crate::ssd::LogicalRect,
@@ -10955,7 +10947,6 @@ fn configured_background_effect_elements_for_layer(
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
     upper_layer_source_damage: &[crate::state::OwnedDamageRect],
-    lower_layer_scene_generation: u64,
     output: &Output,
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
@@ -10974,15 +10965,17 @@ fn configured_background_effect_elements_for_layer(
     custom_background: Option<&crate::ssd::WindowEffectSlot>,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let layer_id = crate::ssd::layer_runtime_id(layer_surface);
-    let custom_config = custom_background.map(|effect| crate::ssd::BackgroundEffectConfig {
-        effect: effect.effect.clone(),
-    });
-    let selected_effect_config = custom_config.or_else(|| configured_background_effect.cloned());
-    let Some(effect_config) = selected_effect_config.as_ref() else {
+    let Some(backdrop_effect) = custom_background
+        .map(|slot| &slot.effect)
+        .or(configured_background_effect.map(|config| &config.effect))
+    else {
         return Ok(Vec::new());
     };
     let rects = if let Some(effect) = custom_background {
         layer_surface_logical_rect(output, layer_surface)
+            .and_then(|rect| {
+                window_render::layer_effect_region_bounds(layer_surface, rect, effect.region)
+            })
             .map(|rect| vec![expand_logical_rect(rect, effect.outsets)])
             .unwrap_or_default()
     } else {
@@ -10995,7 +10988,7 @@ fn configured_background_effect_elements_for_layer(
     let Some(effect_rect) = crate::backend::window::bounding_box_for_rects(&rects) else {
         return Ok(Vec::new());
     };
-    let blur_padding = effect_config.effect.capture_padding.max(0);
+    let blur_padding = backdrop_effect.capture_padding.max(0);
     let capture_geo = smithay::utils::Rectangle::new(
         smithay::utils::Point::from((effect_rect.x - blur_padding, effect_rect.y - blur_padding)),
         (
@@ -11012,9 +11005,9 @@ fn configured_background_effect_elements_for_layer(
             scale,
         );
     let (_, lower_layers) = window_render::layer_surfaces_for_output(output);
-    let uses_backdrop = effect_config.effect.uses_backdrop_input();
-    let uses_xray = effect_config.effect.uses_xray_backdrop_input();
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    let uses_backdrop = backdrop_effect.uses_backdrop_input();
+    let uses_xray = backdrop_effect.uses_xray_backdrop_input();
+    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             layer_id = %layer_id,
@@ -11052,7 +11045,7 @@ fn configured_background_effect_elements_for_layer(
                 upper_layer_source_damage,
             ));
         }
-        if effect_config.effect.uses_layer_source_input() {
+        if backdrop_effect.uses_layer_source_input() {
             entries.extend(collect_layer_source_damage(
                 std::iter::once(layer_surface.clone()),
                 upper_layer_source_damage,
@@ -11067,11 +11060,8 @@ fn configured_background_effect_elements_for_layer(
         effect_rect.width,
         effect_rect.height
     );
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = SignatureHasher::default();
     stable_key.hash(&mut hasher);
-    if uses_backdrop || uses_xray {
-        lower_layer_scene_generation.hash(&mut hasher);
-    }
     if uses_backdrop {
         hash_window_scene_contributors(
             &mut hasher,
@@ -11087,7 +11077,7 @@ fn configured_background_effect_elements_for_layer(
     if uses_backdrop {
         hash_layer_scene_contributors(&mut hasher, output, upper_layers_below, effect_rect);
     }
-    format!("{:?}", effect_config.effect).hash(&mut hasher);
+    hash_debug(&mut hasher, &backdrop_effect);
     (
         effect_rect.x,
         effect_rect.y,
@@ -11101,7 +11091,7 @@ fn configured_background_effect_elements_for_layer(
         .hash(&mut hasher);
     let signature = hasher.finish();
     let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-        &effect_config.effect,
+        &backdrop_effect,
         smithay::utils::Rectangle::new(
             smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
             (effect_rect.width, effect_rect.height).into(),
@@ -11117,7 +11107,7 @@ fn configured_background_effect_elements_for_layer(
     );
     let mut elements = Vec::new();
     if !matches!(
-        effect_config.effect.invalidate_policy(),
+        backdrop_effect.invalidate_policy(),
         crate::ssd::EffectInvalidationPolicy::Always
     ) && !source_damage_hit
         && let Some(existing) = layer_backdrop_cache
@@ -11137,7 +11127,7 @@ fn configured_background_effect_elements_for_layer(
                     )),
                     (rect.width, rect.height).into(),
                 );
-                if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                     tracing::info!(
                         layer_surface = ?layer_surface.wl_surface().id(),
                         output = %output.name(),
@@ -11165,7 +11155,7 @@ fn configured_background_effect_elements_for_layer(
                         rect_local,
                         rect_local,
                         captured_local_rect,
-                        &effect_config.effect,
+                        &backdrop_effect,
                         alpha,
                         scale.x as f32,
                         None,
@@ -11176,7 +11166,7 @@ fn configured_background_effect_elements_for_layer(
             }
             return Ok(elements);
         }
-    let backdrop_texture = if effect_config.effect.uses_backdrop_input() {
+    let backdrop_texture = if backdrop_effect.uses_backdrop_input() {
         let mut backdrop_scene: Vec<TtyRenderElements> = Vec::new();
         // Upper layers below this one render above every toplevel window, so
         // they go first in the front-to-back capture scene.
@@ -11228,7 +11218,7 @@ fn configured_background_effect_elements_for_layer(
     } else {
         None
     };
-    let xray_texture = if effect_config.effect.uses_xray_backdrop_input() {
+    let xray_texture = if backdrop_effect.uses_xray_backdrop_input() {
         let mut xray_scene: Vec<TtyRenderElements> = Vec::new();
         for lower_layer in &lower_layers {
             if let Ok(mut layer_elements) = layer_surface_scene_elements_for_capture(
@@ -11259,7 +11249,7 @@ fn configured_background_effect_elements_for_layer(
     else {
         return Ok(Vec::new());
     };
-    let layer_source_capture = if effect_config.effect.uses_layer_source_input() {
+    let layer_source_capture = if backdrop_effect.uses_layer_source_input() {
         let layer_source_geo = smithay::utils::Rectangle::new(
             smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
             (effect_rect.width, effect_rect.height).into(),
@@ -11299,7 +11289,7 @@ fn configured_background_effect_elements_for_layer(
     // the surface maps, zero-sized geometry during animations, capture
     // failure). Running the pipeline without it would fail inside
     // resolve_effect_input, so skip the effect for this frame instead.
-    if effect_config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+    if backdrop_effect.uses_layer_source_input() && layer_source_texture.is_none() {
         return Ok(Vec::new());
     }
     // Built on the backdrop key so its size and stack-position variants can be
@@ -11335,7 +11325,7 @@ fn configured_background_effect_elements_for_layer(
             input_size,
             sample_region,
             output_size,
-            &effect_config.effect,
+            &backdrop_effect,
         )?
     } else {
         crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -11346,10 +11336,10 @@ fn configured_background_effect_elements_for_layer(
             input_size,
             sample_region,
             output_size,
-            &effect_config.effect,
+            &backdrop_effect,
         )?
     };
-    if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+    if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
         tracing::info!(
             layer_surface = ?layer_surface.wl_surface().id(),
             output = %output.name(),
@@ -11420,7 +11410,7 @@ fn configured_background_effect_elements_for_layer(
             smithay::utils::Point::from((rect.x - output_geo.loc.x, rect.y - output_geo.loc.y)),
             (rect.width, rect.height).into(),
         );
-        if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+        if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
             tracing::info!(
                 layer_surface = ?layer_surface.wl_surface().id(),
                 output = %output.name(),
@@ -11448,7 +11438,7 @@ fn configured_background_effect_elements_for_layer(
                 rect_local,
                 rect_local,
                 captured_local_rect,
-                &effect_config.effect,
+                &backdrop_effect,
                 alpha,
                 scale.x as f32,
                 None,
@@ -11467,7 +11457,6 @@ fn lower_layer_scene_elements(
     scale: smithay::utils::Scale<f64>,
     effect_config: Option<&crate::ssd::BackgroundEffectConfig>,
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
-    lower_layer_scene_generation: u64,
     layer_backdrop_cache: &mut std::collections::HashMap<
         String,
         crate::backend::shader_effect::CachedBackdropTexture,
@@ -11514,20 +11503,18 @@ fn lower_layer_scene_elements(
         let custom_background = configured_layer_effects
             .get(&layer_id)
             .and_then(|effects| effects.behind.as_ref())
-            .filter(|effect| effect.effect.is_backdrop())
-            .cloned();
-        let custom_config =
-            custom_background
-                .as_ref()
-                .map(|effect| crate::ssd::BackgroundEffectConfig {
-                    effect: effect.effect.clone(),
-                });
-        let selected_effect_config = custom_config.or_else(|| effect_config.cloned());
-        let Some(effect_config) = selected_effect_config.as_ref() else {
+            .filter(|effect| effect.effect.is_backdrop());
+        let Some(backdrop_effect) = custom_background
+            .map(|slot| &slot.effect)
+            .or(effect_config.map(|config| &config.effect))
+        else {
             continue;
         };
-        let rects = if let Some(effect) = custom_background.as_ref() {
+        let rects = if let Some(effect) = custom_background {
             layer_surface_logical_rect(output, layer_surface)
+                .and_then(|rect| {
+                    window_render::layer_effect_region_bounds(layer_surface, rect, effect.region)
+                })
                 .map(|rect| vec![expand_logical_rect(rect, effect.outsets)])
                 .unwrap_or_default()
         } else {
@@ -11545,7 +11532,7 @@ fn lower_layer_scene_elements(
                 effect_rect.width,
                 effect_rect.height
             );
-            let blur_padding = effect_config.effect.capture_padding.max(0);
+            let blur_padding = backdrop_effect.capture_padding.max(0);
             let capture_geo = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
                     effect_rect.x - blur_padding,
@@ -11557,10 +11544,16 @@ fn lower_layer_scene_elements(
                 )
                     .into(),
             );
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = SignatureHasher::default();
             stable_key.hash(&mut hasher);
-            lower_layer_scene_generation.hash(&mut hasher);
-            format!("{:?}", effect_config.effect).hash(&mut hasher);
+            // The layers below this one; their content changes arrive as source damage.
+            hash_layer_scene_contributors(
+                &mut hasher,
+                output,
+                &lower_layers[index + 1..],
+                effect_rect,
+            );
+            hash_debug(&mut hasher, &backdrop_effect);
             (
                 effect_rect.x,
                 effect_rect.y,
@@ -11577,14 +11570,14 @@ fn lower_layer_scene_elements(
                 lower_layers.iter().skip(index + 1).cloned(),
                 lower_layer_source_damage,
             );
-            if effect_config.effect.uses_layer_source_input() {
+            if backdrop_effect.uses_layer_source_input() {
                 relevant_source_damage.extend(collect_layer_source_damage(
                     std::iter::once(layer_surface.clone()),
                     lower_layer_source_damage,
                 ));
             }
             let source_damage_hit = crate::backend::shader_effect::source_damage_intersects_rect(
-                &effect_config.effect,
+                &backdrop_effect,
                 smithay::utils::Rectangle::new(
                     smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
                     (effect_rect.width, effect_rect.height).into(),
@@ -11606,7 +11599,7 @@ fn lower_layer_scene_elements(
                 (effect_rect.width, effect_rect.height).into(),
             );
             if !matches!(
-                effect_config.effect.invalidate_policy(),
+                backdrop_effect.invalidate_policy(),
                 crate::ssd::EffectInvalidationPolicy::Always
             ) && !source_damage_hit
                 && let Some(existing) = layer_backdrop_cache
@@ -11643,7 +11636,7 @@ fn lower_layer_scene_elements(
                                 rect_local,
                                 rect_local,
                                 captured_local_rect,
-                                &effect_config.effect,
+                                &backdrop_effect,
                                 1.0,
                                 scale.x as f32,
                                 None,
@@ -11708,17 +11701,17 @@ fn lower_layer_scene_elements(
                 },
             )?
             .ok_or("missing backdrop snapshot")?;
-            let backdrop_texture = if effect_config.effect.uses_backdrop_input() {
+            let backdrop_texture = if backdrop_effect.uses_backdrop_input() {
                 Some(snapshot.texture.clone())
             } else {
                 None
             };
-            let xray_texture = if effect_config.effect.uses_xray_backdrop_input() {
+            let xray_texture = if backdrop_effect.uses_xray_backdrop_input() {
                 Some(snapshot.texture.clone())
             } else {
                 None
             };
-            let layer_source_capture = if effect_config.effect.uses_layer_source_input() {
+            let layer_source_capture = if backdrop_effect.uses_layer_source_input() {
                 let layer_source_geo = smithay::utils::Rectangle::new(
                     smithay::utils::Point::from((effect_rect.x, effect_rect.y)),
                     (effect_rect.width, effect_rect.height).into(),
@@ -11757,7 +11750,7 @@ fn lower_layer_scene_elements(
             // Skip the effect this frame when the layer source could not be
             // captured (empty scene / zero-sized geometry); running the
             // pipeline without it would fail inside resolve_effect_input.
-            if effect_config.effect.uses_layer_source_input() && layer_source_texture.is_none() {
+            if backdrop_effect.uses_layer_source_input() && layer_source_texture.is_none() {
                 continue;
             }
             let input_texture = backdrop_texture
@@ -11794,7 +11787,7 @@ fn lower_layer_scene_elements(
                     input_size,
                     sample_region,
                     output_size,
-                    &effect_config.effect,
+                    &backdrop_effect,
                 )?
             } else {
                 crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -11805,7 +11798,7 @@ fn lower_layer_scene_elements(
                     input_size,
                     sample_region,
                     output_size,
-                    &effect_config.effect,
+                    &backdrop_effect,
                 )?
             };
             let mut sub_elements = layer_backdrop_cache
@@ -11876,7 +11869,7 @@ fn lower_layer_scene_elements(
                         rect_local,
                         rect_local,
                         captured_local_rect,
-                        &effect_config.effect,
+                        &backdrop_effect,
                         1.0,
                         scale.x as f32,
                         None,
@@ -11900,7 +11893,6 @@ fn upper_layer_scene_elements(
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
     upper_layer_source_damage: &[crate::state::OwnedDamageRect],
-    lower_layer_scene_generation: u64,
     configured_layer_effects: &std::collections::HashMap<String, crate::ssd::WindowEffectConfig>,
     configured_background_effect: Option<&crate::ssd::BackgroundEffectConfig>,
     output: &Output,
@@ -11986,8 +11978,7 @@ fn upper_layer_scene_elements(
         let custom_background = configured_layer_effects
             .get(&layer_id)
             .and_then(|effects| effects.behind.as_ref())
-            .filter(|effect| effect.effect.is_backdrop())
-            .cloned();
+            .filter(|effect| effect.effect.is_backdrop());
         let effect_config = configured_background_effect;
         if custom_background.is_none()
             && let Some(effect_config) =
@@ -12011,7 +12002,6 @@ fn upper_layer_scene_elements(
                 window_source_damage,
                 lower_layer_source_damage,
                 upper_layer_source_damage,
-                lower_layer_scene_generation,
                 output,
                 output_geo,
                 scale,
@@ -12021,7 +12011,7 @@ fn upper_layer_scene_elements(
                 1.0,
                 layer_backdrop_cache,
                 configured_background_effect,
-                custom_background.as_ref(),
+                custom_background,
             )?);
         }
     }
@@ -12116,7 +12106,6 @@ fn configured_background_effect_elements_for_window(
     _window_commit_times: &std::collections::HashMap<smithay::desktop::Window, std::time::Duration>,
     window_source_damage: &[crate::state::OwnedDamageRect],
     lower_layer_source_damage: &[crate::state::OwnedDamageRect],
-    lower_layer_scene_generation: u64,
     output: &Output,
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
@@ -12152,7 +12141,7 @@ fn configured_background_effect_elements_for_window(
             let uses_xray = effect_config.effect.uses_xray_backdrop_input();
             let stable_key = format!("__protocol_background_effect_{}", index);
             let cache_key = format!("{}@{}", stable_key, output.name());
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let mut hasher = SignatureHasher::default();
             stable_key.hash(&mut hasher);
             let effect_rect = if apply_visual_transform {
                 crate::backend::visual::transformed_rect(
@@ -12176,10 +12165,7 @@ fn configured_background_effect_elements_for_window(
                 .hash(&mut hasher);
             let blur_padding = effect_config.effect.capture_padding.max(0);
             blur_padding.hash(&mut hasher);
-            if uses_backdrop || uses_xray {
-                lower_layer_scene_generation.hash(&mut hasher);
-            }
-            format!("{:?}", effect_config.effect).hash(&mut hasher);
+            hash_debug(&mut hasher, &effect_config.effect);
             let capture_geo = smithay::utils::Rectangle::new(
                 smithay::utils::Point::from((
                     effect_rect.x - blur_padding,
@@ -12378,7 +12364,7 @@ fn configured_background_effect_elements_for_window(
                 effect_rect.height,
                 scale,
             );
-            if std::env::var_os("SHOJI_FIREFOX_BACKDROP_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
                 tracing::info!(
                     window_id = %decoration.snapshot.id,
                     title = %decoration.snapshot.title,
@@ -12416,7 +12402,7 @@ fn configured_background_effect_elements_for_window(
                     "backdrop debug: protocol window element"
                 );
             }
-            if std::env::var_os("SHOJI_GAP_SHADER_READBACK_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
                     renderer,
                     &input_texture,
@@ -12446,7 +12432,7 @@ fn configured_background_effect_elements_for_window(
                 &effect_config.effect,
             )
             .ok()?;
-            if std::env::var_os("SHOJI_GAP_SHADER_READBACK_DEBUG").is_some() {
+            if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
                 crate::backend::shader_effect::log_gap_texture_region_readback(
                     renderer,
                     &texture,
@@ -12906,7 +12892,7 @@ fn closing_snapshot_elements(
     output_geo: smithay::utils::Rectangle<i32, Logical>,
     scale: smithay::utils::Scale<f64>,
 ) -> Vec<TtyRenderElements> {
-    let close_debug = std::env::var_os("SHOJI_CLOSE_DEBUG").is_some();
+    let close_debug = crate::env_flag!("SHOJI_CLOSE_DEBUG");
     closing_snapshots
         .iter()
         .flat_map(|snapshot| {
@@ -14144,7 +14130,7 @@ fn schedule_estimated_vblank_callback(
                 );
             }
             if should_redraw {
-                if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                     tracing::info!(
                         output = %output.name(),
                         queued = true,
@@ -14165,7 +14151,7 @@ fn schedule_estimated_vblank_callback(
                 }
                 state.schedule_redraw();
             } else {
-                if std::env::var_os("SHOJI_TRANSFORM_SNAPSHOT_DEBUG").is_some() {
+                if crate::env_flag!("SHOJI_TRANSFORM_SNAPSHOT_DEBUG") {
                     tracing::info!(
                         output = %output.name(),
                         queued = false,

@@ -823,10 +823,47 @@ export interface WindowEffectAssignment {
   behindSubsurfaces?: WindowEffectHandle | null;
 }
 
+/**
+ * The part of a layer surface that a backdrop `behind` effect covers. The effect
+ * captures, runs its pipeline and is re-run only over the bounding box of that
+ * part (plus `outsets`), not over the whole surface. Worth setting when the
+ * surface is much larger than what it draws — a fixed-size shell surface, or a
+ * full-screen one with the bar cut out by an input mask.
+ * - `"surface"` (default): the whole surface.
+ * - `"input"`: the input region (QuickShell's `mask`). A surface without one
+ *   takes input everywhere, so this is then the whole surface.
+ * - `"blur-region"`: the blur region the client asked for through
+ *   ext-background-effect (QuickShell's `BackgroundEffect.blurRegion`). Nothing
+ *   is drawn while the client asks for none.
+ *
+ * Anything drawn outside the region gets no effect, so pad it with `outsets`
+ * where the surface draws past its region (antialiasing, shapes that merge).
+ * The region is part of the same commit as the buffer, so the two never
+ * disagree. Only a backdrop `behind` accepts a region other than `"surface"`.
+ *
+ * レイヤーサーフェスのうち、バックドロップの `behind` エフェクトが覆う部分です。
+ * キャプチャ・パイプライン実行・再計算の判定を、サーフェス全体ではなくその部分の
+ * 外接矩形（＋`outsets`）だけで行います。サーフェスが描画内容よりずっと大きい
+ * とき（固定サイズのシェル、入力マスクでバーだけ切り出した全画面サーフェスなど）
+ * に指定すると軽くなります。
+ * - `"surface"`（既定）: サーフェス全体。
+ * - `"input"`: 入力領域（QuickShell の `mask`）。未設定のサーフェスは全体で入力を
+ *   受けるので、その場合はサーフェス全体になります。
+ * - `"blur-region"`: ext-background-effect でクライアントが要求したブラー領域
+ *   （QuickShell の `BackgroundEffect.blurRegion`）。要求が無い間は何も描きません。
+ *
+ * 領域の外に描かれたものにはエフェクトが掛からないため、領域からはみ出して描く分
+ * （アンチエイリアスや形の融合など）は `outsets` で広げてください。領域はバッファと
+ * 同じ commit で切り替わるため、見た目とずれることはありません。`"surface"` 以外を
+ * 指定できるのはバックドロップの `behind` だけです。
+ */
+export type LayerEffectRegion = "surface" | "input" | "blur-region";
+
 export interface LayerEffectHandle {
   kind: "layer-effect";
   effect: CompiledEffectHandle;
   outsets?: EffectOutsets;
+  region?: LayerEffectRegion;
 }
 
 export interface LayerEffectAssignment {

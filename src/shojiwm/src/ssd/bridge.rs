@@ -4,7 +4,7 @@ use super::{
     AlignItems, BackdropBlur, BackgroundEffectConfig, BlendMode, BorderFit, BorderStyle, BoxNode,
     ButtonNode, Color, CompiledEffect, DecorationInteractionHandlers, DecorationNode,
     DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectAlphaMode,
-    EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectStage, ImageNode, JustifyContent,
+    EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectRegion, EffectStage, ImageNode, JustifyContent,
     LabelNode, LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
     PositionOffsets, ShaderEffectNode, ShaderModule, ShaderStage, ShaderUniformValue,
     StylePosition, WindowAction, WindowBorderInteraction, WindowEffectConfig, WindowEffectSlot,
@@ -256,6 +256,9 @@ pub struct WireWindowEffectSlot {
     pub kind: String,
     pub effect: WireCompiledEffect,
     pub outsets: Option<WireEffectOutsets>,
+    /// `"surface"` (default), `"input"` or `"blur-region"`.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -756,8 +759,18 @@ impl TryFrom<WireWindowEffectSlot> for WindowEffectSlot {
         Ok(WindowEffectSlot {
             effect: value.effect.try_into()?,
             outsets: decode_effect_outsets(value.outsets),
+            region: decode_effect_region(value.region.as_deref())?,
         })
     }
+}
+
+fn decode_effect_region(value: Option<&str>) -> Result<EffectRegion, DecorationBridgeError> {
+    Ok(match value.unwrap_or("surface") {
+        "surface" => EffectRegion::Surface,
+        "input" => EffectRegion::Input,
+        "blur-region" => EffectRegion::BlurRegion,
+        _ => return Err(DecorationBridgeError::InvalidShaderDescriptor),
+    })
 }
 
 fn decode_effect_outsets(value: Option<WireEffectOutsets>) -> EffectOutsets {
@@ -1582,6 +1595,34 @@ mod tests {
                 bottom: 6,
             }
         );
+        assert_eq!(behind.region, EffectRegion::Surface);
+    }
+
+    #[test]
+    fn decode_layer_effect_region() {
+        let decode = |region: &str| {
+            let wire: WireWindowEffectConfig = serde_json::from_str(&format!(
+                r#"{{
+                    "behind": {{
+                        "kind": "layer-effect",
+                        "effect": {{
+                            "kind": "compiled-effect",
+                            "input": {{ "kind": "backdrop-source" }},
+                            "capturePadding": 24,
+                            "invalidate": {{ "kind": "always" }},
+                            "pipeline": [{{ "kind": "noise", "noiseKind": "salt", "amount": 0.1 }}]
+                        }},
+                        "region": "{region}"
+                    }}
+                }}"#
+            ))
+            .expect("layer effect assignment should deserialize");
+            WindowEffectConfig::try_from(wire).map(|effects| effects.behind.unwrap().region)
+        };
+        assert_eq!(decode("surface").unwrap(), EffectRegion::Surface);
+        assert_eq!(decode("input").unwrap(), EffectRegion::Input);
+        assert_eq!(decode("blur-region").unwrap(), EffectRegion::BlurRegion);
+        assert!(decode("everywhere").is_err());
     }
 
     #[test]

@@ -64,6 +64,37 @@ COMPOSITOR.effect.popup = (popup) => {
 };
 ```
 
+### Narrowing a layer effect to a region
+
+A layer's `behind` backdrop covers the whole layer surface by default: the
+backdrop is captured over it, the pipeline runs over it, and any damage anywhere
+under it re-runs the effect. Shell toolkits often map surfaces much larger than
+what they draw — a fixed-size surface around an animated pill, or one full-screen
+surface per monitor with the bar cut out by an input mask — which makes that
+expensive. Set `region` to cover only the part that draws:
+
+```ts
+const BAR_BLUR = compileLayerEffect({
+  input: backdropSource(),
+  region: 'input', // the input region, e.g. QuickShell's `mask`
+  outsets: 16,     // what draws past the region: antialiasing, merging shapes
+  alpha: 'preserve',
+  pipeline: [dualKawaseBlur({radius: 4, passes: 2})],
+});
+```
+
+| `region` | Covers |
+|---|---|
+| `'surface'` (default) | The whole surface. |
+| `'input'` | The bounding box of the input region (`wl_surface.set_input_region`). A surface without one takes input everywhere, so this is then the whole surface. |
+| `'blur-region'` | The bounding box of the blur region the client asked for through ext-background-effect (QuickShell's `BackgroundEffect.blurRegion`). Nothing is drawn while the client asks for none. |
+
+The capture, the pipeline, `layerSource()` and damage-based invalidation all
+follow the region, plus `outsets`. Both regions are part of the same commit as
+the buffer, so the effect never lags a frame behind an animated shape. Anything
+the surface draws outside the region gets no backdrop. Only a backdrop `behind`
+accepts a region other than `'surface'`.
+
 ## Building an effect
 
 An effect is **a source input + a pipeline of stages**. Compile it with the
