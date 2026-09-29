@@ -6,8 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/shoji_wm/tsconfig.json && tsc -p packages/config/tsconfig.json",
-    "ssd:eval": "tsx tools/evaluate-decoration.ts packages/config/src/index.tsx"
+    "typecheck": "tsc -p packages/shoji_wm/tsconfig.json && tsc -p packages/config/tsconfig.json"
   },
   "devDependencies": {
     "tsx": "^4.20.3",
