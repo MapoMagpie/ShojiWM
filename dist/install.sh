@@ -52,7 +52,10 @@ if [[ $DEV -eq 1 ]]; then
 fi
 
 if [[ $BUILD -eq 1 ]]; then
-    CARGO_ARGS=($PROFILE_FLAG -p shoji_wm -p xdg-desktop-portal-shojiwm)
+    CARGO_ARGS=($PROFILE_FLAG -p shoji_wm)
+    if [[ $INSTALL_PORTAL -eq 1 ]]; then
+        CARGO_ARGS+=(-p xdg-desktop-portal-shojiwm)
+    fi
     if [[ $DEBUG -eq 1 ]]; then
         # Hardened mimalloc (guard pages, encoded free lists): heap
         # corruption aborts at the faulting write instead of detonating
