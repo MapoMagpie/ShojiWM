@@ -29,6 +29,19 @@ ShojiWM は1つのスクリプト `dist/install.sh` でソースからインス�
   - `xwayland` —— X11 アプリの実行に使う Xwayland サーバー本体（下記の注記参照）
 - `sudo` —— インストーラーが `/usr` にファイルをコピーし、セッションを登録するため
 
+:::warning[最低バージョン]
+ShojiWM は一部の LTS ディストリビューションより新しいシステムパッケージを必要とします。
+
+- `libwayland` **1.23** 以上 —— 実行時に必須です。古いと起動直後に `NoWaylandLib` で終了します
+- `xwayland` **23.1** 以上 —— 内蔵の xwayland-satellite に必要です（古い場合は
+  `SHOJI_XWAYLAND_SATELLITE=off` で代替できます）
+- PipeWire **0.3.77** 以上 —— xdg-desktop-portal バックエンドのビルドにのみ必要です
+  （`--no-portal` で省略できます）
+
+Ubuntu では **25.04 以降**が必要で、Ubuntu 22.04 / 24.04 はサポート対象外です。
+Debian 13（trixie）以降も要件を満たします。
+:::
+
 :::note[ネイティブライブラリのインストール]
 パッケージ名はディストリビューションによって異なります。例えば次のようになります。
 

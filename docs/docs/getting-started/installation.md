@@ -31,6 +31,20 @@ official release**. Until then, install from source as described below.
     below)
 - `sudo` — the installer copies files into `/usr` and registers the session
 
+:::warning[Minimum versions]
+ShojiWM needs newer system packages than some LTS distributions ship:
+
+- `libwayland` **1.23** or newer — required at runtime; with an older one
+  ShojiWM exits at startup with `NoWaylandLib`
+- `xwayland` **23.1** or newer — for the built-in xwayland-satellite (older
+  versions can use `SHOJI_XWAYLAND_SATELLITE=off` instead)
+- PipeWire **0.3.77** or newer — only to build the xdg-desktop-portal backend
+  (skip it with `--no-portal`)
+
+On Ubuntu this means **25.04 or newer**; Ubuntu 22.04 and 24.04 are not
+supported. Debian 13 (trixie) or newer also meets these requirements.
+:::
+
 :::note[Installing the native libraries]
 Package names vary by distribution. For example:
 
