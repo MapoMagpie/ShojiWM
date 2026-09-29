@@ -30,6 +30,7 @@ use super::{
 use crate::{
     activation_environment::{RuntimeEnvUpdates, apply_runtime_env_updates},
     config::RuntimeDisplayConfigUpdate,
+    keyboard_layout::KeyboardLayoutSnapshot,
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::{RuntimeInputConfigUpdate, RuntimeInputDeviceSnapshot},
     runtime_key_binding::RuntimeKeyBindingConfigUpdate,
@@ -721,6 +722,7 @@ pub struct EmbeddedDecorationEvaluator {
     runtime: Arc<Mutex<Option<EmbeddedDecorationRuntime>>>,
     display_state: Arc<Mutex<std::collections::BTreeMap<String, WaylandOutputSnapshot>>>,
     input_state: Arc<Mutex<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>>,
+    keyboard_layout: Arc<Mutex<Option<KeyboardLayoutSnapshot>>>,
     runtime_state_generation: Arc<AtomicU64>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
     async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
@@ -759,6 +761,7 @@ struct EmbeddedDecorationRuntime {
     stderr_log: Arc<Mutex<String>>,
     async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
     last_sent_runtime_state_generation: u64,
+    last_sent_keyboard_layout: Option<KeyboardLayoutSnapshot>,
 }
 
 #[derive(serde::Serialize)]
@@ -1522,6 +1525,7 @@ impl EmbeddedDecorationEvaluator {
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            keyboard_layout: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
@@ -1536,6 +1540,7 @@ impl EmbeddedDecorationEvaluator {
             runtime: Arc::new(Mutex::new(None)),
             display_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             input_state: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            keyboard_layout: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
             async_event_sender: Arc::new(Mutex::new(None)),
@@ -1575,6 +1580,16 @@ impl EmbeddedDecorationEvaluator {
                 self.runtime_state_generation
                     .fetch_add(1, Ordering::Release);
             }
+    }
+
+    pub fn set_keyboard_layout(&self, layout: KeyboardLayoutSnapshot) -> bool {
+        if let Ok(mut current) = self.keyboard_layout.lock()
+            && current.as_ref() != Some(&layout)
+        {
+            *current = Some(layout);
+            return true;
+        }
+        false
     }
 
     /// Retire the current isolate and hand back an evaluator that shares this
@@ -1876,6 +1891,7 @@ impl EmbeddedDecorationEvaluator {
             stderr_log: Arc::new(Mutex::new(String::new())),
             async_event_sender: Arc::clone(&self.async_event_sender),
             last_sent_runtime_state_generation: 0,
+            last_sent_keyboard_layout: None,
         })
     }
 
@@ -2367,6 +2383,7 @@ impl Clone for EmbeddedDecorationEvaluator {
             runtime: Arc::clone(&self.runtime),
             display_state: Arc::clone(&self.display_state),
             input_state: Arc::clone(&self.input_state),
+            keyboard_layout: Arc::clone(&self.keyboard_layout),
             runtime_state_generation: Arc::clone(&self.runtime_state_generation),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
             async_event_sender: Arc::clone(&self.async_event_sender),
@@ -3330,7 +3347,14 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
         let request_id = runtime.next_request_id;
         runtime.next_request_id += 1;
         let runtime_state_generation = self.runtime_state_generation.load(Ordering::Acquire);
-        if runtime.last_sent_runtime_state_generation == runtime_state_generation {
+        let keyboard_layout = self
+            .keyboard_layout
+            .lock()
+            .map(|layout| layout.clone())
+            .unwrap_or_default();
+        let layout_changed = runtime.last_sent_keyboard_layout != keyboard_layout;
+        if runtime.last_sent_runtime_state_generation == runtime_state_generation && !layout_changed
+        {
             runtime.write_scheduler_fast_request(request_id, now_ms)?;
         } else {
             let display_state = self
@@ -3350,6 +3374,11 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
                 now_ms,
                 display_state,
                 input_state,
+                keyboard_layout: if layout_changed {
+                    keyboard_layout.clone()
+                } else {
+                    None
+                },
             })?;
             runtime.last_sent_runtime_state_generation = runtime_state_generation;
         }
@@ -3393,6 +3422,8 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
                     .unwrap_or_else(|| "runtime returned failure".into()),
             ));
         }
+
+        runtime.last_sent_keyboard_layout = keyboard_layout;
 
         if managed_rect_debug_enabled() {
             info!(
@@ -6713,6 +6744,75 @@ COMPOSITOR.window.composition = () => <Label text={restored} />;
         drop(reloaded);
         drop(evaluator);
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn embedded_runtime_reports_keyboard_layout_changes_and_reload() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-keyboard-layout-test-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(&config_path, r#"
+import { COMPOSITOR, Label } from "shoji_wm";
+COMPOSITOR.window.composition = () => <Label text="layout test" />;
+const layouts = [];
+COMPOSITOR.event.onEnable(() => {
+  COMPOSITOR.event.onKeyboardLayoutChange((event) => layouts.push(event));
+  const unsubscribe = COMPOSITOR.event.onKeyboardLayoutChange(() => {
+    throw new Error("unsubscribed layout listener was invoked");
+  });
+  unsubscribe();
+});
+COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
+"#).unwrap();
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"), &config_path,
+        ).with_working_dir(&repository_root);
+        evaluator.lifecycle_enable("initial", None).unwrap();
+        for (index, name) in [(0, "English (US)"), (1, "Russian"), (1, "German")] {
+            assert!(evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
+                index, name: name.into(),
+            }));
+            // Other runtime traffic must not consume the pending layout update.
+            evaluator.evaluate_window(&make_window(false), 0).unwrap();
+            evaluator.scheduler_tick(1).unwrap();
+            assert!(!evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
+                index, name: name.into(),
+            }));
+            evaluator.scheduler_tick(2).unwrap();
+            // A full state payload must not re-emit an unchanged layout either.
+            evaluator.runtime_state_generation.fetch_add(1, Ordering::Release);
+            evaluator.scheduler_tick(3).unwrap();
+        }
+        evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
+            index: 0, name: "English (US)".into(),
+        });
+        evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
+            index: 1, name: "German".into(),
+        });
+        evaluator.scheduler_tick(4).unwrap();
+        let state = evaluator.lifecycle_disable("reload").unwrap();
+        assert_eq!(state["layouts"], serde_json::json!([
+            { "index": 0, "name": "English (US)" },
+            { "index": 1, "name": "Russian" },
+            { "index": 1, "name": "German" },
+        ]));
+        let reloaded = evaluator.fresh_like();
+        reloaded.lifecycle_enable("reload", None).unwrap();
+        reloaded.scheduler_tick(5).unwrap();
+        reloaded.scheduler_tick(6).unwrap();
+        let state = reloaded.lifecycle_disable("shutdown").unwrap();
+        assert_eq!(state["layouts"], serde_json::json!([
+            { "index": 1, "name": "German" },
+        ]));
+        drop(reloaded);
+        drop(evaluator);
+        std::fs::remove_dir_all(test_dir).unwrap();
     }
 
     #[test]

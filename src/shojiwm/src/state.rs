@@ -2358,6 +2358,7 @@ impl ShojiWM {
     /// need to pull the resulting dirty actions through before the next idle
     /// poll would naturally fire (~250 ms later).
     fn tick_runtime_scheduler_with(&mut self, force: bool) -> u64 {
+        self.sync_keyboard_layout();
         self.refresh_runtime_processes();
         let managed_window_animation_active = !self.managed_window_animations.is_empty();
         if !force
@@ -2655,6 +2656,7 @@ impl ShojiWM {
         }
 
         self.decoration_evaluator = DecorationRuntimeEvaluator::Embedded(next);
+        self.runtime_scheduler_enabled = true;
         self.mark_all_window_decoration_policies_reloaded();
         self.config_error_report = None;
         // The overlay was just cleared: effect failures that are still there must show up again.
