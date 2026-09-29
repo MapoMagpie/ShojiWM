@@ -670,7 +670,7 @@ export function compileEffect(
  *
  * @example Per-window drop shadow / ウィンドウごとのドロップシャドウ
  * ```ts
- * // The handle goes in an assignment slot: behind | behindRootSurface | inFront | replace.
+ * // The handle goes in an assignment slot: behind | behindRootSurface | inFront | replace | replaceSubsurfaces | behindSubsurfaces.
  * COMPOSITOR.effect.window = () => ({
  *   behind: compileWindowEffect({
  *     input: windowSource(),

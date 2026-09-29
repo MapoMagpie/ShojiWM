@@ -244,6 +244,10 @@ pub struct WireWindowEffectConfig {
     #[serde(rename = "inFront")]
     pub in_front: Option<WireWindowEffectSlot>,
     pub replace: Option<WireWindowEffectSlot>,
+    #[serde(rename = "replaceSubsurfaces", default)]
+    pub replace_subsurfaces: Option<WireWindowEffectSlot>,
+    #[serde(rename = "behindSubsurfaces", default)]
+    pub behind_subsurfaces: Option<WireWindowEffectSlot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -726,6 +730,14 @@ impl TryFrom<WireWindowEffectConfig> for WindowEffectConfig {
                 .transpose()?,
             in_front: value.in_front.map(TryInto::try_into).transpose()?,
             replace: value.replace.map(TryInto::try_into).transpose()?,
+            replace_subsurfaces: value
+                .replace_subsurfaces
+                .map(TryInto::try_into)
+                .transpose()?,
+            behind_subsurfaces: value
+                .behind_subsurfaces
+                .map(TryInto::try_into)
+                .transpose()?,
         })
     }
 }
@@ -1067,7 +1079,7 @@ fn is_reserved_effect_binding_name(name: &str) -> bool {
     name.is_empty()
         || matches!(
             name,
-            "tex" | "effect_texture_size_px" | "effect_content_rect_px"
+            "tex" | "effect_texture_size_px" | "effect_content_rect_px" | "effect_frame_rect_px"
         )
 }
 

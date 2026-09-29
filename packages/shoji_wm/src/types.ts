@@ -791,6 +791,36 @@ export interface WindowEffectAssignment {
   behindRootSurface?: WindowEffectHandle | null;
   inFront?: WindowEffectHandle | null;
   replace?: WindowEffectHandle | null;
+  /**
+   * Replaces the window's subsurfaces (embedded video, previews, ...) separately
+   * from the rest of the window, over their own bounds, so subsurfaces reaching
+   * outside the window are covered too. `windowSource()` reads the subsurfaces.
+   * While this or `behindSubsurfaces` is set, the window sources of the other
+   * slots leave subsurfaces out.
+   * Use `effect_frame_uv()` in the shader to line a mask up with the window.
+   * TTY backend only.
+   * ウィンドウのサブサーフェス（埋め込み動画・プレビューなど）を、ウィンドウ本体とは
+   * 別に、サブサーフェス自身の範囲で置き換えます。ウィンドウからはみ出した
+   * サブサーフェスにも適用されます。`windowSource()` はサブサーフェスを読みます。
+   * これか `behindSubsurfaces` を設定している間は、他のスロットのウィンドウソースから
+   * サブサーフェスが除かれます。
+   * マスクをウィンドウに揃えるにはシェーダーで `effect_frame_uv()` を使います。
+   * TTY バックエンドのみ。
+   */
+  replaceSubsurfaces?: WindowEffectHandle | null;
+  /**
+   * Drawn behind the window's subsurfaces (e.g. their drop shadow), over their
+   * own bounds plus `outsets`, so subsurfaces outside the window get it too.
+   * `windowSource()` reads the subsurfaces as they are, before
+   * `replaceSubsurfaces`. Subsurfaces are left out of the other slots' window
+   * sources as with `replaceSubsurfaces`. TTY backend only.
+   * ウィンドウのサブサーフェスの背後に描画します（影など）。サブサーフェス自身の範囲
+   * ＋`outsets` で処理するため、ウィンドウからはみ出したサブサーフェスにも適用されます。
+   * `windowSource()` は `replaceSubsurfaces` 適用前のサブサーフェスを読みます。
+   * `replaceSubsurfaces` と同様、他のスロットのウィンドウソースからサブサーフェスが
+   * 除かれます。TTY バックエンドのみ。
+   */
+  behindSubsurfaces?: WindowEffectHandle | null;
 }
 
 export interface LayerEffectHandle {

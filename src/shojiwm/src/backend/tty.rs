@@ -5519,8 +5519,21 @@ fn render_surface(
                         "output_render_debug: window rendered"
                     );
                 }
-                // Full window sources include subsurfaces and SSD decorations.
-                // Popups remain independently composed above the window effect.
+                // Full window sources include subsurfaces and SSD decorations, unless
+                // `replaceSubsurfaces` / `behindSubsurfaces` take the subsurfaces out to
+                // handle them over their own bounds. Popups remain independently composed above the window effect.
+                let (replace_subsurfaces_slot, behind_subsurfaces_slot) = window_decorations
+                    .get(window)
+                    .and_then(|decoration| decoration.window_effects.as_ref())
+                    .map(|effects| {
+                        (
+                            effects.replace_subsurfaces.clone(),
+                            effects.behind_subsurfaces.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let separate_subsurfaces =
+                    replace_subsurfaces_slot.is_some() || behind_subsurfaces_slot.is_some();
                 let source_clip_scale = if use_full_window_snapshot {
                     scale
                 } else {
@@ -5587,7 +5600,7 @@ fn render_surface(
                         visual_state,
                         visual_state.opacity,
                         content_clip,
-                        true,
+                        !separate_subsurfaces,
                     )
                 } else {
                     Vec::new()
@@ -5725,6 +5738,79 @@ fn render_surface(
                     );
                 }
 
+                let (subsurfaces_above, subsurfaces_below, client_elements) =
+                    if separate_subsurfaces {
+                        let groups = subsurface_groups_for_window(
+                            window,
+                            &mut backend.renderer,
+                            physical_location,
+                            scale,
+                            visual_state,
+                            visual_state.opacity,
+                        );
+                        let client_elements = client_elements
+                            .into_iter()
+                            .filter(|element| {
+                                !groups.ids.contains(
+                                    smithay::backend::renderer::element::Element::id(element),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        // Each group: its (replaced) subsurfaces, then its behind effect.
+                        let mut render_group = |group: Vec<TtyRenderElements>,
+                                                placements: [&'static str; 2]| {
+                            let Some(decoration) = window_decorations.get_mut(window) else {
+                                return group;
+                            };
+                            let behind = behind_subsurfaces_slot
+                                .as_ref()
+                                .and_then(|effect| {
+                                    subsurface_effect_elements(
+                                        &mut backend.renderer,
+                                        &output,
+                                        output_geo,
+                                        scale,
+                                        &window_id,
+                                        placements[1],
+                                        decoration,
+                                        effect,
+                                        &group,
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_default();
+                            let mut elements = match replace_subsurfaces_slot.as_ref() {
+                                Some(effect) => subsurface_effect_elements(
+                                    &mut backend.renderer,
+                                    &output,
+                                    output_geo,
+                                    scale,
+                                    &window_id,
+                                    placements[0],
+                                    decoration,
+                                    effect,
+                                    &group,
+                                )
+                                .unwrap_or(group),
+                                None => group,
+                            };
+                            elements.extend(behind);
+                            elements
+                        };
+                        let above = render_group(
+                            groups.above,
+                            ["replace-subsurfaces-above", "behind-subsurfaces-above"],
+                        );
+                        let below = render_group(
+                            groups.below,
+                            ["replace-subsurfaces-below", "behind-subsurfaces-below"],
+                        );
+                        (above, below, client_elements)
+                    } else {
+                        (Vec::new(), Vec::new(), client_elements)
+                    };
+                // Subsurfaces below the root belong between the client and its SSD.
+                let client_element_count = client_elements.len();
                 let mut original_window_body_elements: Vec<TtyRenderElements> = Vec::new();
                 original_window_body_elements.extend(client_elements);
                 original_window_body_elements
@@ -5816,10 +5902,12 @@ fn render_surface(
                 if let Some(replace_effects) = replace_effects {
                     // Full replacement owns subsurfaces too (e.g. OBS's video preview).
                     // Drawing them again here bypasses the shader's visibility mask.
-                    if !matches!(
-                        replace_effect_slot.as_ref().map(|effect| &effect.effect.input),
-                        Some(EffectInput::WindowSource(WindowSourceInclude::Full))
-                    ) {
+                    if !separate_subsurfaces
+                        && !matches!(
+                            replace_effect_slot.as_ref().map(|effect| &effect.effect.input),
+                            Some(EffectInput::WindowSource(WindowSourceInclude::Full))
+                        )
+                    {
                         current_window_elements.extend(non_root_surface_elements_for_window(
                             window,
                             &mut backend.renderer,
@@ -5833,9 +5921,11 @@ fn render_surface(
                             content_clip,
                         ));
                     }
+                    current_window_elements.extend(subsurfaces_above);
                     current_window_elements.extend(replace_effects);
+                    current_window_elements.extend(subsurfaces_below);
                 } else {
-                    if use_full_window_snapshot {
+                    if use_full_window_snapshot && !separate_subsurfaces {
                         current_window_elements.extend(non_root_surface_elements_for_window(
                             window,
                             &mut backend.renderer,
@@ -5849,6 +5939,11 @@ fn render_surface(
                             content_clip,
                         ));
                     }
+                    current_window_elements.extend(subsurfaces_above);
+                    original_window_body_elements.splice(
+                        client_element_count..client_element_count,
+                        subsurfaces_below,
+                    );
                     current_window_elements.extend(original_window_body_elements);
                 }
                 if window_effect_debug_enabled() {
@@ -7621,6 +7716,140 @@ fn window_surface_source_elements_for_window(
     )
 }
 
+/// A window's subsurfaces, split around the root surface; each group is front-to-back like
+/// render elements.
+#[derive(Default)]
+struct SubsurfaceGroups {
+    above: Vec<TtyRenderElements>,
+    below: Vec<TtyRenderElements>,
+    ids: std::collections::HashSet<smithay::backend::renderer::element::Id>,
+}
+
+fn subsurface_groups_for_window(
+    window: &smithay::desktop::Window,
+    renderer: &mut GlesRenderer,
+    physical_location: Point<i32, smithay::utils::Physical>,
+    output_scale: Scale<f64>,
+    visual: WindowVisualState,
+    alpha: f32,
+) -> SubsurfaceGroups {
+    let smithay::desktop::WindowSurface::Wayland(surface) = window.underlying_surface() else {
+        return SubsurfaceGroups::default();
+    };
+    let root_id = smithay::backend::renderer::element::Id::from_wayland_resource(
+        surface.wl_surface(),
+    );
+    let mut elements =
+        window_render::surface_elements(window, renderer, physical_location, output_scale, alpha);
+    // Paint order puts subsurfaces placed above the root before it. Without a root buffer
+    // there is nothing to be above or below; keep them all in front.
+    let root_index = elements
+        .iter()
+        .position(|element| smithay::backend::renderer::element::Element::id(element) == &root_id);
+    let below = match root_index {
+        Some(index) => {
+            let mut below = elements.split_off(index);
+            below.remove(0);
+            below
+        }
+        None => Vec::new(),
+    };
+    let above = elements;
+    let ids = above
+        .iter()
+        .chain(below.iter())
+        .map(|element| smithay::backend::renderer::element::Element::id(element).clone())
+        .collect();
+    let transform = |elements| {
+        transform_window_elements(
+            elements,
+            visual,
+            TtyRenderElements::Window,
+            TtyRenderElements::TransformedWindow,
+        )
+    };
+    SubsurfaceGroups {
+        above: transform(above),
+        below: transform(below),
+        ids,
+    }
+}
+
+/// Logical bounds of render elements, rounded outwards.
+fn logical_bounds_of_elements(
+    elements: &[TtyRenderElements],
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) -> Option<crate::ssd::LogicalRect> {
+    let physical = elements
+        .iter()
+        .map(|element| smithay::backend::renderer::element::Element::geometry(element, scale))
+        .filter(|geometry| !geometry.is_empty())
+        .reduce(|acc, geometry| acc.merge(geometry))?;
+    let left = (physical.loc.x as f64 / scale.x).floor() as i32;
+    let top = (physical.loc.y as f64 / scale.y).floor() as i32;
+    let right = ((physical.loc.x + physical.size.w) as f64 / scale.x).ceil() as i32;
+    let bottom = ((physical.loc.y + physical.size.h) as f64 / scale.y).ceil() as i32;
+    Some(crate::ssd::LogicalRect::new(
+        output_geo.loc.x + left,
+        output_geo.loc.y + top,
+        right - left,
+        bottom - top,
+    ))
+}
+
+/// Runs a subsurface slot (`replaceSubsurfaces` / `behindSubsurfaces`) over one subsurface
+/// group, covering the group's own bounds so subsurfaces outside the window are covered too.
+#[allow(clippy::too_many_arguments)]
+fn subsurface_effect_elements(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    window_id: &str,
+    placement: &'static str,
+    decoration: &mut crate::ssd::WindowDecorationState,
+    effect: &crate::ssd::WindowEffectSlot,
+    group: &[TtyRenderElements],
+) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
+    let Some(rect) = logical_bounds_of_elements(group, output_geo, scale) else {
+        return Ok(Vec::new());
+    };
+    let frame_rect =
+        transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+    let mut hasher = DefaultHasher::new();
+    window_effect_signature(placement, rect, effect, scale, group).hash(&mut hasher);
+    (
+        frame_rect.x - rect.x,
+        frame_rect.y - rect.y,
+        frame_rect.width,
+        frame_rect.height,
+    )
+        .hash(&mut hasher);
+    let (element_id, commit_counter) = window_effect_element_state(
+        decoration,
+        format!("{placement}@{}", output.name()),
+        hasher.finish(),
+    );
+    window_effect_elements_in_frame(
+        renderer,
+        output,
+        output_geo,
+        scale,
+        window_id,
+        placement,
+        element_id,
+        commit_counter,
+        rect,
+        frame_rect,
+        effect,
+        group,
+    )
+    .inspect_err(|error| {
+        warn!(window_id, placement, ?error, "failed to build subsurface window effect");
+    })
+}
+
 fn non_root_surface_elements_for_window(
     window: &smithay::desktop::Window,
     renderer: &mut GlesRenderer,
@@ -8619,6 +8848,25 @@ fn capture_origin_for_logical_rect(
         .to_physical_precise_round(scale)
 }
 
+/// `frame` in the physical-pixel space of a texture captured over `capture`.
+fn effect_frame_rect_in_texture(
+    capture: crate::ssd::LogicalRect,
+    frame: crate::ssd::LogicalRect,
+    scale: smithay::utils::Scale<f64>,
+) -> Rectangle<i32, smithay::utils::Buffer> {
+    Rectangle::new(
+        Point::from((
+            ((frame.x - capture.x) as f64 * scale.x).round() as i32,
+            ((frame.y - capture.y) as f64 * scale.y).round() as i32,
+        )),
+        (
+            (frame.width as f64 * scale.x).round().max(1.0) as i32,
+            (frame.height as f64 * scale.y).round().max(1.0) as i32,
+        )
+            .into(),
+    )
+}
+
 fn window_effect_signature(
     placement: &'static str,
     window_rect: crate::ssd::LogicalRect,
@@ -8739,6 +8987,40 @@ fn window_effect_elements(
     element_id: smithay::backend::renderer::element::Id,
     commit_counter: smithay::backend::renderer::utils::CommitCounter,
     window_rect: crate::ssd::LogicalRect,
+    effect: &crate::ssd::WindowEffectSlot,
+    window_elements: &[TtyRenderElements],
+) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
+    window_effect_elements_in_frame(
+        renderer,
+        output,
+        output_geo,
+        scale,
+        window_id,
+        placement,
+        element_id,
+        commit_counter,
+        window_rect,
+        window_rect,
+        effect,
+        window_elements,
+    )
+}
+
+/// Like [`window_effect_elements`], for an effect covering `window_rect` that belongs to a
+/// larger or offset `frame_rect` (the window, for subsurface effects). The frame is exposed to
+/// shaders as `effect.frame_rect_px`.
+#[allow(clippy::too_many_arguments)]
+fn window_effect_elements_in_frame(
+    renderer: &mut GlesRenderer,
+    output: &Output,
+    output_geo: smithay::utils::Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    window_id: &str,
+    placement: &'static str,
+    element_id: smithay::backend::renderer::element::Id,
+    commit_counter: smithay::backend::renderer::utils::CommitCounter,
+    window_rect: crate::ssd::LogicalRect,
+    frame_rect: crate::ssd::LogicalRect,
     effect: &crate::ssd::WindowEffectSlot,
     window_elements: &[TtyRenderElements],
 ) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
@@ -8863,6 +9145,7 @@ fn window_effect_elements(
             (texture_size.w, texture_size.h),
             None,
             Some((texture_size.w, texture_size.h)),
+            Some(effect_frame_rect_in_texture(rect, frame_rect, scale)),
             &effect.effect,
         )?;
     if window_effect_debug_enabled() {

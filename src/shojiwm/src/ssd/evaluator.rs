@@ -532,6 +532,9 @@ fn validate_popup_effect_config(
             .replace
             .as_ref()
             .is_some_and(|slot| !is_popup_source(slot))
+        // Subsurfaces are split out of toplevel windows only.
+        || effects.replace_subsurfaces.is_some()
+        || effects.behind_subsurfaces.is_some()
     {
         return Err(DecorationBridgeError::InvalidEffectInput);
     }
@@ -559,6 +562,8 @@ fn validate_layer_effect_config(
             .replace
             .as_ref()
             .is_some_and(|slot| !is_layer_source(slot))
+        || effects.replace_subsurfaces.is_some()
+        || effects.behind_subsurfaces.is_some()
     {
         return Err(DecorationBridgeError::InvalidEffectInput);
     }

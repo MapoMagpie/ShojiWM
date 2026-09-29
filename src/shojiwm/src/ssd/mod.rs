@@ -982,6 +982,12 @@ pub struct WindowEffectConfig {
     pub behind_root_surface: Option<WindowEffectSlot>,
     pub in_front: Option<WindowEffectSlot>,
     pub replace: Option<WindowEffectSlot>,
+    /// Replaces the window's subsurfaces separately from the rest of the window.
+    /// While this or `behind_subsurfaces` is set, window sources of the other slots
+    /// leave subsurfaces out.
+    pub replace_subsurfaces: Option<WindowEffectSlot>,
+    /// Drawn behind the window's subsurfaces, over their own bounds.
+    pub behind_subsurfaces: Option<WindowEffectSlot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
