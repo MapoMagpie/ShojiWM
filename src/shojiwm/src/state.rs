@@ -356,6 +356,11 @@ pub struct ShojiWM {
     /// finished rendering into it: a freshly allocated, still-zeroed buffer then shows up as a
     /// fully transparent window for one frame.
     pub drm_syncobj_state: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    /// Whether every GPU in the system takes part in implicit dma-buf sync, so that an
+    /// implicit-sync client buffer is protected from being re-rendered while we still read it
+    /// without holding it past the render. Conservatively `false` until the TTY backend has
+    /// checked the GPUs' drivers; see `collect_client_buffers_for_hold`.
+    pub implicit_sync_trusted: bool,
     pub background_effect_state: BackgroundEffectState,
     pub damage_blink_enabled: bool,
     pub damage_blink_visible: HashMap<String, Vec<LogicalRect>>,
@@ -1682,6 +1687,7 @@ impl ShojiWM {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             drm_syncobj_state: None,
+            implicit_sync_trusted: false,
             background_effect_state,
             damage_blink_enabled,
             damage_blink_visible: HashMap::new(),

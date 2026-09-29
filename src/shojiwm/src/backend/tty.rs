@@ -1001,9 +1001,9 @@ struct SurfaceData {
     /// its next buffer, i.e. possibly while the GPU is still sampling the old one. Drivers with
     /// implicit dma-buf fences (Mesa) make the client's next render wait anyway; the NVIDIA
     /// proprietary driver has none, so the client cleared and re-rendered a buffer we were still
-    /// compositing — a window that flashed transparent for one frame. Only surfaces that use
-    /// `linux-drm-syncobj-v1` are held; see `collect_client_buffers_for_hold` for what that
-    /// leaves uncovered.
+    /// compositing — a window that flashed transparent for one frame. Implicit-sync buffers are
+    /// held only while a GPU without implicit sync is present; see
+    /// `collect_client_buffers_for_hold`.
     held_client_buffers: Vec<smithay::backend::renderer::utils::Buffer>,
     frame_callback_timer_armed: bool,
     frame_callback_timer_generation: u64,
@@ -1436,6 +1436,22 @@ pub fn device_added(
         }
     }
 
+    // Re-checked on every added device; this also sees GPUs without outputs, which are never
+    // added but can still render client buffers (PRIME offload).
+    let implicit_sync_trusted = all_gpus_take_part_in_implicit_sync();
+    if implicit_sync_trusted != state.implicit_sync_trusted {
+        info!(
+            implicit_sync_trusted,
+            "client buffer hold policy: {}",
+            if implicit_sync_trusted {
+                "explicit-sync buffers only"
+            } else {
+                "all client buffers (a GPU without implicit sync is present)"
+            }
+        );
+    }
+    state.implicit_sync_trusted = implicit_sync_trusted;
+
     let allocator = GbmAllocator::new(
         gbm.clone(),
         BufferObjectFlags::RENDERING | BufferObjectFlags::SCANOUT,
@@ -1508,8 +1524,73 @@ pub fn device_added(
     Ok(())
 }
 
-/// Every client buffer of an explicit-sync surface that the next render of `output` can
-/// sample: the windows drawn on it (`windows`, with their popups and subsurfaces), its layer
+/// Kernel drivers of GPUs whose userspace (Mesa) takes part in implicit dma-buf sync: a reader
+/// attaches its fence to the dma-buf and a writer waits for it before rendering again.
+const IMPLICIT_SYNC_DRIVERS: &[&str] = &["amdgpu", "radeon", "i915", "xe", "nouveau"];
+
+/// Whether every GPU in the system has a driver in [`IMPLICIT_SYNC_DRIVERS`]. Implicit sync
+/// needs both sides: the GPU we render with must attach a read fence and the GPU the client
+/// renders with must wait for it. A client may render on any GPU (PRIME offload onto a dGPU
+/// that drives no output), so this looks at all of them rather than at the output's. Unknown
+/// drivers and an unreadable sysfs count as not taking part.
+fn all_gpus_take_part_in_implicit_sync() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return false;
+    };
+    let mut drivers = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // `cardN` only: skip connectors (`cardN-eDP-1`) and render nodes (same GPU).
+        if !name
+            .strip_prefix("card")
+            .is_some_and(|index| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let driver = std::fs::read_link(entry.path().join("device/driver"))
+            .ok()
+            .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
+        drivers.push(driver);
+    }
+    drivers_take_part_in_implicit_sync(&drivers)
+}
+
+/// `drivers` holds one entry per GPU, `None` where the driver could not be read.
+fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
+    !drivers.is_empty()
+        && drivers.iter().all(|driver| {
+            driver
+                .as_deref()
+                .is_some_and(|driver| IMPLICIT_SYNC_DRIVERS.contains(&driver))
+        })
+}
+
+#[cfg(test)]
+mod implicit_sync_tests {
+    use super::drivers_take_part_in_implicit_sync as trusted;
+
+    fn gpus(drivers: &[Option<&str>]) -> Vec<Option<String>> {
+        drivers.iter().map(|driver| driver.map(str::to_owned)).collect()
+    }
+
+    #[test]
+    fn only_all_mesa_systems_trust_implicit_sync() {
+        assert!(trusted(&gpus(&[Some("amdgpu")])));
+        assert!(trusted(&gpus(&[Some("i915"), Some("amdgpu")])));
+        // Mesa iGPU + NVIDIA dGPU: a client may render on the dGPU even if it drives nothing.
+        assert!(!trusted(&gpus(&[Some("amdgpu"), Some("nvidia")])));
+        assert!(!trusted(&gpus(&[Some("nvidia")])));
+        assert!(!trusted(&gpus(&[Some("amdgpu"), None])));
+        assert!(!trusted(&gpus(&[Some("simpledrm")])));
+        assert!(!trusted(&[]));
+    }
+}
+
+/// Every client buffer that the next render of `output` can sample and that needs a hold: the
+/// windows drawn on it (`windows`, with their popups and subsurfaces), its layer
 /// surfaces, its session-lock surface and a surface cursor while the pointer is on it. See
 /// `SurfaceData::held_client_buffers` for why they are held past the render.
 ///
@@ -1518,20 +1599,19 @@ pub fn device_added(
 /// which can sample windows on other outputs, need no hold: they read back into shm, which waits
 /// for the GPU before the capture completes.
 ///
-/// Only surfaces that use `linux-drm-syncobj-v1` are held: their release point is signalled from
-/// the CPU when the buffer drops, and nothing orders it after our GPU read. When we render with
-/// Mesa, an implicit-sync dma-buf carries that read as a fence a Mesa client waits on before
-/// rendering into it again, and an shm buffer is copied during the render, so holding those only
-/// delays their release. The NVIDIA proprietary driver takes no part in implicit sync (see
-/// `ShojiWM::drm_syncobj_state` and `SurfaceData::held_client_buffers`), so without explicit
-/// sync the hold is lost for a client rendering on it, and for every implicit-sync dma-buf while
-/// we render on it. Such an NVIDIA client was not synchronised on acquire either: the pre-commit
-/// hook's dma-buf fence wait finds nothing to wait on.
+/// Surfaces that use `linux-drm-syncobj-v1` are always held: their release point is signalled
+/// from the CPU when the buffer drops, and nothing orders it after our GPU read. Other buffers
+/// are held unless `ShojiWM::implicit_sync_trusted`: when every GPU runs Mesa, an implicit-sync
+/// dma-buf carries our read as a fence the client waits on before rendering into it again, and
+/// an shm buffer is copied during the render, so holding those only delays their release. The
+/// NVIDIA proprietary driver takes no part in implicit sync, neither as the GPU we render with
+/// nor as the one a client renders with (PRIME offload), so with one present everything is held.
 fn collect_client_buffers_for_hold(
     state: &ShojiWM,
     output: &Output,
     windows: &[smithay::desktop::Window],
 ) -> Vec<smithay::backend::renderer::utils::Buffer> {
+    let hold_implicit_sync = !state.implicit_sync_trusted;
     use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
     use smithay::reexports::wayland_protocols::wp::linux_drm_syncobj::v1::server::wp_linux_drm_syncobj_surface_v1::WpLinuxDrmSyncobjSurfaceV1;
     use smithay::wayland::compositor::{SurfaceData, TraversalAction, with_surface_tree_downward};
@@ -1546,10 +1626,11 @@ fn collect_client_buffers_for_hold(
         // `None`) if that object is destroyed later: a buffer committed before then still
         // carries its release point, so a surface that ever had one is still held (along with
         // any later implicit or shm buffers it attaches, which is harmless).
-        if states
-            .data_map
-            .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
-            .is_none()
+        if !hold_implicit_sync
+            && states
+                .data_map
+                .get::<RefCell<Option<WpLinuxDrmSyncobjSurfaceV1>>>()
+                .is_none()
         {
             return;
         }
