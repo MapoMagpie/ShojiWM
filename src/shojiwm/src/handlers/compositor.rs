@@ -444,6 +444,20 @@ impl CompositorHandler for ShojiWM {
                                 attrs.lock().unwrap().hotspot -= buffer_delta;
                             }
 
+                        // A viewport means the client already sized the cursor itself;
+                        // xwayland-satellite does this for X cursors (buffer ÷ its scale,
+                        // hotspot already converted). Guessing a buffer_scale on top would
+                        // shrink the hotspot a second time.
+                        let has_viewport = {
+                            let mut viewport_cache =
+                                states.cached_state.get::<ViewportCachedState>();
+                            let viewport = viewport_cache.current();
+                            viewport.src.is_some() || viewport.dst.is_some()
+                        };
+                        if has_viewport {
+                            return;
+                        }
+
                         // Workaround for Xwayland (via xwayland-satellite) sending oversized
                         // cursor buffers without setting buffer_scale: it attaches a 48×48
                         // Adwaita buffer and never calls set_buffer_scale(2), resulting in a
