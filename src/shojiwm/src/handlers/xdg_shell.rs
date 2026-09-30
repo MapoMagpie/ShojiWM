@@ -784,7 +784,8 @@ impl ShojiWM {
             window_geo.loc.x + window_geo.size.w / 2,
             window_geo.loc.y + window_geo.size.h / 2,
         ));
-        let output = self
+        // No output while every monitor is disconnected: keep the positioner's own geometry.
+        let Some(output) = self
             .space
             .outputs()
             .filter_map(|output| {
@@ -805,8 +806,12 @@ impl ShojiWM {
             })
             .map(|(output, _, _)| output)
             .or_else(|| self.space.outputs().next())
-            .unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
+        else {
+            return;
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return;
+        };
         let popup_toplevel_coords = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
 
         // The target geometry for the positioner should be relative to its parent's geometry, so

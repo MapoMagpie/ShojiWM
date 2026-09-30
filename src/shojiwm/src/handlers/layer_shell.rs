@@ -19,7 +19,7 @@ use smithay::{
         },
     },
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::state::{PendingLayerSurface, ShojiWM};
 
@@ -44,9 +44,12 @@ impl WlrLayerShellHandler for ShojiWM {
         _layer_kind: Layer,
         namespace: String,
     ) {
+        // A client may still hold the wl_output of a disconnected monitor; that
+        // Output is out of the space and would never render or close the layer.
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
+            .filter(|output| self.space.outputs().any(|candidate| candidate == output))
             .or_else(|| {
                 let pos = self.seat.get_pointer()?.current_location();
                 let pos_i = pos.to_i32_floor();
@@ -59,7 +62,16 @@ impl WlrLayerShellHandler for ShojiWM {
                     })
                     .cloned()
             })
-            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+            .or_else(|| self.space.outputs().next().cloned());
+        // With every monitor disconnected (e.g. a DP monitor entering power
+        // saving), clients re-create the layers closed on disconnect right
+        // away. There is nowhere to place them, so close them again; clients
+        // create new ones when an output global appears.
+        let Some(output) = output else {
+            warn!(%namespace, "no output for new layer surface; closing it");
+            surface.send_close();
+            return;
+        };
         let layer = LayerSurface::new(surface, namespace);
         self.pending_layer_surfaces
             .push(PendingLayerSurface { output, layer });
