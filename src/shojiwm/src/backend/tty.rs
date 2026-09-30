@@ -266,6 +266,28 @@ fn vblank_grid(
     (vblank, next)
 }
 
+/// Each flip is a frame of its own, so it cannot share a presentation time with the previous
+/// one; that happens when a phase re-estimate or an event handled after the following vblank
+/// lands both on the same grid point. The bump is only one period past the grid: flips that
+/// come faster than the refresh period (tearing flips from a fullscreen game) would otherwise
+/// push the target a period further every flip, running seconds ahead of the clock over a long
+/// session, and every window animation sampled at that time finished instantly.
+fn ratchet_frame_target(
+    last: Option<Duration>,
+    grid_next: Duration,
+    frame_duration: Duration,
+) -> Duration {
+    match last {
+        Some(last)
+            if grid_next < last + frame_duration / 2
+                && last + frame_duration <= grid_next + frame_duration =>
+        {
+            last + frame_duration
+        }
+        _ => grid_next,
+    }
+}
+
 fn sanitize_next_frame_target(
     next_frame_target: Option<Duration>,
     fallback_frame_time: Duration,
@@ -274,8 +296,13 @@ fn sanitize_next_frame_target(
     let stale_before = fallback_frame_time
         .checked_sub(frame_duration)
         .unwrap_or(Duration::ZERO);
+    // The target is at most about a period past the fallback (now + one period); anything
+    // further is a bad prediction, and sampling animations there skips them to their end.
+    let too_far_after = fallback_frame_time + frame_duration * 2;
     match next_frame_target {
-        Some(target) if target < stale_before => (fallback_frame_time, true),
+        Some(target) if target < stale_before || target > too_far_after => {
+            (fallback_frame_time, true)
+        }
         Some(target) => (target, false),
         None => (fallback_frame_time, false),
     }
@@ -1636,7 +1663,9 @@ fn drivers_take_part_in_implicit_sync(drivers: &[Option<String>]) -> bool {
 
 #[cfg(test)]
 mod vblank_grid_tests {
-    use super::{VBLANK_GRID_HISTORY, vblank_grid};
+    use super::{
+        VBLANK_GRID_HISTORY, ratchet_frame_target, sanitize_next_frame_target, vblank_grid,
+    };
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -1688,6 +1717,45 @@ mod vblank_grid_tests {
         let targets = predictions(&[2800.0, 200.0]);
         let expected = 1_000_000.0 + 2.0 * PERIOD_US + 200.0;
         assert!((targets[1] - expected).abs() < 1.0, "predicted {} us", targets[1]);
+    }
+
+    /// Tearing flips from a fullscreen game complete faster than the refresh period. The
+    /// duplicate-target bump must not accumulate: it ran the target seconds ahead of the
+    /// clock, and window animations sampled there finished instantly.
+    #[test]
+    fn flips_faster_than_the_period_keep_the_target_near_the_clock() {
+        let period = us(PERIOD_US);
+        let mut history = VecDeque::new();
+        let mut last = None;
+        // 200 fps for a minute on a 120 Hz output.
+        for index in 0..12_000u32 {
+            let observed = us(1_000_000.0 + f64::from(index) * 5_000.0);
+            if history.len() == VBLANK_GRID_HISTORY {
+                history.pop_front();
+            }
+            history.push_back(observed);
+            let grid_next = vblank_grid(&history, observed, period).1;
+            let target = ratchet_frame_target(last, grid_next, period);
+            last = Some(target);
+            assert!(
+                target <= observed + period * 2,
+                "flip {index}: target {target:?} ran ahead of observation {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_far_future_target_falls_back_to_the_clock() {
+        let period = us(PERIOD_US);
+        let fallback = us(2_000_000.0);
+        assert_eq!(
+            sanitize_next_frame_target(Some(fallback + period * 600), fallback, period),
+            (fallback, true)
+        );
+        assert_eq!(
+            sanitize_next_frame_target(Some(fallback + period), fallback, period),
+            (fallback + period, false)
+        );
     }
 }
 
@@ -1875,14 +1943,11 @@ fn frame_finish(
         presentation_clock,
         surface.frame_duration,
     );
-    // Each flip is a frame of its own, so it cannot share a presentation time with the
-    // previous one; that happens when a phase re-estimate or an event handled after the
-    // following vblank lands both on the same grid point.
-    if let Some(last) = surface.last_grid_frame_target
-        && next_frame_target < last + surface.frame_duration / 2
-    {
-        next_frame_target = last + surface.frame_duration;
-    }
+    next_frame_target = ratchet_frame_target(
+        surface.last_grid_frame_target,
+        next_frame_target,
+        surface.frame_duration,
+    );
     surface.last_grid_frame_target = Some(next_frame_target);
     surface.next_frame_target = Some(next_frame_target);
     if ShojiWM::motion_trace_enabled() {
@@ -3425,6 +3490,15 @@ fn render_surface(
             fallback_frame_time,
             frame_duration,
         );
+        if let Some(target) = surface.next_frame_target
+            && target > fallback_frame_time + frame_duration * 2
+        {
+            warn!(
+                output = %output.name(),
+                ahead_ms = (target - fallback_frame_time).as_secs_f64() * 1000.0,
+                "predicted frame time is far ahead of the clock; using the clock instead"
+            );
+        }
         let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
         // Usually already stepped for this frame right after the previous flip was queued.
         let preticked = state
