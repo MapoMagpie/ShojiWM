@@ -1224,9 +1224,8 @@ pub fn resume_tty_session(state: &mut ShojiWM) {
     }
     retry_pending_connectors(state);
 
-    state.force_full_damage = true;
+    state.request_full_damage();
     state.request_tty_maintenance("tty-session-resume");
-    state.schedule_redraw();
 }
 
 /// Record a mid-session config evaluation failure for the error overlay.
@@ -3584,7 +3583,7 @@ fn render_surface(
                 "transform snapshot tty pending decoration damage at render start"
             );
         }
-        if state.force_full_damage {
+        if state.take_full_damage(&output.name()) {
             extra_damage.push(crate::ssd::LogicalRect::new(
                 output_geo.loc.x,
                 output_geo.loc.y,
@@ -14145,9 +14144,7 @@ fn reset_surface_after_commit_failure(
             "failed to reconnect output after surface reset",
         );
     }
-    state.force_full_damage = true;
-    state
-        .schedule_redraw();
+    state.request_full_damage();
     Ok(())
 }
 

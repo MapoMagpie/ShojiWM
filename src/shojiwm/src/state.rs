@@ -496,7 +496,10 @@ pub struct ShojiWM {
     /// dispatched from inside that call — is traceable to the user.
     pub user_input_in_flight: bool,
     pub mapped_on_demand_layer_surfaces: HashSet<u32>,
+    /// Debug flag (`--force-full-damage`): redraw every output fully on every frame.
     pub force_full_damage: bool,
+    /// Outputs that still owe one full redraw (see [`ShojiWM::request_full_damage`]).
+    pub full_damage_pending_outputs: HashSet<String>,
     pub debug_previous_scene_signatures: HashMap<String, Vec<String>>,
     pub tty_maintenance_pending: bool,
     pub tty_maintenance_reasons: BTreeSet<&'static str>,
@@ -1787,6 +1790,7 @@ impl ShojiWM {
             user_input_in_flight: false,
             mapped_on_demand_layer_surfaces: Default::default(),
             force_full_damage,
+            full_damage_pending_outputs: HashSet::new(),
             debug_previous_scene_signatures: HashMap::new(),
             tty_maintenance_pending: true,
             tty_maintenance_reasons: BTreeSet::new(),
@@ -2835,13 +2839,7 @@ impl ShojiWM {
         self.popup_effect_evaluation_cache.clear();
         // A reload after editing only a shader file leaves every effect spec equal, so no
         // element reports damage; redraw everything once so the rebuilt programs show.
-        let output_rects = self
-            .space
-            .outputs()
-            .filter_map(|output| self.space.output_geometry(output))
-            .map(|geo| LogicalRect::new(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h))
-            .collect::<Vec<_>>();
-        self.pending_decoration_damage.extend(output_rects);
+        self.request_full_damage();
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
         info!("hot reloaded TypeScript config");
@@ -4422,6 +4420,24 @@ impl ShojiWM {
     }
 
     #[track_caller]
+    /// Redraw every current output fully once, e.g. after a session resume or a config reload.
+    /// Per output, since a render pass may skip outputs and the shared damage list is cleared
+    /// after each pass.
+    pub fn request_full_damage(&mut self) {
+        let names = self
+            .space
+            .outputs()
+            .map(|output| output.name())
+            .collect::<Vec<_>>();
+        self.full_damage_pending_outputs.extend(names);
+        self.schedule_redraw();
+    }
+
+    /// Whether `output_name` must be redrawn fully this frame; consumes a one-shot request.
+    pub fn take_full_damage(&mut self, output_name: &str) -> bool {
+        self.full_damage_pending_outputs.remove(output_name) || self.force_full_damage
+    }
+
     pub fn schedule_redraw(&mut self) {
         let caller = std::panic::Location::caller();
         if std::env::var_os("SHOJI_REDRAW_STATS")

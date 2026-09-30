@@ -955,7 +955,7 @@ pub fn init_winit(
                             .cloned()
                             .collect();
                         let mut extra_damage = state.pending_decoration_damage.clone();
-                        if state.force_full_damage {
+                        if state.take_full_damage(&output.name()) {
                             extra_damage.push(crate::ssd::LogicalRect::new(
                                 output_geo.loc.x,
                                 output_geo.loc.y,
