@@ -2293,9 +2293,13 @@ fn submit_deferred_frame(
         Some(err) => {
             // The held frame is gone either way; put the surface back into a
             // state where a fresh render can recover through the normal
-            // (fully error-handled) path. `EmptyFrame` means a follow-up
-            // render emptied the staged frame — its own no-damage handling
-            // already ran, so stay quiet about it.
+            // (fully error-handled) path. `EmptyFrame` is expected and stays
+            // quiet, but still redraws: besides a follow-up render emptying
+            // the staged frame, smithay's modeset bandwidth fallback in
+            // `use_mode` consumes the staged frame of every output and
+            // commits a black one, which would otherwise stay on screen
+            // until the next input or client commit. After a genuine
+            // no-damage replacement the redraw is one empty render.
             surface.frame_pending = false;
             surface.redraw_state = TtyRedrawState::Idle;
             // The staged frame is dropped and will never flip, so no flip releases its hold,
@@ -2306,15 +2310,14 @@ fn submit_deferred_frame(
             surface.held_client_buffers.clear();
             let output_name = surface.output.name();
             use smithay::backend::drm::compositor::FrameError;
-            let empty = matches!(err, FrameError::EmptyFrame);
-            if !empty {
+            if !matches!(err, FrameError::EmptyFrame) {
                 warn!(
                     output = %output_name,
                     ?err,
                     "deferred frame submission failed; falling back to a fresh render"
                 );
-                state.schedule_redraw();
             }
+            state.schedule_redraw();
         }
     }
 }
@@ -14224,7 +14227,22 @@ pub fn apply_tty_output_mode(
                     &DrmOutputRenderElements::default(),
                 )?;
             surface.frame_duration = Duration::from_secs_f64(1_000f64 / mode.refresh as f64);
-            surface.redraw_state = TtyRedrawState::Queued;
+            if surface.deferred_submit.take().is_some() {
+                // Staged for a deadline commit but not committed: nothing is in flight. Drop it
+                // (its timer sees the new generation and returns) and render the new mode now,
+                // instead of committing a frame sized for the old one.
+                surface.deferred_submit_generation =
+                    surface.deferred_submit_generation.wrapping_add(1);
+                surface.frame_pending = false;
+                surface.redraw_state = TtyRedrawState::Queued;
+            } else if surface.frame_pending {
+                // A committed frame is still waiting for its flip. Rendering now would put a
+                // second frame in flight, which `frame_pending` and `held_client_buffers` both
+                // assume never happens; `frame_finish` redraws once it has flipped.
+                surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed: true };
+            } else {
+                surface.redraw_state = TtyRedrawState::Queued;
+            }
             return Ok(true);
         }
     }
