@@ -2462,6 +2462,11 @@ struct FailedShader {
     confirmed: bool,
 }
 
+struct BuiltShader {
+    stamp: ShaderFileStamp,
+    verified: bool,
+}
+
 thread_local! {
     /// Pipeline failures seen since the last config reload (deduplicated).
     static REPORTED_EFFECT_ERRORS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
@@ -2472,6 +2477,11 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// The set of current effect failures changed since the backend last looked.
     static EFFECT_ERRORS_DIRTY: Cell<bool> = const { Cell::new(false) };
+    /// Program cache key -> stamp of the shader file the cached (successfully built) program
+    /// was compiled from, and whether that stamp was checked since the last config reload.
+    /// Checked once per reload so that editing only a `.frag` file and reloading rebuilds the
+    /// program, without a `stat` on every cache hit.
+    static BUILT_SHADERS: RefCell<HashMap<String, BuiltShader>> = RefCell::new(HashMap::new());
     /// Set whenever a compile function hands out a stand-in program.
     static STAND_IN_SHADER_USED: Cell<bool> = const { Cell::new(false) };
     /// Nesting depth of `run_effect_pipeline` (sub-pipelines of `unit()` / `renderTo()`).
@@ -2519,6 +2529,12 @@ pub fn reset_effect_error_reports() {
             failure.confirmed = false;
         }
     });
+    // The reload may come from an edit to a shader file alone: recheck every built program.
+    BUILT_SHADERS.with(|built| {
+        for shader in built.borrow_mut().values_mut() {
+            shader.verified = false;
+        }
+    });
     EFFECT_ERRORS_DIRTY.with(|dirty| dirty.set(true));
 }
 
@@ -2536,9 +2552,31 @@ fn shader_file_stamp(path: &str) -> ShaderFileStamp {
     Some((metadata.modified().ok()?, metadata.len()))
 }
 
-/// True when `cache_key` currently holds a stand-in and the shader file has changed since it
-/// failed, i.e. the cached stand-in should be dropped and the real shader tried again.
-fn shader_failure_is_outdated(cache_key: &str, path: &str) -> bool {
+/// True when the program cached under `cache_key` should be dropped and the shader built again:
+/// it is a stand-in and the shader file has changed since it failed, or it was built from a
+/// shader file that has changed since (checked once per config reload).
+fn cached_shader_is_outdated(cache_key: &str, path: &str) -> bool {
+    let unverified = BUILT_SHADERS.with(|built| {
+        built
+            .borrow()
+            .get(cache_key)
+            .and_then(|shader| (!shader.verified).then_some(shader.stamp))
+    });
+    if let Some(stamp) = unverified {
+        let current = shader_file_stamp(path);
+        return BUILT_SHADERS.with(|built| {
+            let mut built = built.borrow_mut();
+            if stamp == current {
+                if let Some(shader) = built.get_mut(cache_key) {
+                    shader.verified = true;
+                }
+                false
+            } else {
+                built.remove(cache_key);
+                true
+            }
+        });
+    }
     let recorded = FAILED_SHADERS.with(|failed| {
         failed
             .borrow()
@@ -2629,6 +2667,11 @@ fn compile_shader_or_fallback<P>(
     let failure = match fs::read_to_string(path) {
         Ok(source) => match compile(renderer, &source) {
             Ok(program) => {
+                BUILT_SHADERS.with(|built| {
+                    built
+                        .borrow_mut()
+                        .insert(cache_key.to_owned(), BuiltShader { stamp, verified: true })
+                });
                 if FAILED_SHADERS
                     .with(|failed| failed.borrow_mut().remove(cache_key))
                     .is_some()
@@ -2690,7 +2733,7 @@ fn compile_shader_program(
         cache_key.push(':');
         cache_key.push_str(&kind);
     }
-    if shader_failure_is_outdated(&cache_key, &shader_module.shader.path) {
+    if cached_shader_is_outdated(&cache_key, &shader_module.shader.path) {
         renderer
             .egl_context()
             .user_data()
@@ -3176,7 +3219,7 @@ fn multi_texture_stage_program(
         cache_key.push(':');
         cache_key.push_str(&kind);
     }
-    if shader_failure_is_outdated(&cache_key, &stage.shader.path) {
+    if cached_shader_is_outdated(&cache_key, &stage.shader.path) {
         renderer
             .egl_context()
             .user_data()
@@ -3308,7 +3351,7 @@ fn compile_texture_program(
             cache_key.push_str(&kind);
         }
     }
-    if shader_failure_is_outdated(&cache_key, path) {
+    if cached_shader_is_outdated(&cache_key, path) {
         renderer
             .egl_context()
             .user_data()
@@ -6292,7 +6335,7 @@ mod effect_error_tests {
         // Had the config still used it, the next request must rebuild instead of serving the
         // cached stand-in silently: an unconfirmed entry counts as outdated even though the
         // (still missing) file has the same stamp.
-        assert!(shader_failure_is_outdated(
+        assert!(cached_shader_is_outdated(
             "stage:/cfg/missing.frag",
             "/cfg/missing.frag"
         ));
@@ -6301,12 +6344,45 @@ mod effect_error_tests {
         // A confirmed failure whose file did not change keeps serving the stand-in.
         record("stage:/cfg/missing.frag", "shader /cfg/missing.frag could not be read");
         STAND_IN_SHADER_USED.with(|used| used.set(false));
-        assert!(!shader_failure_is_outdated(
+        assert!(!cached_shader_is_outdated(
             "stage:/cfg/missing.frag",
             "/cfg/missing.frag"
         ));
         assert!(STAND_IN_SHADER_USED.with(Cell::get));
         FAILED_SHADERS.with(|failed| failed.borrow_mut().clear());
+    }
+
+    /// Editing only a `.frag` file and reloading must rebuild a program that compiled fine;
+    /// it was cached by path and served forever. Without a reload nothing is rechecked.
+    #[test]
+    fn built_shader_is_rebuilt_after_a_reload_when_its_file_changed() {
+        let dir = std::env::temp_dir().join(format!("shoji-built-shader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("effect.frag");
+        let path_str = path.to_str().unwrap();
+        let key = format!("pixel:{path_str}");
+        std::fs::write(&path, "vec4 shader_main(EffectContext e) { return vec4(0.0); }\n").unwrap();
+        BUILT_SHADERS.with(|built| {
+            built.borrow_mut().insert(
+                key.clone(),
+                BuiltShader { stamp: shader_file_stamp(path_str), verified: true },
+            )
+        });
+
+        // Unchanged file across a reload: keep the cached program.
+        reset_effect_error_reports();
+        assert!(!cached_shader_is_outdated(&key, path_str));
+
+        // Edited file (the length changes, so the stamp does even within one mtime tick).
+        std::fs::write(&path, "vec4 shader_main(EffectContext e) { return vec4(1.0, 0.0, 0.0, 1.0); }\n")
+            .unwrap();
+        // Not rechecked until a reload.
+        assert!(!cached_shader_is_outdated(&key, path_str));
+        reset_effect_error_reports();
+        assert!(cached_shader_is_outdated(&key, path_str));
+        assert!(BUILT_SHADERS.with(|built| !built.borrow().contains_key(&key)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

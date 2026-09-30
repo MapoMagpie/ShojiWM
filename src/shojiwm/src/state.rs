@@ -2833,6 +2833,15 @@ impl ShojiWM {
         self.configured_popup_surface_policies.clear();
         self.layer_effect_evaluation_cache.clear();
         self.popup_effect_evaluation_cache.clear();
+        // A reload after editing only a shader file leaves every effect spec equal, so no
+        // element reports damage; redraw everything once so the rebuilt programs show.
+        let output_rects = self
+            .space
+            .outputs()
+            .filter_map(|output| self.space.output_geometry(output))
+            .map(|geo| LogicalRect::new(geo.loc.x, geo.loc.y, geo.size.w, geo.size.h))
+            .collect::<Vec<_>>();
+        self.pending_decoration_damage.extend(output_rects);
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
         info!("hot reloaded TypeScript config");
