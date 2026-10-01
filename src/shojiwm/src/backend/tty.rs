@@ -532,26 +532,6 @@ fn previous_client_frame_state(key: &str, current: ClientFrameState) -> Option<C
     guard.insert(key.to_string(), current)
 }
 
-/// Stores the visual transform for a snapshot window from the previous render frame and returns
-/// the previous value. Used to detect whether the transform is actively changing (animation
-/// in progress) vs. stable (stationary snapshot window that should be throttled).
-///
-/// The key is `snapshot_id + ":" + output_name` so that each output independently tracks
-/// the previous transform.  Without the output suffix, a multi-output setup would have the
-/// second output to render always see "unchanged" because the first output already stored the
-/// current-frame value into the shared slot.
-fn previous_snapshot_visual_transform(
-    snapshot_id: &str,
-    output_name: &str,
-    current: crate::ssd::WindowTransform,
-) -> Option<crate::ssd::WindowTransform> {
-    static STATE: OnceLock<Mutex<HashMap<String, crate::ssd::WindowTransform>>> = OnceLock::new();
-    let state = STATE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = state.lock().ok()?;
-    let key = format!("{snapshot_id}:{output_name}");
-    guard.insert(key, current)
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct BackdropSampleFrameState {
     sample_screen_rect: Option<(f64, f64, f64, f64)>,
@@ -3939,12 +3919,6 @@ fn render_surface(
         let mut max_window_id: Option<String> = None;
         let mut snapshot_capture_elapsed_ms = 0.0f64;
         let mut snapshot_capture_count = 0usize;
-        // Windows in snapshot mode (scaled visual_transform) whose transform changed
-        // since the previous frame — these are actively animating and need full-rate callbacks.
-        // Windows whose transform is unchanged are stationary in snapshot mode and can be
-        // throttled (see snapshot fix below).
-        let mut snapshot_transform_changed_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
 
         let close_debug = crate::env_flag!("SHOJI_CLOSE_DEBUG");
         if close_debug && !closing_window_snapshots.is_empty() {
@@ -4220,25 +4194,6 @@ fn render_surface(
                         decoration.visual_transform,
                     ));
                 }
-                // Track whether this window's visual_transform changed since the previous frame.
-                // If it changed the window is actively animating; if not, it is stationary in
-                // snapshot mode.  The snapshot fix below only restores primary_scanout_output for
-                // animating windows so that stationary snapshot windows remain throttled.
-                if use_full_window_snapshot
-                    && let Some(sid) = snapshot_id.as_deref()
-                        && let Some(decoration) = window_decorations.get(window) {
-                            let prev = previous_snapshot_visual_transform(
-                                sid,
-                                output.name().as_str(),
-                                decoration.visual_transform,
-                            );
-                            let changed = prev
-                                .map(|p| p != decoration.visual_transform)
-                                .unwrap_or(true); // first frame → assume changed
-                            if changed {
-                                snapshot_transform_changed_ids.insert(sid.to_string());
-                            }
-                        }
                 if use_full_window_snapshot {
                     transform_snapshot_window_ids.insert(window_id.clone());
                 } else {
@@ -7453,16 +7408,11 @@ fn render_surface(
             // send_frame_callbacks_for_output skip them entirely, causing the client (e.g.
             // Chrome at visual scale=0.9) to fall back to a ~0.6 fps background rate.
             //
-            // Fix: for every window currently rendered via snapshot, synthesise a
-            // RenderElementStates that marks all its wl_surfaces as "presented on this
-            // output" and call update_surface_primary_scanout_output again so that their
-            // primary-scanout assignment is restored before frame callbacks are sent.
+            // Fix: for every window currently rendered via snapshot, mark all its wl_surfaces
+            // as presented on this output so their primary-scanout assignment is restored
+            // before frame callbacks are sent. This covers stationary snapshot windows too: a
+            // window kept scaled (a zoomed-out workspace) is visible and must keep updating.
             if !state.transform_snapshot_window_ids.is_empty() {
-                use smithay::backend::renderer::element::{
-                    Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
-                };
-                use smithay::desktop::utils::update_surface_primary_scanout_output;
-
                 if crate::env_flag!("SHOJI_FRAME_THROTTLE_DEBUG") {
                     tracing::info!(
                         output = %output.name(),
@@ -7478,10 +7428,7 @@ fn render_surface(
                         state
                             .window_decorations
                             .get(*w)
-                            .map(|d| {
-                                state.transform_snapshot_window_ids.contains(&d.snapshot.id)
-                                    && snapshot_transform_changed_ids.contains(&d.snapshot.id)
-                            })
+                            .map(|d| state.transform_snapshot_window_ids.contains(&d.snapshot.id))
                             .unwrap_or(false)
                     })
                     .cloned()
@@ -7512,38 +7459,9 @@ fn render_surface(
                 }
 
                 for window in snapshot_windows {
-                    // Restore primary scanout output only for snapshot windows whose transform is
-                    // still actively changing this frame. Stationary snapshot windows remain
-                    // throttled so visible-idle clients such as X11 Chrome do not get refresh-rate
-                    // frame callbacks solely because the compositor is compositing an offscreen
-                    // texture for them.
-                    let mut synthetic_states = RenderElementStates::default();
-                    window.with_surfaces(|surface, _| {
-                        synthetic_states.states.insert(
-                            Id::from_wayland_resource(surface),
-                            // Use usize::MAX so that area_primary_scanout_compare (used below)
-                            // always assigns this output as primary, regardless of the stored
-                            // area from the previous output. The goal here is to force the
-                            // primary back to the current output for snapshot-rendered windows.
-                            RenderElementState {
-                                visible_area: usize::MAX,
-                                presentation_state: RenderElementPresentationState::Rendering {
-                                    reason: None,
-                                },
-                                needs_capture: false,
-                            },
-                        );
-                    });
-                    window.with_surfaces(|surface, states| {
-                        update_surface_primary_scanout_output(
-                            surface,
-                            &output,
-                            states,
-                            None,
-                            &synthetic_states,
-                            crate::presentation::area_primary_scanout_compare,
-                        );
-                    });
+                    crate::presentation::restore_primary_scanout_for_offscreen_window(
+                        &window, &output,
+                    );
                 }
             }
             let replace_effect_windows: Vec<_> = state

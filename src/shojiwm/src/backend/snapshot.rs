@@ -149,20 +149,21 @@ pub fn capture_snapshot<E: RenderElement<GlesRenderer>>(
     snapshot.z_index = z_index;
     snapshot.has_client_content = has_client_content;
 
-    // Check if the tracker's physical size still matches; if not, recreate it (age=0 full
-    // redraw). If the size matches, use age=1 so only the actually changed regions are
-    // re-rendered into the offscreen texture and added to the DamageBag.
-    let age = match tracker.mode() {
-        OutputModeSource::Static {
-            size,
-            scale: tracker_scale,
-            ..
-        } if *size == physical.size && *tracker_scale == Scale::from(scale.x) => 1,
-        _ => {
-            *tracker = OutputDamageTracker::new(physical.size, scale.x, Transform::Normal);
-            0
-        }
-    };
+    // Always redraw the whole texture (age 0); the tracker is kept only for its size and
+    // scale. Incremental redraw (age 1) left scaled windows partly or entirely empty while
+    // they moved: the texture can be a fresh one (first capture, a size change, or an
+    // `existing` snapshot whose texture another capture replaced) that holds none of the
+    // tracker's previous content, and clipped client surfaces, drawn shifted into capture
+    // space, were not redrawn into damage their clip did not match there.
+    let size_matches = matches!(
+        tracker.mode(),
+        OutputModeSource::Static { size, scale: tracker_scale, .. }
+            if *size == physical.size && *tracker_scale == Scale::from(scale.x)
+    );
+    if !size_matches {
+        *tracker = OutputDamageTracker::new(physical.size, scale.x, Transform::Normal);
+    }
+    let age = 0;
 
     let mut framebuffer = renderer.bind(&mut snapshot.texture)?;
     let render_output_result = tracker

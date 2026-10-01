@@ -231,6 +231,43 @@ struct SurfaceFrameThrottlingState {
     last_sent_at: RefCell<Option<(Output, u32)>>,
 }
 
+/// Marks every surface of `window` as presented on `output`.
+///
+/// Windows composited through an offscreen texture (a full-window transform snapshot, a
+/// replacement effect) have no surface element in the output's render states, so
+/// [`update_primary_scanout_output`] clears their primary output and frame callbacks fall back
+/// to the throttled rate: a scaled window kept on screen updated at about 1 fps.
+pub fn restore_primary_scanout_for_offscreen_window(window: &Window, output: &Output) {
+    use smithay::backend::renderer::element::{
+        Id, RenderElementPresentationState, RenderElementState, RenderElementStates,
+    };
+    use smithay::desktop::utils::update_surface_primary_scanout_output;
+
+    let mut synthetic_states = RenderElementStates::default();
+    window.with_surfaces(|surface, _| {
+        synthetic_states.states.insert(
+            Id::from_wayland_resource(surface),
+            // usize::MAX so `area_primary_scanout_compare` always picks this output, whatever
+            // area the previous primary output had stored.
+            RenderElementState {
+                visible_area: usize::MAX,
+                presentation_state: RenderElementPresentationState::Rendering { reason: None },
+                needs_capture: false,
+            },
+        );
+    });
+    window.with_surfaces(|surface, states| {
+        update_surface_primary_scanout_output(
+            surface,
+            output,
+            states,
+            None,
+            &synthetic_states,
+            area_primary_scanout_compare,
+        );
+    });
+}
+
 pub fn update_primary_scanout_output(
     space: &Space<Window>,
     output: &Output,

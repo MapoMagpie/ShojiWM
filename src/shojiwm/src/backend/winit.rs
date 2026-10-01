@@ -2038,6 +2038,20 @@ pub fn init_winit(
                                     &render_output_result.states,
                                     &state.window_decorations,
                                 );
+                                // Windows drawn through a full-window snapshot have no surface
+                                // element in the render states; keep them on this output so their
+                                // frame callbacks are not throttled (see the tty backend).
+                                for window in state.space.elements_for_output(&output) {
+                                    if state.window_decorations.get(window).is_some_and(|decoration| {
+                                        state
+                                            .transform_snapshot_window_ids
+                                            .contains(&decoration.snapshot.id)
+                                    }) {
+                                        crate::presentation::restore_primary_scanout_for_offscreen_window(
+                                            window, &output,
+                                        );
+                                    }
+                                }
 
                                 let frame_time = Duration::from(state.clock.now())
                                     + output

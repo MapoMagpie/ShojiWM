@@ -1606,7 +1606,23 @@ impl ShojiWM {
         self.window_decorations
             .get(window)
             .filter(|decoration| decoration.managed_window.managed)
-            .map(|decoration| decoration.layout.root.rect)
+            .map(|decoration| {
+                // The rect the config set, unless a rect animation is moving the window: then
+                // the layout root is where it is drawn. The root can also be transient: a press
+                // that focuses the window re-renders its chrome (e.g. a focus-dependent border)
+                // and, for a moment, lays the previous tree out around the new client rect, which
+                // reported the start rect inset by the border.
+                match decoration.managed_window.rect {
+                    Some(rect)
+                        if !self
+                            .managed_window_animations
+                            .contains_key(&decoration.snapshot.id) =>
+                    {
+                        managed_rect_snapshot_to_logical_rect(rect)
+                    }
+                    _ => decoration.layout.root.rect,
+                }
+            })
             .map(|rect| {
                 smithay::utils::Rectangle::new(
                     (rect.x, rect.y).into(),
