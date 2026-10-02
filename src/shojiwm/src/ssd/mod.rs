@@ -107,8 +107,8 @@ impl DecorationTree {
     ) -> Result<ComputedDecorationTree, DecorationLayoutError> {
         self.validate()?;
 
-        let mut root = layout_node_with_scale(&self.root, bounds, None, None, scale)?;
-        root.sync_root_bounds(scale);
+        let mut root = layout_node_with_scale(&self.root, bounds, None, scale, (0, 0))?;
+        root.sync_root_bounds();
         if root.window_slot_rect().is_none() {
             return Err(DecorationLayoutError::MissingComputedWindowSlot);
         }
@@ -129,8 +129,28 @@ pub struct ComputedDecorationTree {
 }
 
 impl ComputedDecorationTree {
+    /// The client slot in logical pixels, derived from the root rect and the
+    /// decoration insets. Each inset is the physical inset rounded to logical
+    /// pixels on its own, so it is the same for every root size: converting a
+    /// root size to a client size and back is exact. Rounding the slot's
+    /// edges instead would make the right/bottom inset depend on the parity of
+    /// the size at fractional scales, and the root -> configure -> layout
+    /// round trip would flip the client size by one pixel on every pass.
     pub fn window_slot_rect(&self) -> Option<LogicalRect> {
-        self.root.window_slot_rect()
+        let root = &self.root;
+        let slot = root.resolved_window_slot_rect()?;
+        let frame = root.frame;
+        let bounds = root.resolved_rect;
+        let left = frame.logical_len_rounded(slot.x - bounds.x);
+        let top = frame.logical_len_rounded(slot.y - bounds.y);
+        let right = frame.logical_len_rounded(bounds.right() - slot.right());
+        let bottom = frame.logical_len_rounded(bounds.bottom() - slot.bottom());
+        Some(LogicalRect::new(
+            root.rect.x + left,
+            root.rect.y + top,
+            root.rect.width - left - right,
+            root.rect.height - top - bottom,
+        ))
     }
 
     pub fn bounds_rect(&self) -> LogicalRect {
@@ -154,31 +174,49 @@ impl ComputedDecorationTree {
     /// 4. move on decoration chrome
     /// 5. outside
     pub fn hit_test(&self, point: LogicalPoint) -> DecorationHitTestResult {
+        self.hit_test_at(point.x as f64, point.y as f64)
+    }
+
+    /// `hit_test` for a fractional logical point. The point is mapped onto
+    /// the layout's physical pixel grid and tested against the same pixel
+    /// rects that are rendered, so input matches what is on screen exactly.
+    pub fn hit_test_at(&self, x: f64, y: f64) -> DecorationHitTestResult {
+        let point = self.root.frame.layout_point(x, y);
         if let Some(action) = find_button_action(&self.root, point) {
             return DecorationHitTestResult::Action(action);
         }
 
-        if let Some(slot_rect) = self.window_slot_rect() {
+        if let Some(slot_rect) = self.root.resolved_window_slot_rect() {
             if let Some(border) = self.root.window_border_style() {
+                let scale = self.root.frame.scale;
                 let hit_area = self
                     .root
                     .window_border_resize_hit_area()
                     .unwrap_or_default();
-                let edge_width = hit_area.edge_width.unwrap_or(border.width);
-                let corner_width = hit_area.corner_width.unwrap_or(edge_width);
-                if let Some(edges) =
-                    hit_test_resize_edges(self.root.rect, edge_width, corner_width, point)
-                {
+                let edge_width = hit_area
+                    .edge_width
+                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
+                    .unwrap_or_else(|| ResolvedLayoutValue::border_width(border.width, scale));
+                let corner_width = hit_area
+                    .corner_width
+                    .map(|width| ResolvedLayoutValue::from_logical(width as f64, scale))
+                    .unwrap_or(edge_width);
+                if let Some(edges) = hit_test_resize_edges(
+                    self.root.resolved_rect,
+                    edge_width.raw(),
+                    corner_width.raw(),
+                    point,
+                ) {
                     return DecorationHitTestResult::Resize(edges);
                 }
             }
 
-            if slot_rect.contains(point) {
+            if slot_rect.contains_point(point) {
                 return DecorationHitTestResult::ClientArea;
             }
         }
 
-        if self.root.rect.contains(point) {
+        if self.root.resolved_rect.contains_point(point) {
             return DecorationHitTestResult::Move;
         }
 
@@ -189,7 +227,15 @@ impl ComputedDecorationTree {
         &self,
         point: LogicalPoint,
     ) -> Option<DecorationInteractionTarget> {
-        find_interaction_target(&self.root, point)
+        self.interaction_target_at_precise(point.x as f64, point.y as f64)
+    }
+
+    pub fn interaction_target_at_precise(
+        &self,
+        x: f64,
+        y: f64,
+    ) -> Option<DecorationInteractionTarget> {
+        find_interaction_target(&self.root, self.root.frame.layout_point(x, y))
     }
 }
 
@@ -207,6 +253,7 @@ pub struct ComputedDecorationNode {
     pub(crate) resolved_border_radius: ResolvedLayoutValue,
     pub effective_clip: Option<DecorationClip>,
     pub(crate) resolved_effective_clip: Option<ResolvedDecorationClip>,
+    pub(crate) frame: LayoutFrame,
     pub children: Vec<ComputedDecorationNode>,
 }
 
@@ -223,10 +270,10 @@ pub(crate) struct ResolvedDecorationClip {
 }
 
 impl ResolvedDecorationClip {
-    fn round_to_logical_clip(self) -> DecorationClip {
+    pub(crate) fn to_logical_clip(self, frame: LayoutFrame) -> DecorationClip {
         DecorationClip {
-            rect: self.rect.round_to_logical_rect(),
-            radius: self.radius.round_to_i32(),
+            rect: frame.logical_rect(self.rect),
+            radius: frame.logical_len_rounded(self.radius),
         }
     }
 }
@@ -269,7 +316,7 @@ impl ComputedDecorationNode {
     }
 
     pub(crate) fn bounds_rect(&self) -> LogicalRect {
-        self.resolved_bounds_rect().round_to_logical_rect()
+        self.frame.logical_rect(self.resolved_bounds_rect())
     }
 
     pub(crate) fn resolved_bounds_rect(&self) -> ResolvedLogicalRect {
@@ -383,21 +430,32 @@ impl ComputedDecorationNode {
         }
     }
 
-    pub(crate) fn sync_root_bounds(&mut self, scale: f64) {
+    pub(crate) fn sync_root_bounds(&mut self) {
+        let frame = self.frame;
         self.resolved_rect = self.resolved_layout_bounds_rect();
-        self.rect = self.resolved_rect.round_to_logical_rect();
+        // The extra physical pixels of a sub-pixel root size never change the
+        // root's logical rect: that rect feeds the client configure size, which
+        // must stay on the integer size the window manager asked for.
+        let mut logical_bounds = self.resolved_rect;
+        logical_bounds.width = ResolvedLayoutValue::from_raw(
+            (logical_bounds.width.raw() - frame.root_extra_px.0).max(0),
+        );
+        logical_bounds.height = ResolvedLayoutValue::from_raw(
+            (logical_bounds.height.raw() - frame.root_extra_px.1).max(0),
+        );
+        self.rect = frame.logical_rect(logical_bounds);
         self.resolved_content_rect = self
             .resolved_rect
-            .inset(self.style.resolved_content_inset(scale));
+            .inset(self.style.resolved_content_inset(frame.scale));
         self.resolved_effective_clip = effective_clip_for_node_resolved(
             &self.to_decoration_node(),
             None,
             self.resolved_content_rect,
-            scale,
+            frame.scale,
         );
         self.effective_clip = self
             .resolved_effective_clip
-            .map(ResolvedDecorationClip::round_to_logical_clip);
+            .map(|clip| clip.to_logical_clip(frame));
     }
 
     fn layout_direction_for_bounds(&self) -> Option<LayoutDirection> {
@@ -445,13 +503,13 @@ pub enum DecorationRenderPrimitive {
     FillRect {
         rect: LogicalRect,
         color: Color,
-        radius: Option<i32>,
+        radius: Option<f64>,
     },
     BorderRect {
         rect: LogicalRect,
-        width: i32,
+        width: f64,
         color: Color,
-        radius: Option<i32>,
+        radius: Option<f64>,
     },
     Label {
         rect: LogicalRect,
@@ -1169,17 +1227,17 @@ pub enum LayoutDirection {
 /// to lock in core concepts early without overcommitting to full CSS compatibility.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DecorationStyle {
-    pub width: Option<i32>,
-    pub height: Option<i32>,
-    pub min_width: Option<i32>,
-    pub min_height: Option<i32>,
-    pub max_width: Option<i32>,
-    pub max_height: Option<i32>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    pub min_width: Option<f64>,
+    pub min_height: Option<f64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
     pub flex_grow: Option<f32>,
     pub flex_shrink: Option<f32>,
     pub padding: Edges,
     pub margin: Edges,
-    pub gap: Option<i32>,
+    pub gap: Option<f64>,
     pub position: Option<StylePosition>,
     pub z_index: Option<i32>,
     pub inset: PositionOffsets,
@@ -1197,14 +1255,14 @@ pub struct DecorationStyle {
     pub border_bottom: Option<BorderStyle>,
     pub border_left: Option<BorderStyle>,
     pub border_fit: Option<BorderFit>,
-    pub border_radius: Option<i32>,
+    pub border_radius: Option<f64>,
     pub visible: Option<bool>,
     pub cursor: Option<String>,
-    pub font_size: Option<i32>,
+    pub font_size: Option<f64>,
     pub font_weight: Option<serde_json::Value>,
     pub font_family: Option<Vec<String>>,
     pub text_align: Option<String>,
-    pub line_height: Option<i32>,
+    pub line_height: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1253,24 +1311,26 @@ impl NodeTransform {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PositionOffsets {
-    pub top: Option<i32>,
-    pub right: Option<i32>,
-    pub bottom: Option<i32>,
-    pub left: Option<i32>,
+    pub top: Option<f64>,
+    pub right: Option<f64>,
+    pub bottom: Option<f64>,
+    pub left: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Style edge lengths (padding / margin) in logical pixels. Fractional values
+/// are allowed; layout snaps each one to the physical pixel grid.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Edges {
-    pub top: i32,
-    pub right: i32,
-    pub bottom: i32,
-    pub left: i32,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
 }
 
 impl Edges {
-    pub fn all(value: i32) -> Self {
+    pub fn all(value: f64) -> Self {
         Self {
             top: value,
             right: value,
@@ -1279,7 +1339,7 @@ impl Edges {
         }
     }
 
-    pub fn symmetric(horizontal: i32, vertical: i32) -> Self {
+    pub fn symmetric(horizontal: f64, vertical: f64) -> Self {
         Self {
             top: vertical,
             right: horizontal,
@@ -1311,9 +1371,10 @@ pub enum BorderFit {
     FitChildren,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BorderStyle {
-    pub width: i32,
+    /// Logical width; any non-zero width covers at least one physical pixel.
+    pub width: f64,
     pub color: Color,
 }
 
@@ -1389,10 +1450,10 @@ impl LogicalRect {
         }
     }
 
-    pub fn inset(self, edges: Edges) -> Self {
-        let width = (self.width - edges.left - edges.right).max(0);
-        let height = (self.height - edges.top - edges.bottom).max(0);
-        Self::new(self.x + edges.left, self.y + edges.top, width, height)
+    pub fn inset_uniform(self, inset: i32) -> Self {
+        let width = (self.width - inset * 2).max(0);
+        let height = (self.height - inset * 2).max(0);
+        Self::new(self.x + inset, self.y + inset, width, height)
     }
 
     pub fn contains(self, point: LogicalPoint) -> bool {
@@ -1415,42 +1476,152 @@ impl LogicalPoint {
     }
 }
 
-#[allow(dead_code)]
-const RESOLVED_LAYOUT_SUBPIXELS: i32 = 256;
+/// Rounds half-way cases up (towards +inf), the single rounding rule used to
+/// put layout lengths on the physical pixel grid.
+pub(crate) fn round_half_up(value: f64) -> i32 {
+    (value + 0.5).floor() as i32
+}
 
+/// Maps the layout's root-local physical pixel grid back to global logical
+/// space.
+///
+/// Layout runs entirely in whole physical pixels relative to the root
+/// decoration's origin: every style length is snapped once (`round(v·s)`)
+/// when it is resolved, and all positions are sums of those integers. That
+/// makes every node edge land exactly on the device grid, independently of
+/// where the window sits. Logical values exist only at the boundary, as
+/// `origin + px / scale`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LayoutFrame {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub scale: f64,
+    /// Physical pixels added to the root beyond `round(size · scale)` to
+    /// carry the sub-logical-pixel part of an animated root size. The root's
+    /// logical rect deliberately ignores it (see `sync_root_bounds`).
+    pub root_extra_px: (i32, i32),
+}
+
+impl Default for LayoutFrame {
+    fn default() -> Self {
+        Self {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            scale: 1.0,
+            root_extra_px: (0, 0),
+        }
+    }
+}
+
+impl LayoutFrame {
+    pub(crate) fn new(origin_x: f64, origin_y: f64, scale: f64) -> Self {
+        Self {
+            origin_x,
+            origin_y,
+            scale: sanitize_layout_scale(scale),
+            root_extra_px: (0, 0),
+        }
+    }
+
+    pub(crate) fn translated(self, dx: f64, dy: f64) -> Self {
+        Self {
+            origin_x: self.origin_x + dx,
+            origin_y: self.origin_y + dy,
+            ..self
+        }
+    }
+
+    /// Maps a global logical point onto the root-local physical pixel grid.
+    pub(crate) fn layout_point(self, x: f64, y: f64) -> LayoutPoint {
+        LayoutPoint {
+            x: (x - self.origin_x) * self.scale,
+            y: (y - self.origin_y) * self.scale,
+        }
+    }
+
+    pub(crate) fn logical_len(self, value: ResolvedLayoutValue) -> f32 {
+        (value.0 as f64 / self.scale) as f32
+    }
+
+    pub(crate) fn logical_len_rounded(self, value: ResolvedLayoutValue) -> i32 {
+        round_half_up(value.0 as f64 / self.scale)
+    }
+
+    pub(crate) fn logical_x(self, value: ResolvedLayoutValue) -> f64 {
+        self.origin_x + value.0 as f64 / self.scale
+    }
+
+    pub(crate) fn logical_y(self, value: ResolvedLayoutValue) -> f64 {
+        self.origin_y + value.0 as f64 / self.scale
+    }
+
+    pub(crate) fn precise_rect(
+        self,
+        rect: ResolvedLogicalRect,
+    ) -> crate::backend::visual::PreciseLogicalRect {
+        crate::backend::visual::PreciseLogicalRect {
+            x: self.logical_x(rect.x) as f32,
+            y: self.logical_y(rect.y) as f32,
+            width: self.logical_len(rect.width),
+            height: self.logical_len(rect.height),
+        }
+    }
+
+    /// Integer logical approximation (edges rounded independently) for
+    /// consumers that still work on the logical integer grid, such as hit
+    /// testing and protocol-facing sizes.
+    pub(crate) fn logical_rect(self, rect: ResolvedLogicalRect) -> LogicalRect {
+        let left = round_half_up(self.logical_x(rect.x));
+        let top = round_half_up(self.logical_y(rect.y));
+        let right = round_half_up(self.logical_x(rect.right()));
+        let bottom = round_half_up(self.logical_y(rect.bottom()));
+        LogicalRect::new(left, top, right - left, bottom - top)
+    }
+}
+
+fn sanitize_layout_scale(scale: f64) -> f64 {
+    if scale.is_finite() {
+        scale.abs().max(0.0001)
+    } else {
+        1.0
+    }
+}
+
+/// A point in root-local physical pixels (see `LayoutFrame`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LayoutPoint {
+    x: f64,
+    y: f64,
+}
+
+/// A layout length or coordinate in whole physical pixels (see `LayoutFrame`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct ResolvedLayoutValue(i32);
 
 impl ResolvedLayoutValue {
-    const ZERO: Self = Self(0);
+    pub(crate) const ZERO: Self = Self(0);
 
-    const fn from_raw(raw: i32) -> Self {
+    pub(crate) const fn from_raw(raw: i32) -> Self {
         Self(raw)
     }
 
-    const fn raw(self) -> i32 {
+    pub(crate) const fn raw(self) -> i32 {
         self.0
     }
 
-    const fn from_i32(value: i32) -> Self {
-        Self(value * RESOLVED_LAYOUT_SUBPIXELS)
+    /// Snaps a logical length onto the physical grid of `scale`.
+    pub(crate) fn from_logical(value: f64, scale: f64) -> Self {
+        Self(round_half_up(value * sanitize_layout_scale(scale)))
     }
 
-    fn from_f32(value: f32) -> Self {
-        Self((value * RESOLVED_LAYOUT_SUBPIXELS as f32).round() as i32)
-    }
-
-    fn to_f32(self) -> f32 {
-        self.0 as f32 / RESOLVED_LAYOUT_SUBPIXELS as f32
-    }
-
-    fn round_to_i32(self) -> i32 {
-        self.to_f32().round() as i32
-    }
-
-    fn snap_edge(self, scale: f64) -> Self {
-        let scale = scale.abs().max(0.0001);
-        Self::from_f32((((self.to_f32() as f64) * scale).round() / scale) as f32)
+    /// Like `from_logical`, but a positive width never collapses to zero: a
+    /// thin border stays visible as one physical pixel.
+    pub(crate) fn border_width(value: f64, scale: f64) -> Self {
+        if value > 0.0 {
+            Self(Self::from_logical(value, scale).0.max(1))
+        } else {
+            Self::ZERO
+        }
     }
 }
 
@@ -1472,60 +1643,68 @@ impl std::ops::Sub for ResolvedLayoutValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ResolvedLayoutEdges {
-    top: ResolvedLayoutValue,
-    right: ResolvedLayoutValue,
-    bottom: ResolvedLayoutValue,
-    left: ResolvedLayoutValue,
+    pub(crate) top: ResolvedLayoutValue,
+    pub(crate) right: ResolvedLayoutValue,
+    pub(crate) bottom: ResolvedLayoutValue,
+    pub(crate) left: ResolvedLayoutValue,
 }
 
 impl ResolvedLayoutEdges {
-    fn from_edges(edges: Edges) -> Self {
+    fn from_edges(edges: Edges, scale: f64) -> Self {
         Self {
-            top: ResolvedLayoutValue::from_i32(edges.top),
-            right: ResolvedLayoutValue::from_i32(edges.right),
-            bottom: ResolvedLayoutValue::from_i32(edges.bottom),
-            left: ResolvedLayoutValue::from_i32(edges.left),
+            top: ResolvedLayoutValue::from_logical(edges.top, scale),
+            right: ResolvedLayoutValue::from_logical(edges.right, scale),
+            bottom: ResolvedLayoutValue::from_logical(edges.bottom, scale),
+            left: ResolvedLayoutValue::from_logical(edges.left, scale),
+        }
+    }
+
+    pub(crate) fn all(value: ResolvedLayoutValue) -> Self {
+        Self {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
         }
     }
 }
 
+/// A rect in root-local physical pixels (see `LayoutFrame`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ResolvedLogicalRect {
-    x: ResolvedLayoutValue,
-    y: ResolvedLayoutValue,
-    width: ResolvedLayoutValue,
-    height: ResolvedLayoutValue,
+    pub(crate) x: ResolvedLayoutValue,
+    pub(crate) y: ResolvedLayoutValue,
+    pub(crate) width: ResolvedLayoutValue,
+    pub(crate) height: ResolvedLayoutValue,
 }
 
-// kept: non-`_resolved` counterparts, still part of the type's API
-#[allow(dead_code)]
 impl ResolvedLogicalRect {
-    fn from_logical(rect: LogicalRect) -> Self {
+    pub(crate) fn from_px(x: i32, y: i32, width: i32, height: i32) -> Self {
         Self {
-            x: ResolvedLayoutValue::from_i32(rect.x),
-            y: ResolvedLayoutValue::from_i32(rect.y),
-            width: ResolvedLayoutValue::from_i32(rect.width),
-            height: ResolvedLayoutValue::from_i32(rect.height),
+            x: ResolvedLayoutValue(x),
+            y: ResolvedLayoutValue(y),
+            width: ResolvedLayoutValue(width.max(0)),
+            height: ResolvedLayoutValue(height.max(0)),
         }
     }
 
-    fn left(self) -> ResolvedLayoutValue {
-        self.x
-    }
-
-    fn top(self) -> ResolvedLayoutValue {
-        self.y
-    }
-
-    fn right(self) -> ResolvedLayoutValue {
+    pub(crate) fn right(self) -> ResolvedLayoutValue {
         self.x + self.width
     }
 
-    fn bottom(self) -> ResolvedLayoutValue {
+    /// Half-open pixel coverage: a point on the right/bottom edge is outside.
+    pub(crate) fn contains_point(self, point: LayoutPoint) -> bool {
+        point.x >= self.x.0 as f64
+            && point.y >= self.y.0 as f64
+            && point.x < self.right().0 as f64
+            && point.y < self.bottom().0 as f64
+    }
+
+    pub(crate) fn bottom(self) -> ResolvedLayoutValue {
         self.y + self.height
     }
 
-    fn inset(self, edges: ResolvedLayoutEdges) -> Self {
+    pub(crate) fn inset(self, edges: ResolvedLayoutEdges) -> Self {
         let left = self.x + edges.left;
         let top = self.y + edges.top;
         let right = self.right() - edges.right;
@@ -1538,60 +1717,26 @@ impl ResolvedLogicalRect {
         }
     }
 
-    fn snapped_size(
-        self,
-        scale_x: f64,
-        scale_y: f64,
-    ) -> (ResolvedLayoutValue, ResolvedLayoutValue) {
-        let left = self.left().snap_edge(scale_x);
-        let top = self.top().snap_edge(scale_y);
-        let right = self.right().snap_edge(scale_x);
-        let bottom = self.bottom().snap_edge(scale_y);
-        (
-            ResolvedLayoutValue::from_raw((right.raw() - left.raw()).max(0)),
-            ResolvedLayoutValue::from_raw((bottom.raw() - top.raw()).max(0)),
-        )
-    }
-
-    fn round_to_logical_rect(self) -> LogicalRect {
-        LogicalRect::new(
-            self.x.round_to_i32(),
-            self.y.round_to_i32(),
-            self.width.round_to_i32(),
-            self.height.round_to_i32(),
-        )
-    }
-
-    fn transform_around(self, origin: (f32, f32), transform: NodeTransform) -> Self {
-        let left =
-            origin.0 + (self.x.to_f32() - origin.0) * transform.scale_x + transform.translate_x;
-        let top =
-            origin.1 + (self.y.to_f32() - origin.1) * transform.scale_y + transform.translate_y;
-        let right = origin.0
-            + (self.right().to_f32() - origin.0) * transform.scale_x
-            + transform.translate_x;
-        let bottom = origin.1
-            + (self.bottom().to_f32() - origin.1) * transform.scale_y
-            + transform.translate_y;
-        let min_x = left.min(right);
-        let min_y = top.min(bottom);
-        let max_x = left.max(right);
-        let max_y = top.max(bottom);
-        Self {
-            x: ResolvedLayoutValue::from_f32(min_x),
-            y: ResolvedLayoutValue::from_f32(min_y),
-            width: ResolvedLayoutValue::from_f32((max_x - min_x).max(0.0)),
-            height: ResolvedLayoutValue::from_f32((max_y - min_y).max(0.0)),
-        }
-    }
-
-    pub(crate) fn to_precise_logical_rect(self) -> crate::backend::visual::PreciseLogicalRect {
-        crate::backend::visual::PreciseLogicalRect {
-            x: self.x.to_f32(),
-            y: self.y.to_f32(),
-            width: self.width.to_f32(),
-            height: self.height.to_f32(),
-        }
+    /// Applies a node transform around `origin` (physical pixels). Translation
+    /// is given in logical pixels; the transformed edges are snapped back onto
+    /// the physical grid.
+    fn transform_around(self, origin: (f64, f64), transform: NodeTransform, scale: f64) -> Self {
+        let scale = sanitize_layout_scale(scale);
+        let translate_x = transform.translate_x as f64 * scale;
+        let translate_y = transform.translate_y as f64 * scale;
+        let map_x = |value: ResolvedLayoutValue| {
+            origin.0 + (value.0 as f64 - origin.0) * transform.scale_x as f64 + translate_x
+        };
+        let map_y = |value: ResolvedLayoutValue| {
+            origin.1 + (value.0 as f64 - origin.1) * transform.scale_y as f64 + translate_y
+        };
+        let (left, right) = (map_x(self.x), map_x(self.right()));
+        let (top, bottom) = (map_y(self.y), map_y(self.bottom()));
+        let min_x = round_half_up(left.min(right));
+        let min_y = round_half_up(top.min(bottom));
+        let max_x = round_half_up(left.max(right));
+        let max_y = round_half_up(top.max(bottom));
+        Self::from_px(min_x, min_y, max_x - min_x, max_y - min_y)
     }
 }
 
@@ -1614,35 +1759,25 @@ impl From<DecorationValidationError> for DecorationLayoutError {
     }
 }
 
-// kept: lower-level entry point, not currently called directly
-#[allow(dead_code)]
-pub(super) fn layout_node(
-    node: &DecorationNode,
-    rect: LogicalRect,
-    inherited_clip: Option<DecorationClip>,
-    window_slot_size: Option<(i32, i32)>,
-) -> Result<ComputedDecorationNode, DecorationLayoutError> {
-    layout_node_with_scale(node, rect, inherited_clip, window_slot_size, 1.0)
-}
-
 pub(super) fn layout_node_with_scale(
     node: &DecorationNode,
     rect: LogicalRect,
-    inherited_clip: Option<DecorationClip>,
     window_slot_size: Option<(i32, i32)>,
     scale: f64,
+    root_extra_px: (i32, i32),
 ) -> Result<ComputedDecorationNode, DecorationLayoutError> {
-    layout_node_resolved(
-        node,
-        ResolvedLogicalRect::from_logical(rect),
-        inherited_clip.map(|clip| ResolvedDecorationClip {
-            rect: ResolvedLogicalRect::from_logical(clip.rect),
-            radius: ResolvedLayoutValue::from_i32(clip.radius),
-        }),
-        window_slot_size,
-        scale,
-        ResolvedLogicalRect::from_logical(rect),
-    )
+    // The root's physical size derives from its logical size alone, so the
+    // whole tree is position independent; the window's placement enters only
+    // through the frame origin.
+    let mut frame = LayoutFrame::new(rect.x as f64, rect.y as f64, scale);
+    frame.root_extra_px = root_extra_px;
+    let root_rect = ResolvedLogicalRect::from_px(
+        0,
+        0,
+        round_half_up(rect.width as f64 * frame.scale) + root_extra_px.0,
+        round_half_up(rect.height as f64 * frame.scale) + root_extra_px.1,
+    );
+    layout_node_resolved(node, root_rect, None, window_slot_size, frame, root_rect)
 }
 
 fn layout_node_resolved(
@@ -1650,17 +1785,12 @@ fn layout_node_resolved(
     resolved_rect: ResolvedLogicalRect,
     inherited_clip: Option<ResolvedDecorationClip>,
     window_slot_size: Option<(i32, i32)>,
-    scale: f64,
+    frame: LayoutFrame,
     containing_block: ResolvedLogicalRect,
 ) -> Result<ComputedDecorationNode, DecorationLayoutError> {
-    let resolved_border_width = node
-        .style
-        .border
-        .map(|border| ResolvedLayoutValue::from_i32(border.width.max(0)).snap_edge(scale))
-        .unwrap_or(ResolvedLayoutValue::ZERO);
-    let resolved_border_radius =
-        ResolvedLayoutValue::from_i32(node.style.border_radius.unwrap_or(0).max(0))
-            .snap_edge(scale);
+    let scale = frame.scale;
+    let resolved_border_width = node.style.resolved_border_width(scale);
+    let resolved_border_radius = node.style.resolved_border_radius(scale);
     let content_rect = resolved_rect.inset(node.style.resolved_content_inset(scale));
     let effective_clip =
         effective_clip_for_node_resolved(node, inherited_clip, content_rect, scale);
@@ -1677,7 +1807,7 @@ fn layout_node_resolved(
             layout.direction,
             effective_clip,
             window_slot_size,
-            scale,
+            frame,
             child_containing_block,
         )?,
         DecorationNodeKind::ShaderEffect(effect) => layout_box_children(
@@ -1686,7 +1816,7 @@ fn layout_node_resolved(
             effect.direction,
             effective_clip,
             window_slot_size,
-            scale,
+            frame,
             child_containing_block,
         )?,
         // Buttons act as flex containers for their child icon / label so that
@@ -1699,7 +1829,7 @@ fn layout_node_resolved(
             LayoutDirection::Column,
             effective_clip,
             window_slot_size,
-            scale,
+            frame,
             child_containing_block,
         )?,
         _ if node.children.is_empty() => Vec::new(),
@@ -1722,7 +1852,7 @@ fn layout_node_resolved(
                     child_rect,
                     effective_clip,
                     window_slot_size,
-                    scale,
+                    frame,
                     child_containing_block,
                 )
             })
@@ -1735,13 +1865,14 @@ fn layout_node_resolved(
         window_border_interaction: node.window_border_interaction,
         kind: node.kind.clone(),
         style: node.style.clone(),
-        rect: resolved_rect.round_to_logical_rect(),
+        rect: frame.logical_rect(resolved_rect),
         resolved_rect,
         resolved_content_rect: content_rect,
         resolved_border_width,
         resolved_border_radius,
-        effective_clip: effective_clip.map(ResolvedDecorationClip::round_to_logical_clip),
+        effective_clip: effective_clip.map(|clip| clip.to_logical_clip(frame)),
         resolved_effective_clip: effective_clip,
+        frame,
         children,
     };
 
@@ -1753,8 +1884,9 @@ pub(super) fn reapply_tree_preserving_layout(
     computed: &mut ComputedDecorationNode,
     node: &DecorationNode,
     inherited_clip: Option<ResolvedDecorationClip>,
-    scale: f64,
 ) {
+    let frame = computed.frame;
+    let scale = frame.scale;
     computed.stable_id = node.stable_id.clone();
     computed.interaction = node.interaction.clone();
     computed.window_border_interaction = node.window_border_interaction;
@@ -1765,17 +1897,11 @@ pub(super) fn reapply_tree_preserving_layout(
         .inset(node.style.resolved_content_inset(scale));
     let effective_clip =
         effective_clip_for_node_resolved(node, inherited_clip, content_rect, scale);
-    computed.rect = computed.resolved_rect.round_to_logical_rect();
+    computed.rect = frame.logical_rect(computed.resolved_rect);
     computed.resolved_content_rect = content_rect;
-    computed.resolved_border_width = node
-        .style
-        .border
-        .map(|border| ResolvedLayoutValue::from_i32(border.width.max(0)).snap_edge(scale))
-        .unwrap_or(ResolvedLayoutValue::ZERO);
-    computed.resolved_border_radius =
-        ResolvedLayoutValue::from_i32(node.style.border_radius.unwrap_or(0).max(0))
-            .snap_edge(scale);
-    computed.effective_clip = effective_clip.map(ResolvedDecorationClip::round_to_logical_clip);
+    computed.resolved_border_width = node.style.resolved_border_width(scale);
+    computed.resolved_border_radius = node.style.resolved_border_radius(scale);
+    computed.effective_clip = effective_clip.map(|clip| clip.to_logical_clip(frame));
     computed.resolved_effective_clip = effective_clip;
 
     for (computed_child, node_child) in computed.children.iter_mut().zip(node.children.iter()) {
@@ -1783,7 +1909,6 @@ pub(super) fn reapply_tree_preserving_layout(
             computed_child,
             node_child,
             computed.resolved_effective_clip,
-            scale,
         );
     }
 }
@@ -1794,12 +1919,13 @@ fn layout_box_children(
     direction: LayoutDirection,
     effective_clip: Option<ResolvedDecorationClip>,
     window_slot_size: Option<(i32, i32)>,
-    scale: f64,
+    frame: LayoutFrame,
     containing_block: ResolvedLogicalRect,
 ) -> Result<Vec<ComputedDecorationNode>, DecorationLayoutError> {
     if node.children.is_empty() {
         return Ok(Vec::new());
     }
+    let scale = frame.scale;
 
     let flow_children = node
         .children
@@ -1979,7 +2105,6 @@ fn layout_box_children(
             content_rect,
             child_align,
             margin_box_cross_size,
-            scale,
         );
         let cross_origin = margin_box_cross_origin + margin_cross_start;
 
@@ -1990,30 +2115,23 @@ fn layout_box_children(
             cross_size,
         );
         if layout_debug_enabled {
-            let scale_f32 = scale.abs().max(0.0001) as f32;
             let (parent_cross_start, parent_cross_len, child_cross_start, child_cross_len) =
                 match direction {
                     LayoutDirection::Row => (
-                        content_rect.y.to_f32(),
-                        content_rect.height.to_f32(),
-                        child_rect.y.to_f32(),
-                        child_rect.height.to_f32(),
+                        content_rect.y.raw(),
+                        content_rect.height.raw(),
+                        child_rect.y.raw(),
+                        child_rect.height.raw(),
                     ),
                     LayoutDirection::Column => (
-                        content_rect.x.to_f32(),
-                        content_rect.width.to_f32(),
-                        child_rect.x.to_f32(),
-                        child_rect.width.to_f32(),
+                        content_rect.x.raw(),
+                        content_rect.width.raw(),
+                        child_rect.x.raw(),
+                        child_rect.width.raw(),
                     ),
                 };
-            let parent_cross_start_px = (parent_cross_start * scale_f32).round() as i32;
-            let parent_cross_end_px =
-                ((parent_cross_start + parent_cross_len) * scale_f32).round() as i32;
-            let child_cross_start_px = (child_cross_start * scale_f32).round() as i32;
-            let child_cross_len_px = (child_cross_len * scale_f32).round().max(0.0) as i32;
-            let child_cross_end_px = child_cross_start_px + child_cross_len_px;
-            let child_center_twice_px = child_cross_start_px * 2 + child_cross_len_px;
-            let parent_center_twice_px = parent_cross_start_px + parent_cross_end_px;
+            let child_center_twice_px = child_cross_start * 2 + child_cross_len;
+            let parent_center_twice_px = parent_cross_start * 2 + parent_cross_len;
             let child_stable_id = child.stable_id.as_deref().unwrap_or("<none>");
             let child_kind = match &child.kind {
                 DecorationNodeKind::Box(_) => "box",
@@ -2034,21 +2152,11 @@ fn layout_box_children(
                 align = ?child_align.unwrap_or(AlignItems::Stretch),
                 scale,
                 content_rect = ?content_rect,
-                cursor_raw = cursor.raw(),
-                cursor_resolved = cursor.to_f32(),
-                main_size_raw = main_size.raw(),
-                main_size_resolved = main_size.to_f32(),
-                cross_available_raw = cross_available.raw(),
-                cross_available_resolved = cross_available.to_f32(),
-                cross_size_raw = cross_size.raw(),
-                cross_size_resolved = cross_size.to_f32(),
-                cross_origin_raw = cross_origin.raw(),
-                cross_origin_resolved = cross_origin.to_f32(),
-                parent_cross_start_px,
-                parent_cross_end_px,
-                child_cross_start_px,
-                child_cross_len_px,
-                child_cross_end_px,
+                cursor_px = cursor.raw(),
+                main_size_px = main_size.raw(),
+                cross_available_px = cross_available.raw(),
+                cross_size_px = cross_size.raw(),
+                cross_origin_px = cross_origin.raw(),
                 center_delta_twice_px = child_center_twice_px - parent_center_twice_px,
                 child_rect = ?child_rect,
                 "gap layout child placement"
@@ -2059,7 +2167,7 @@ fn layout_box_children(
             child_rect,
             effective_clip,
             window_slot_size,
-            scale,
+            frame,
             containing_block,
         )?);
         let distributed_gap_remainder = (flow_position as i32).min(gap_extra_remainder.max(0));
@@ -2080,7 +2188,7 @@ fn layout_box_children(
                 child_rect,
                 effective_clip,
                 window_slot_size,
-                scale,
+                frame,
                 containing_block,
             )?);
         }
@@ -2100,22 +2208,15 @@ fn absolute_child_rect_resolved(
 ) -> ResolvedLogicalRect {
     let offsets = child.style.inset;
     let margin = child.style.resolved_margin(scale);
-    let left = offsets
-        .left
-        .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale));
-    let right = offsets
-        .right
-        .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale));
-    let top = offsets
-        .top
-        .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale));
-    let bottom = offsets
-        .bottom
-        .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale));
+    let snap = |value: f64| ResolvedLayoutValue::from_logical(value, scale);
+    let left = offsets.left.map(snap);
+    let right = offsets.right.map(snap);
+    let top = offsets.top.map(snap);
+    let bottom = offsets.bottom.map(snap);
 
     let auto_size = child.auto_size_resolved(window_slot_size, scale);
     let width = match (child.style.width, left, right) {
-        (Some(width), _, _) => ResolvedLayoutValue::from_i32(width).snap_edge(scale),
+        (Some(width), _, _) => snap(width),
         (None, Some(left), Some(right)) => ResolvedLayoutValue::from_raw(
             (containing_block.width.raw()
                 - left.raw()
@@ -2129,7 +2230,7 @@ fn absolute_child_rect_resolved(
             .unwrap_or(ResolvedLayoutValue::ZERO),
     };
     let height = match (child.style.height, top, bottom) {
-        (Some(height), _, _) => ResolvedLayoutValue::from_i32(height).snap_edge(scale),
+        (Some(height), _, _) => snap(height),
         (None, Some(top), Some(bottom)) => ResolvedLayoutValue::from_raw(
             (containing_block.height.raw()
                 - top.raw()
@@ -2175,38 +2276,37 @@ fn apply_node_transform(node: &mut ComputedDecorationNode) {
     }
 
     let origin = (
-        (node.resolved_rect.x + node.resolved_rect.width).to_f32()
-            - node.resolved_rect.width.to_f32() * 0.5,
-        (node.resolved_rect.y + node.resolved_rect.height).to_f32()
-            - node.resolved_rect.height.to_f32() * 0.5,
+        node.resolved_rect.x.raw() as f64 + node.resolved_rect.width.raw() as f64 * 0.5,
+        node.resolved_rect.y.raw() as f64 + node.resolved_rect.height.raw() as f64 * 0.5,
     );
     transform_subtree(node, origin, transform);
 }
 
 fn transform_subtree(
     node: &mut ComputedDecorationNode,
-    origin: (f32, f32),
+    origin: (f64, f64),
     transform: NodeTransform,
 ) {
-    node.resolved_rect = node.resolved_rect.transform_around(origin, transform);
-    node.rect = node.resolved_rect.round_to_logical_rect();
-    node.resolved_content_rect = node
-        .resolved_content_rect
-        .transform_around(origin, transform);
+    let frame = node.frame;
+    node.resolved_rect = node
+        .resolved_rect
+        .transform_around(origin, transform, frame.scale);
+    node.rect = frame.logical_rect(node.resolved_rect);
+    node.resolved_content_rect =
+        node.resolved_content_rect
+            .transform_around(origin, transform, frame.scale);
     if let Some(clip) = &mut node.resolved_effective_clip {
-        clip.rect = clip.rect.transform_around(origin, transform);
+        clip.rect = clip.rect.transform_around(origin, transform, frame.scale);
     }
     node.effective_clip = node
         .resolved_effective_clip
-        .map(ResolvedDecorationClip::round_to_logical_clip);
+        .map(|clip| clip.to_logical_clip(frame));
 
     for child in &mut node.children {
         transform_subtree(child, origin, transform);
     }
 }
 
-// kept: non-`_resolved` counterparts of the methods actually used
-#[allow(dead_code)]
 impl DecorationNode {
     fn preferred_main_size_resolved(
         &self,
@@ -2220,45 +2320,17 @@ impl DecorationNode {
         };
 
         let fallback = explicit
-            .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale))
+            .map(|value| ResolvedLayoutValue::from_logical(value, scale))
             .unwrap_or_else(|| {
                 self.auto_size_resolved(window_slot_size, scale)
                     .map(|(width, height)| match direction {
                         LayoutDirection::Row => width,
                         LayoutDirection::Column => height,
                     })
-                    .unwrap_or_else(|| match self.kind {
-                        DecorationNodeKind::WindowSlot => ResolvedLayoutValue::ZERO,
-                        _ => ResolvedLayoutValue::ZERO,
-                    })
+                    .unwrap_or(ResolvedLayoutValue::ZERO)
             });
 
         self.style.clamp_main_resolved(direction, fallback, scale)
-    }
-
-    fn preferred_main_size(
-        &self,
-        direction: LayoutDirection,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> i32 {
-        let explicit = match direction {
-            LayoutDirection::Row => self.style.width,
-            LayoutDirection::Column => self.style.height,
-        };
-
-        let fallback = explicit.unwrap_or_else(|| {
-            self.auto_size(window_slot_size)
-                .map(|(width, height)| match direction {
-                    LayoutDirection::Row => width,
-                    LayoutDirection::Column => height,
-                })
-                .unwrap_or_else(|| match self.kind {
-                    DecorationNodeKind::WindowSlot => 0,
-                    _ => 0,
-                })
-        });
-
-        self.style.clamp_main(direction, fallback)
     }
 
     fn preferred_cross_size_resolved(
@@ -2275,7 +2347,7 @@ impl DecorationNode {
         };
 
         let fallback = explicit
-            .map(|value| ResolvedLayoutValue::from_i32(value).snap_edge(scale))
+            .map(|value| ResolvedLayoutValue::from_logical(value, scale))
             .unwrap_or_else(|| {
                 if matches!(align.unwrap_or(AlignItems::Stretch), AlignItems::Stretch)
                     && available_cross.raw() > 0
@@ -2292,36 +2364,6 @@ impl DecorationNode {
             });
 
         self.style.clamp_cross_resolved(direction, fallback, scale)
-    }
-
-    fn preferred_cross_size(
-        &self,
-        direction: LayoutDirection,
-        available_cross: i32,
-        align: Option<AlignItems>,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> i32 {
-        let explicit = match direction {
-            LayoutDirection::Row => self.style.height,
-            LayoutDirection::Column => self.style.width,
-        };
-
-        let fallback = explicit.unwrap_or_else(|| {
-            if matches!(align.unwrap_or(AlignItems::Stretch), AlignItems::Stretch)
-                && available_cross > 0
-            {
-                return available_cross;
-            }
-
-            self.auto_size(window_slot_size)
-                .map(|(width, height)| match direction {
-                    LayoutDirection::Row => height,
-                    LayoutDirection::Column => width,
-                })
-                .unwrap_or(available_cross)
-        });
-
-        self.style.clamp_cross(direction, fallback)
     }
 
     fn flex_grow_for_layout(&self) -> f32 {
@@ -2363,14 +2405,19 @@ impl DecorationNode {
         explicit_main_size.is_none() && self.auto_size_resolved(window_slot_size, scale).is_some()
     }
 
-    fn intrinsic_size(&self, window_slot_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
+    fn intrinsic_size_resolved(
+        &self,
+        window_slot_size: Option<(i32, i32)>,
+        scale: f64,
+    ) -> Option<(ResolvedLayoutValue, ResolvedLayoutValue)> {
         match &self.kind {
             DecorationNodeKind::Label(label) => {
-                let font_size = self.style.font_size.unwrap_or(13).max(1);
+                let font_size = self.style.font_size.unwrap_or(13.0).max(1.0) as f32;
                 let line_height = self
                     .style
                     .line_height
-                    .unwrap_or(font_size + 4)
+                    .map(|value| value as f32)
+                    .unwrap_or(font_size + 4.0)
                     .max(font_size);
                 let spec = LabelSpec {
                     rect: LogicalRect::new(0, 0, 0, 0),
@@ -2386,31 +2433,23 @@ impl DecorationNode {
                     font_family: self.style.font_family.clone(),
                     text_align: self.style.text_align.clone(),
                     line_height: Some(line_height),
-                    raster_scale: 1,
+                    raster_scale: 1.0,
                 };
-                Some(measure_label_intrinsic(&spec))
+                let (width, height) = measure_label_intrinsic(&spec);
+                Some((
+                    ResolvedLayoutValue::from_logical(width as f64, scale),
+                    ResolvedLayoutValue::from_logical(height as f64, scale),
+                ))
             }
-            DecorationNodeKind::WindowSlot => window_slot_size,
+            // The client buffer covers `round(size · scale)` physical pixels.
+            DecorationNodeKind::WindowSlot => window_slot_size.map(|(width, height)| {
+                (
+                    ResolvedLayoutValue::from_logical(width as f64, scale),
+                    ResolvedLayoutValue::from_logical(height as f64, scale),
+                )
+            }),
             _ => None,
         }
-    }
-
-    fn intrinsic_size_resolved(
-        &self,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> Option<(ResolvedLayoutValue, ResolvedLayoutValue)> {
-        self.intrinsic_size(window_slot_size)
-            .map(|(width, height)| {
-                (
-                    ResolvedLayoutValue::from_i32(width),
-                    ResolvedLayoutValue::from_i32(height),
-                )
-            })
-    }
-
-    fn auto_size(&self, window_slot_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
-        self.intrinsic_size(window_slot_size)
-            .or_else(|| self.content_based_size(window_slot_size))
     }
 
     fn auto_size_resolved(
@@ -2418,21 +2457,8 @@ impl DecorationNode {
         window_slot_size: Option<(i32, i32)>,
         scale: f64,
     ) -> Option<(ResolvedLayoutValue, ResolvedLayoutValue)> {
-        self.intrinsic_size_resolved(window_slot_size)
+        self.intrinsic_size_resolved(window_slot_size, scale)
             .or_else(|| self.content_based_size_resolved(window_slot_size, scale))
-    }
-
-    fn content_based_size(&self, window_slot_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
-        match &self.kind {
-            DecorationNodeKind::Box(layout) => {
-                Some(self.stack_content_size(layout.direction, window_slot_size))
-            }
-            DecorationNodeKind::ShaderEffect(effect) => {
-                Some(self.stack_content_size(effect.direction, window_slot_size))
-            }
-            DecorationNodeKind::WindowBorder => Some(self.overlay_content_size(window_slot_size)),
-            _ => None,
-        }
     }
 
     fn content_based_size_resolved(
@@ -2451,56 +2477,6 @@ impl DecorationNode {
                 Some(self.overlay_content_size_resolved(window_slot_size, scale))
             }
             _ => None,
-        }
-    }
-
-    fn stack_content_size(
-        &self,
-        direction: LayoutDirection,
-        window_slot_size: Option<(i32, i32)>,
-    ) -> (i32, i32) {
-        let inset = self.style.content_inset();
-        if self.children.is_empty() {
-            return (inset.left + inset.right, inset.top + inset.bottom);
-        }
-
-        let flow_children = self
-            .children
-            .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
-            .collect::<Vec<_>>();
-        if flow_children.is_empty() {
-            return (inset.left + inset.right, inset.top + inset.bottom);
-        }
-
-        let gap = self.style.gap.unwrap_or(0).max(0);
-        let mut main_sum = 0;
-        let mut cross_max = 0;
-
-        for child in &flow_children {
-            let child_main = child
-                .preferred_main_size(direction, window_slot_size)
-                .max(0)
-                + direction.main_margin(child.style.margin);
-            let child_cross = child
-                .preferred_cross_size(direction, 0, child.style.align_items, window_slot_size)
-                .max(0)
-                + direction.cross_margin(child.style.margin);
-            main_sum += child_main;
-            cross_max = cross_max.max(child_cross);
-        }
-
-        main_sum += gap * flow_children.len().saturating_sub(1) as i32;
-
-        match direction {
-            LayoutDirection::Row => (
-                main_sum + inset.left + inset.right,
-                cross_max + inset.top + inset.bottom,
-            ),
-            LayoutDirection::Column => (
-                cross_max + inset.left + inset.right,
-                main_sum + inset.top + inset.bottom,
-            ),
         }
     }
 
@@ -2562,36 +2538,6 @@ impl DecorationNode {
         }
     }
 
-    fn overlay_content_size(&self, window_slot_size: Option<(i32, i32)>) -> (i32, i32) {
-        let inset = self.style.content_inset();
-        let mut width = 0;
-        let mut height = 0;
-
-        for child in self
-            .children
-            .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
-        {
-            width = width.max(
-                child
-                    .preferred_main_size(LayoutDirection::Row, window_slot_size)
-                    .max(0)
-                    + LayoutDirection::Row.main_margin(child.style.margin),
-            );
-            height = height.max(
-                child
-                    .preferred_main_size(LayoutDirection::Column, window_slot_size)
-                    .max(0)
-                    + LayoutDirection::Column.main_margin(child.style.margin),
-            );
-        }
-
-        (
-            width + inset.left + inset.right,
-            height + inset.top + inset.bottom,
-        )
-    }
-
     fn overlay_content_size_resolved(
         &self,
         window_slot_size: Option<(i32, i32)>,
@@ -2629,8 +2575,6 @@ impl DecorationNode {
     }
 }
 
-// kept: non-`_resolved` counterparts of the methods actually used
-#[allow(dead_code)]
 impl DecorationStyle {
     pub(crate) fn effective_border_fit(&self, kind: &DecorationNodeKind) -> BorderFit {
         self.border_fit.unwrap_or(match kind {
@@ -2639,49 +2583,33 @@ impl DecorationStyle {
         })
     }
 
+    pub(crate) fn resolved_border_width(&self, scale: f64) -> ResolvedLayoutValue {
+        self.border
+            .map(|border| ResolvedLayoutValue::border_width(border.width, scale))
+            .unwrap_or(ResolvedLayoutValue::ZERO)
+    }
+
+    pub(crate) fn resolved_border_radius(&self, scale: f64) -> ResolvedLayoutValue {
+        ResolvedLayoutValue::from_logical(self.border_radius.unwrap_or(0.0).max(0.0), scale)
+    }
+
     fn resolved_content_inset(&self, scale: f64) -> ResolvedLayoutEdges {
-        let border = self
-            .border
-            .map(|border| ResolvedLayoutValue::from_i32(border.width).snap_edge(scale))
-            .unwrap_or(ResolvedLayoutValue::ZERO);
-        let padding = ResolvedLayoutEdges::from_edges(self.padding);
+        let border = self.resolved_border_width(scale);
+        let padding = ResolvedLayoutEdges::from_edges(self.padding, scale);
         ResolvedLayoutEdges {
-            top: padding.top.snap_edge(scale) + border,
-            right: padding.right.snap_edge(scale) + border,
-            bottom: padding.bottom.snap_edge(scale) + border,
-            left: padding.left.snap_edge(scale) + border,
+            top: padding.top + border,
+            right: padding.right + border,
+            bottom: padding.bottom + border,
+            left: padding.left + border,
         }
     }
 
     fn resolved_margin(&self, scale: f64) -> ResolvedLayoutEdges {
-        let margin = ResolvedLayoutEdges::from_edges(self.margin);
-        ResolvedLayoutEdges {
-            top: margin.top.snap_edge(scale),
-            right: margin.right.snap_edge(scale),
-            bottom: margin.bottom.snap_edge(scale),
-            left: margin.left.snap_edge(scale),
-        }
+        ResolvedLayoutEdges::from_edges(self.margin, scale)
     }
 
     fn resolved_gap(&self, scale: f64) -> ResolvedLayoutValue {
-        ResolvedLayoutValue::from_i32(self.gap.unwrap_or(0).max(0)).snap_edge(scale)
-    }
-
-    fn content_inset(&self) -> Edges {
-        let border = self.border.map(|border| border.width).unwrap_or(0).max(0);
-        Edges {
-            top: self.padding.top + border,
-            right: self.padding.right + border,
-            bottom: self.padding.bottom + border,
-            left: self.padding.left + border,
-        }
-    }
-
-    fn clamp_main(&self, direction: LayoutDirection, value: i32) -> i32 {
-        match direction {
-            LayoutDirection::Row => clamp_size(value, self.min_width, self.max_width),
-            LayoutDirection::Column => clamp_size(value, self.min_height, self.max_height),
-        }
+        ResolvedLayoutValue::from_logical(self.gap.unwrap_or(0.0).max(0.0), scale)
     }
 
     fn clamp_main_resolved(
@@ -2702,13 +2630,6 @@ impl DecorationStyle {
             },
             scale,
         )
-    }
-
-    fn clamp_cross(&self, direction: LayoutDirection, value: i32) -> i32 {
-        match direction {
-            LayoutDirection::Row => clamp_size(value, self.min_height, self.max_height),
-            LayoutDirection::Column => clamp_size(value, self.min_width, self.max_width),
-        }
     }
 
     fn clamp_cross_resolved(
@@ -2789,37 +2710,22 @@ fn layout_style_equivalent(left: &DecorationStyle, right: &DecorationStyle) -> b
         && left.visible == right.visible
 }
 
-// kept: non-`_resolved` counterpart of clamp_size_resolved
-#[allow(dead_code)]
-fn clamp_size(value: i32, min: Option<i32>, max: Option<i32>) -> i32 {
-    let mut value = value.max(0);
-    if let Some(min) = min {
-        value = value.max(min.max(0));
-    }
-    if let Some(max) = max {
-        value = value.min(max.max(0));
-    }
-    value
-}
-
 fn clamp_size_resolved(
     value: ResolvedLayoutValue,
-    min: Option<i32>,
-    max: Option<i32>,
+    min: Option<f64>,
+    max: Option<f64>,
     scale: f64,
 ) -> ResolvedLayoutValue {
     let mut value = ResolvedLayoutValue::from_raw(value.raw().max(0));
     if let Some(min) = min {
-        value = value.max(ResolvedLayoutValue::from_i32(min.max(0)).snap_edge(scale));
+        value = value.max(ResolvedLayoutValue::from_logical(min.max(0.0), scale));
     }
     if let Some(max) = max {
-        value = value.min(ResolvedLayoutValue::from_i32(max.max(0)).snap_edge(scale));
+        value = value.min(ResolvedLayoutValue::from_logical(max.max(0.0), scale));
     }
     value
 }
 
-// kept: non-`_resolved` counterparts of the methods actually used
-#[allow(dead_code)]
 impl LayoutDirection {
     fn main_start_margin_resolved(self, margin: ResolvedLayoutEdges) -> ResolvedLayoutValue {
         match self {
@@ -2849,20 +2755,6 @@ impl LayoutDirection {
         }
     }
 
-    fn main_margin(self, margin: Edges) -> i32 {
-        match self {
-            LayoutDirection::Row => margin.left + margin.right,
-            LayoutDirection::Column => margin.top + margin.bottom,
-        }
-    }
-
-    fn cross_margin(self, margin: Edges) -> i32 {
-        match self {
-            LayoutDirection::Row => margin.top + margin.bottom,
-            LayoutDirection::Column => margin.left + margin.right,
-        }
-    }
-
     fn main_origin_resolved(self, rect: ResolvedLogicalRect) -> ResolvedLayoutValue {
         match self {
             LayoutDirection::Row => rect.x,
@@ -2884,86 +2776,22 @@ impl LayoutDirection {
         }
     }
 
-    fn main_origin(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.x,
-            LayoutDirection::Column => rect.y,
-        }
-    }
-
-    fn main_len(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.width,
-            LayoutDirection::Column => rect.height,
-        }
-    }
-
-    fn cross_len(self, rect: LogicalRect) -> i32 {
-        match self {
-            LayoutDirection::Row => rect.height,
-            LayoutDirection::Column => rect.width,
-        }
-    }
-
-    fn cross_origin_for_child(
-        self,
-        rect: LogicalRect,
-        align: Option<AlignItems>,
-        child_cross_size: i32,
-    ) -> i32 {
-        let align = align.unwrap_or(AlignItems::Stretch);
-        let available = self.cross_len(rect);
-        let remaining = (available - child_cross_size).max(0);
-
-        match (self, align) {
-            (LayoutDirection::Row, AlignItems::Center) => rect.y + remaining / 2,
-            (LayoutDirection::Row, AlignItems::End) => rect.y + remaining,
-            (LayoutDirection::Row, _) => rect.y,
-            (LayoutDirection::Column, AlignItems::Center) => rect.x + remaining / 2,
-            (LayoutDirection::Column, AlignItems::End) => rect.x + remaining,
-            (LayoutDirection::Column, _) => rect.x,
-        }
-    }
-
     fn cross_origin_for_child_resolved(
         self,
         rect: ResolvedLogicalRect,
         align: Option<AlignItems>,
         child_cross_size: ResolvedLayoutValue,
-        scale: f64,
     ) -> ResolvedLayoutValue {
-        let align = align.unwrap_or(AlignItems::Stretch);
-        let scale = scale.abs().max(0.0001) as f32;
-
-        match (self, align) {
-            (LayoutDirection::Row, AlignItems::Center) => {
-                let top_px = (rect.y.to_f32() * scale).round() as i32;
-                let bottom_px = ((rect.y.to_f32() + rect.height.to_f32()) * scale).round() as i32;
-                let child_px = (child_cross_size.to_f32() * scale).round().max(0.0) as i32;
-                let aligned_px = top_px + ((bottom_px - top_px - child_px).max(0) / 2);
-                ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
-            }
-            (LayoutDirection::Row, AlignItems::End) => {
-                let bottom_px = ((rect.y.to_f32() + rect.height.to_f32()) * scale).round() as i32;
-                let child_px = (child_cross_size.to_f32() * scale).round().max(0.0) as i32;
-                let aligned_px = bottom_px - child_px;
-                ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
-            }
-            (LayoutDirection::Row, _) => rect.y,
-            (LayoutDirection::Column, AlignItems::Center) => {
-                let left_px = (rect.x.to_f32() * scale).round() as i32;
-                let right_px = ((rect.x.to_f32() + rect.width.to_f32()) * scale).round() as i32;
-                let child_px = (child_cross_size.to_f32() * scale).round().max(0.0) as i32;
-                let aligned_px = left_px + ((right_px - left_px - child_px).max(0) / 2);
-                ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
-            }
-            (LayoutDirection::Column, AlignItems::End) => {
-                let right_px = ((rect.x.to_f32() + rect.width.to_f32()) * scale).round() as i32;
-                let child_px = (child_cross_size.to_f32() * scale).round().max(0.0) as i32;
-                let aligned_px = right_px - child_px;
-                ResolvedLayoutValue::from_f32(aligned_px as f32 / scale)
-            }
-            (LayoutDirection::Column, _) => rect.x,
+        let (start, len) = match self {
+            LayoutDirection::Row => (rect.y, rect.height),
+            LayoutDirection::Column => (rect.x, rect.width),
+        };
+        match align.unwrap_or(AlignItems::Stretch) {
+            AlignItems::Center => ResolvedLayoutValue::from_raw(
+                start.raw() + (len.raw() - child_cross_size.raw()).max(0) / 2,
+            ),
+            AlignItems::End => start + len - child_cross_size,
+            AlignItems::Start | AlignItems::Stretch => start,
         }
     }
 
@@ -2987,23 +2815,6 @@ impl LayoutDirection {
                 width: cross_len,
                 height: main_len,
             },
-        }
-    }
-
-    fn rect(
-        self,
-        main_origin: i32,
-        cross_origin: i32,
-        main_len: i32,
-        cross_len: i32,
-    ) -> LogicalRect {
-        match self {
-            LayoutDirection::Row => {
-                LogicalRect::new(main_origin, cross_origin, main_len, cross_len)
-            }
-            LayoutDirection::Column => {
-                LogicalRect::new(cross_origin, main_origin, cross_len, main_len)
-            }
         }
     }
 }
@@ -3107,7 +2918,7 @@ fn push_fill_rect_with_hole(
     rect: LogicalRect,
     hole: LogicalRect,
     color: Color,
-    radius: Option<i32>,
+    radius: Option<f64>,
 ) {
     let top_height = (hole.y - rect.y).max(0);
     let bottom_y = hole.y + hole.height;
@@ -3134,13 +2945,13 @@ fn push_fill_rect_with_hole(
     }
 }
 
-fn find_button_action(node: &ComputedDecorationNode, point: LogicalPoint) -> Option<WindowAction> {
+fn find_button_action(node: &ComputedDecorationNode, point: LayoutPoint) -> Option<WindowAction> {
     if node.style.visible == Some(false) || !node.style.pointer_events_enabled() {
         return None;
     }
     if node
-        .effective_clip
-        .is_some_and(|clip| !clip.rect.contains(point))
+        .resolved_effective_clip
+        .is_some_and(|clip| !clip.rect.contains_point(point))
     {
         return None;
     }
@@ -3152,7 +2963,7 @@ fn find_button_action(node: &ComputedDecorationNode, point: LogicalPoint) -> Opt
     }
 
     match &node.kind {
-        DecorationNodeKind::Button(button) if node.rect.contains(point) => {
+        DecorationNodeKind::Button(button) if node.resolved_rect.contains_point(point) => {
             Some(button.action.clone())
         }
         _ => None,
@@ -3161,14 +2972,14 @@ fn find_button_action(node: &ComputedDecorationNode, point: LogicalPoint) -> Opt
 
 fn find_interaction_target(
     node: &ComputedDecorationNode,
-    point: LogicalPoint,
+    point: LayoutPoint,
 ) -> Option<DecorationInteractionTarget> {
     if node.style.visible == Some(false) || !node.style.pointer_events_enabled() {
         return None;
     }
     if node
-        .effective_clip
-        .is_some_and(|clip| !clip.rect.contains(point))
+        .resolved_effective_clip
+        .is_some_and(|clip| !clip.rect.contains_point(point))
     {
         return None;
     }
@@ -3179,7 +2990,7 @@ fn find_interaction_target(
         }
     }
 
-    if node.rect.contains(point) && node.interaction.has_any() {
+    if node.resolved_rect.contains_point(point) && node.interaction.has_any() {
         let node_id = node.stable_id.clone()?;
         return Some(DecorationInteractionTarget {
             node_id,
@@ -3191,26 +3002,28 @@ fn find_interaction_target(
 }
 
 fn hit_test_resize_edges(
-    rect: LogicalRect,
+    rect: ResolvedLogicalRect,
     edge_width: i32,
     corner_width: i32,
-    point: LogicalPoint,
+    point: LayoutPoint,
 ) -> Option<ResizeEdges> {
-    let edge_width = edge_width.max(0);
-    let corner_width = corner_width.max(edge_width).max(0);
-    if edge_width == 0 || !rect.contains(point) {
+    let edge_width = edge_width.max(0) as f64;
+    let corner_width = (corner_width as f64).max(edge_width).max(0.0);
+    if edge_width == 0.0 || !rect.contains_point(point) {
         return None;
     }
 
-    let right = rect.x + rect.width;
-    let bottom = rect.y + rect.height;
-    let on_left = point.x < rect.x + edge_width;
+    let left = rect.x.0 as f64;
+    let top = rect.y.0 as f64;
+    let right = rect.right().0 as f64;
+    let bottom = rect.bottom().0 as f64;
+    let on_left = point.x < left + edge_width;
     let on_right = point.x >= right - edge_width;
-    let on_top = point.y < rect.y + edge_width;
+    let on_top = point.y < top + edge_width;
     let on_bottom = point.y >= bottom - edge_width;
-    let near_left_corner = point.x < rect.x + corner_width;
+    let near_left_corner = point.x < left + corner_width;
     let near_right_corner = point.x >= right - corner_width;
-    let near_top_corner = point.y < rect.y + corner_width;
+    let near_top_corner = point.y < top + corner_width;
     let near_bottom_corner = point.y >= bottom - corner_width;
 
     let mut edges = ResizeEdges::empty();
@@ -3250,43 +3063,17 @@ fn hit_test_resize_edges(
     (!edges.is_empty()).then_some(edges)
 }
 
-// kept: non-resolved counterpart of effective_clip_for_node_resolved
-#[allow(dead_code)]
-fn effective_clip_for_node(
-    node: &DecorationNode,
-    inherited_clip: Option<DecorationClip>,
-    content_rect: LogicalRect,
-) -> Option<DecorationClip> {
-    effective_clip_for_node_resolved(
-        node,
-        inherited_clip.map(|clip| ResolvedDecorationClip {
-            rect: ResolvedLogicalRect::from_logical(clip.rect),
-            radius: ResolvedLayoutValue::from_i32(clip.radius),
-        }),
-        ResolvedLogicalRect::from_logical(content_rect),
-        1.0,
-    )
-    .map(|clip| clip.round_to_logical_clip())
-}
-
 fn effective_clip_for_node_resolved(
     node: &DecorationNode,
     inherited_clip: Option<ResolvedDecorationClip>,
     content_rect: ResolvedLogicalRect,
     scale: f64,
 ) -> Option<ResolvedDecorationClip> {
-    let node_clip = node_clips_children(node).then(|| {
-        let border_width = node
-            .style
-            .border
-            .map(|border| border.width.max(0))
-            .unwrap_or(0);
-        ResolvedDecorationClip {
-            rect: content_rect,
-            radius: (ResolvedLayoutValue::from_i32(node.style.border_radius.unwrap_or(0))
-                - ResolvedLayoutValue::from_i32(border_width).snap_edge(scale))
-            .max(ResolvedLayoutValue::ZERO),
-        }
+    let node_clip = node_clips_children(node).then(|| ResolvedDecorationClip {
+        rect: content_rect,
+        radius: (node.style.resolved_border_radius(scale)
+            - node.style.resolved_border_width(scale))
+        .max(ResolvedLayoutValue::ZERO),
     });
 
     match (inherited_clip, node_clip) {
@@ -3304,35 +3091,6 @@ fn node_clips_children(node: &DecorationNode) -> bool {
     // placement marker rather than an SSD container.
     node.style.clips_children()
         || (node.style.border.is_some() && !matches!(node.style.overflow, Some(Overflow::Visible)))
-}
-
-// kept: used by effective_clip_for_node above
-#[allow(dead_code)]
-fn intersect_decoration_clips(
-    left: DecorationClip,
-    right: DecorationClip,
-) -> Option<DecorationClip> {
-    let x1 = left.rect.x.max(right.rect.x);
-    let y1 = left.rect.y.max(right.rect.y);
-    let x2 = (left.rect.x + left.rect.width).min(right.rect.x + right.rect.width);
-    let y2 = (left.rect.y + left.rect.height).min(right.rect.y + right.rect.height);
-
-    if x2 <= x1 || y2 <= y1 {
-        return None;
-    }
-
-    if rect_contains_logical(left.rect, right.rect) {
-        return Some(right);
-    }
-
-    if rect_contains_logical(right.rect, left.rect) {
-        return Some(left);
-    }
-
-    Some(DecorationClip {
-        rect: LogicalRect::new(x1, y1, x2 - x1, y2 - y1),
-        radius: left.radius.min(right.radius),
-    })
 }
 
 fn intersect_resolved_decoration_clips(
@@ -3365,15 +3123,6 @@ fn intersect_resolved_decoration_clips(
         },
         radius: left.radius.min(right.radius),
     })
-}
-
-// kept: used by the non-resolved clip path above
-#[allow(dead_code)]
-fn rect_contains_logical(outer: LogicalRect, inner: LogicalRect) -> bool {
-    outer.x <= inner.x
-        && outer.y <= inner.y
-        && outer.x + outer.width >= inner.x + inner.width
-        && outer.y + outer.height >= inner.y + inner.height
 }
 
 fn resolved_rect_contains(outer: ResolvedLogicalRect, inner: ResolvedLogicalRect) -> bool {
@@ -3453,7 +3202,7 @@ mod tests {
     fn window_border_insets_content_by_border_width() {
         let mut root = DecorationNode::new(DecorationNodeKind::WindowBorder);
         root.style.border = Some(BorderStyle {
-            width: 2,
+            width: 2.0,
             color: Color::WHITE,
         });
         root.push_child(DecorationNode::new(DecorationNodeKind::WindowSlot));
@@ -3475,7 +3224,7 @@ mod tests {
         }))
         .with_style(DecorationStyle {
             border: Some(BorderStyle {
-                width: 2,
+                width: 2.0,
                 color: Color::WHITE,
             }),
             ..Default::default()
@@ -3484,10 +3233,10 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
-                    border_radius: Some(20),
+                    border_radius: Some(20.0),
                     ..Default::default()
                 })
                 .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
@@ -3503,7 +3252,7 @@ mod tests {
                 .resolved_effective_clip
                 .expect("nested effective clip")
                 .radius
-                .round_to_i32(),
+                .raw(),
             18
         );
     }
@@ -3515,10 +3264,10 @@ mod tests {
         }))
         .with_style(DecorationStyle {
             border: Some(BorderStyle {
-                width: 2,
+                width: 2.0,
                 color: Color::WHITE,
             }),
-            border_radius: Some(20),
+            border_radius: Some(20.0),
             ..Default::default()
         })
         .with_children(vec![
@@ -3535,7 +3284,7 @@ mod tests {
                 .resolved_effective_clip
                 .expect("border clip should propagate to children")
                 .radius
-                .round_to_i32(),
+                .raw(),
             18
         );
     }
@@ -3548,10 +3297,10 @@ mod tests {
         .with_style(DecorationStyle {
             overflow: Some(Overflow::Hidden),
             border: Some(BorderStyle {
-                width: 2,
+                width: 2.0,
                 color: Color::WHITE,
             }),
-            border_radius: Some(20),
+            border_radius: Some(20.0),
             ..Default::default()
         })
         .with_children(vec![
@@ -3566,7 +3315,7 @@ mod tests {
             .resolved_effective_clip
             .expect("child should inherit rounded clip");
 
-        assert_eq!(clip.radius.round_to_i32(), 18);
+        assert_eq!(clip.radius.raw(), 18);
     }
 
     #[test]
@@ -3577,10 +3326,10 @@ mod tests {
         .with_style(DecorationStyle {
             overflow: Some(Overflow::Hidden),
             border: Some(BorderStyle {
-                width: 1,
+                width: 1.0,
                 color: Color::WHITE,
             }),
-            border_radius: Some(12),
+            border_radius: Some(12.0),
             ..Default::default()
         })
         .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]);
@@ -3592,7 +3341,7 @@ mod tests {
             .resolved_effective_clip
             .expect("button child should inherit rounded clip");
 
-        assert_eq!(clip.radius.round_to_i32(), 11);
+        assert_eq!(clip.radius.raw(), 11);
     }
 
     #[test]
@@ -3601,7 +3350,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(28),
+            height: Some(28.0),
             ..Default::default()
         });
 
@@ -3627,7 +3376,7 @@ mod tests {
             text: "title".into(),
         }))
         .with_style(DecorationStyle {
-            width: Some(100),
+            width: Some(100.0),
             ..Default::default()
         });
         let spacer = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
@@ -3641,7 +3390,7 @@ mod tests {
             action: WindowAction::Close,
         }))
         .with_style(DecorationStyle {
-            width: Some(20),
+            width: Some(20.0),
             ..Default::default()
         });
 
@@ -3649,7 +3398,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            gap: Some(4),
+            gap: Some(4.0),
             ..Default::default()
         })
         .with_children(vec![
@@ -3677,16 +3426,16 @@ mod tests {
             fit: ImageFit::Contain,
         }))
         .with_style(DecorationStyle {
-            width: Some(4),
-            height: Some(4),
+            width: Some(4.0),
+            height: Some(4.0),
             ..Default::default()
         });
         let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
             action: WindowAction::Close,
         }))
         .with_style(DecorationStyle {
-            width: Some(16),
-            height: Some(16),
+            width: Some(16.0),
+            height: Some(16.0),
             ..Default::default()
         })
         .with_children(vec![image]);
@@ -3714,16 +3463,16 @@ mod tests {
             fit: ImageFit::Contain,
         }))
         .with_style(DecorationStyle {
-            width: Some(4),
-            height: Some(4),
+            width: Some(4.0),
+            height: Some(4.0),
             ..Default::default()
         });
         let button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
             action: WindowAction::Close,
         }))
         .with_style(DecorationStyle {
-            width: Some(16),
-            height: Some(16),
+            width: Some(16.0),
+            height: Some(16.0),
             align_items: Some(AlignItems::Center),
             justify_content: Some(JustifyContent::Center),
             ..Default::default()
@@ -3754,8 +3503,8 @@ mod tests {
                 direction: LayoutDirection::Row,
             }))
             .with_style(DecorationStyle {
-                width: Some(10),
-                height: Some(10),
+                width: Some(10.0),
+                height: Some(10.0),
                 ..Default::default()
             })
         };
@@ -3763,8 +3512,8 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            width: Some(100),
-            height: Some(10),
+            width: Some(100.0),
+            height: Some(10.0),
             justify_content: Some(JustifyContent::SpaceBetween),
             ..Default::default()
         })
@@ -3793,7 +3542,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(30),
+            height: Some(30.0),
             ..Default::default()
         })
         .with_children(vec![
@@ -3806,7 +3555,7 @@ mod tests {
         let bordered = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
                 background: Some(Color::BLACK),
@@ -3831,10 +3580,10 @@ mod tests {
         }))
         .with_style(DecorationStyle {
             padding: Edges {
-                top: 6,
-                right: 6,
-                bottom: 6,
-                left: 6,
+                top: 6.0,
+                right: 6.0,
+                bottom: 6.0,
+                left: 6.0,
             },
             ..Default::default()
         })
@@ -3855,7 +3604,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(30),
+            height: Some(30.0),
             ..Default::default()
         })
         .with_children(vec![DecorationNode::new(DecorationNodeKind::Label(
@@ -3887,7 +3636,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(30),
+            height: Some(30.0),
             align_items: Some(AlignItems::Center),
             ..Default::default()
         })
@@ -3919,7 +3668,7 @@ mod tests {
         let child = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
                 background: Some(Color::BLACK),
@@ -3939,10 +3688,10 @@ mod tests {
         }))
         .with_style(DecorationStyle {
             padding: Edges {
-                top: 6,
-                right: 6,
-                bottom: 6,
-                left: 6,
+                top: 6.0,
+                right: 6.0,
+                bottom: 6.0,
+                left: 6.0,
             },
             ..Default::default()
         })
@@ -3966,10 +3715,10 @@ mod tests {
             DecorationStyle {
                 position: Some(StylePosition::Absolute),
                 inset: PositionOffsets {
-                    top: Some(0),
-                    right: Some(0),
-                    bottom: Some(0),
-                    left: Some(0),
+                    top: Some(0.0),
+                    right: Some(0.0),
+                    bottom: Some(0.0),
+                    left: Some(0.0),
                 },
                 ..Default::default()
             },
@@ -3986,7 +3735,7 @@ mod tests {
             overlay,
             DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                 DecorationStyle {
-                    height: Some(20),
+                    height: Some(20.0),
                     ..Default::default()
                 },
             ),
@@ -4019,10 +3768,10 @@ mod tests {
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                 DecorationStyle {
-                    width: Some(10),
-                    height: Some(10),
+                    width: Some(10.0),
+                    height: Some(10.0),
                     margin: Edges {
-                        left: 32,
+                        left: 32.0,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -4056,14 +3805,14 @@ mod tests {
                 DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                     DecorationStyle {
                         position: Some(StylePosition::Absolute),
-                        width: Some(10),
-                        height: Some(10),
+                        width: Some(10.0),
+                        height: Some(10.0),
                         inset: PositionOffsets {
-                            left: Some(5),
+                            left: Some(5.0),
                             ..Default::default()
                         },
                         margin: Edges {
-                            left: 7,
+                            left: 7.0,
                             ..Default::default()
                         },
                         ..Default::default()
@@ -4088,7 +3837,7 @@ mod tests {
             DecorationStyle {
                 position: Some(StylePosition::Absolute),
                 inset: PositionOffsets {
-                    left: Some(4),
+                    left: Some(4.0),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4098,7 +3847,7 @@ mod tests {
             DecorationStyle {
                 position: Some(StylePosition::Absolute),
                 inset: PositionOffsets {
-                    left: Some(8),
+                    left: Some(8.0),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4140,8 +3889,8 @@ mod tests {
                     action: WindowAction::Maximize,
                 }))
                 .with_style(DecorationStyle {
-                    width: Some(100),
-                    height: Some(20),
+                    width: Some(100.0),
+                    height: Some(20.0),
                     z_index: Some(1),
                     background: Some(Color::rgba(255, 0, 0, 255)),
                     ..Default::default()
@@ -4152,8 +3901,8 @@ mod tests {
                 .with_style(DecorationStyle {
                     position: Some(StylePosition::Absolute),
                     z_index: Some(10),
-                    width: Some(100),
-                    height: Some(20),
+                    width: Some(100.0),
+                    height: Some(20.0),
                     background: Some(Color::rgba(0, 255, 0, 255)),
                     ..Default::default()
                 }),
@@ -4185,8 +3934,8 @@ mod tests {
             action: WindowAction::Maximize,
         }))
         .with_style(DecorationStyle {
-            width: Some(100),
-            height: Some(20),
+            width: Some(100.0),
+            height: Some(20.0),
             z_index: Some(1),
             ..Default::default()
         });
@@ -4202,8 +3951,8 @@ mod tests {
         .with_style(DecorationStyle {
             position: Some(StylePosition::Absolute),
             z_index: Some(10),
-            width: Some(100),
-            height: Some(20),
+            width: Some(100.0),
+            height: Some(20.0),
             ..Default::default()
         });
         upper.stable_id = Some("upper".into());
@@ -4245,8 +3994,8 @@ mod tests {
                     action: WindowAction::Maximize,
                 }))
                 .with_style(DecorationStyle {
-                    width: Some(100),
-                    height: Some(20),
+                    width: Some(100.0),
+                    height: Some(20.0),
                     ..Default::default()
                 }),
                 DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
@@ -4255,8 +4004,8 @@ mod tests {
                 .with_style(DecorationStyle {
                     position: Some(StylePosition::Absolute),
                     z_index: Some(10),
-                    width: Some(100),
-                    height: Some(20),
+                    width: Some(100.0),
+                    height: Some(20.0),
                     pointer_events: Some(PointerEvents::None),
                     ..Default::default()
                 }),
@@ -4281,8 +4030,8 @@ mod tests {
                     action: WindowAction::Close,
                 }))
                 .with_style(DecorationStyle {
-                    width: Some(20),
-                    height: Some(10),
+                    width: Some(20.0),
+                    height: Some(10.0),
                     transform: Some(NodeTransform {
                         translate_x: 5.0,
                         translate_y: 2.0,
@@ -4320,11 +4069,11 @@ mod tests {
                 DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                     DecorationStyle {
                         position: Some(StylePosition::Absolute),
-                        width: Some(20),
-                        height: Some(20),
+                        width: Some(20.0),
+                        height: Some(20.0),
                         inset: PositionOffsets {
-                            top: Some(-10),
-                            left: Some(-10),
+                            top: Some(-10.0),
+                            left: Some(-10.0),
                             ..Default::default()
                         },
                         ..Default::default()
@@ -4346,7 +4095,7 @@ mod tests {
             text: "Shoji".into(),
         }))
         .with_style(DecorationStyle {
-            height: Some(24),
+            height: Some(24.0),
             color: Some(Color::BLACK),
             ..Default::default()
         });
@@ -4355,7 +4104,7 @@ mod tests {
             .with_style(DecorationStyle {
                 background: Some(Color::WHITE),
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::BLACK,
                 }),
                 ..Default::default()
@@ -4384,7 +4133,7 @@ mod tests {
         assert!(primitives.iter().any(|primitive| matches!(
             primitive,
             DecorationRenderPrimitive::BorderRect { rect, width, color, .. }
-                if *rect == LogicalRect::new(0, 0, 100, 40) && *width == 2 && *color == Color::BLACK
+                if *rect == LogicalRect::new(0, 0, 100, 40) && *width == 2.0 && *color == Color::BLACK
         )));
         assert!(primitives.iter().any(|primitive| matches!(
             primitive,
@@ -4404,7 +4153,7 @@ mod tests {
         .with_style(DecorationStyle {
             background: Some(Color::WHITE),
             border: Some(BorderStyle {
-                width: 1,
+                width: 1.0,
                 color: Color::BLACK,
             }),
             ..Default::default()
@@ -4414,7 +4163,7 @@ mod tests {
                 direction: LayoutDirection::Column,
             }))
             .with_style(DecorationStyle {
-                height: Some(4),
+                height: Some(4.0),
                 background: Some(Color::rgba(255, 0, 0, 255)),
                 ..Default::default()
             }),
@@ -4432,7 +4181,7 @@ mod tests {
             .position(|primitive| matches!(
                 primitive,
                 DecorationRenderPrimitive::BorderRect { rect, width, color, .. }
-                    if *rect == LogicalRect::new(0, 0, 10, 10) && *width == 1 && *color == Color::BLACK
+                    if *rect == LogicalRect::new(0, 0, 10, 10) && *width == 1.0 && *color == Color::BLACK
             ))
             .expect("root border should exist");
         let child_background_index = primitives
@@ -4528,7 +4277,7 @@ mod tests {
                 action: WindowAction::Close,
             }))
             .with_style(DecorationStyle {
-                width: Some(20),
+                width: Some(20.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4552,7 +4301,7 @@ mod tests {
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                 DecorationStyle {
-                    height: Some(20),
+                    height: Some(20.0),
                     ..Default::default()
                 },
             ),
@@ -4579,7 +4328,7 @@ mod tests {
                 text: "title".into(),
             }))
             .with_style(DecorationStyle {
-                height: Some(20),
+                height: Some(20.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4600,7 +4349,7 @@ mod tests {
         let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 4,
+                    width: 4.0,
                     color: Color::WHITE,
                 }),
                 ..Default::default()
@@ -4626,7 +4375,7 @@ mod tests {
         let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
                 ..Default::default()
@@ -4658,37 +4407,16 @@ mod tests {
     }
 
     #[test]
-    fn resolved_layout_snaps_size_from_edges() {
-        let rect = ResolvedLogicalRect {
-            x: ResolvedLayoutValue::from_i32(1953),
-            y: ResolvedLayoutValue::from_i32(82),
-            width: ResolvedLayoutValue::from_i32(1512),
-            height: ResolvedLayoutValue::from_i32(906),
-        };
-
-        let (snapped_width, snapped_height) = rect.snapped_size(1.6, 1.6);
-        assert_eq!(snapped_width.round_to_i32(), 1512);
-        assert_eq!(snapped_height.round_to_i32(), 906);
-        assert_eq!(
-            ((((rect.right().to_f32() as f64) * 1.6).round()
-                - ((rect.left().to_f32() as f64) * 1.6).round()) as i32),
-            2419
-        );
-    }
-
-    #[test]
-    fn resolved_layout_inset_preserves_subpixel_border_width() {
-        let rect = ResolvedLogicalRect::from_logical(LogicalRect::new(0, 0, 18, 18));
-        let border = ResolvedLayoutValue::from_f32(1.875);
-        let inset = rect.inset(ResolvedLayoutEdges {
-            top: border,
-            right: border,
-            bottom: border,
-            left: border,
-        });
-
-        assert_eq!(inset.x.to_f32(), 1.875);
-        assert_eq!(inset.width.to_f32(), 14.25);
+    fn style_lengths_snap_to_the_physical_grid() {
+        // 3 logical px at 1.5x is 4.5 physical px: ties round up to 5 px
+        // (3.333 logical), never to a fractional pixel.
+        assert_eq!(ResolvedLayoutValue::from_logical(3.0, 1.5).raw(), 5);
+        assert_eq!(ResolvedLayoutValue::from_logical(1.75, 1.5).raw(), 3);
+        assert_eq!(ResolvedLayoutValue::from_logical(1.6, 1.25).raw(), 2);
+        // A thin but non-zero border stays visible as one physical pixel.
+        assert_eq!(ResolvedLayoutValue::border_width(0.3, 1.25).raw(), 1);
+        assert_eq!(ResolvedLayoutValue::border_width(0.0, 1.25).raw(), 0);
+        assert_eq!(ResolvedLayoutValue::from_logical(0.3, 1.25).raw(), 0);
     }
 
     #[test]
@@ -4696,14 +4424,14 @@ mod tests {
         let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 1,
+                    width: 1.0,
                     color: Color::WHITE,
                 }),
                 padding: Edges {
-                    top: 4,
-                    right: 4,
-                    bottom: 4,
-                    left: 4,
+                    top: 4.0,
+                    right: 4.0,
+                    bottom: 4.0,
+                    left: 4.0,
                 },
                 ..Default::default()
             })
@@ -4712,19 +4440,19 @@ mod tests {
                     direction: LayoutDirection::Row,
                 }))
                 .with_style(DecorationStyle {
-                    gap: Some(3),
+                    gap: Some(3.0),
                     ..Default::default()
                 })
                 .with_children(vec![
                     DecorationNode::new(DecorationNodeKind::Label(LabelNode { text: "A".into() }))
                         .with_style(DecorationStyle {
-                            width: Some(11),
-                            height: Some(20),
+                            width: Some(11.0),
+                            height: Some(20.0),
                             ..Default::default()
                         }),
                     DecorationNode::new(DecorationNodeKind::AppIcon).with_style(DecorationStyle {
-                        width: Some(11),
-                        height: Some(20),
+                        width: Some(11.0),
+                        height: Some(20.0),
                         ..Default::default()
                     }),
                     DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4739,9 +4467,10 @@ mod tests {
         let label = &row.children[0];
         let icon = &row.children[1];
 
+        // gap 3 at 1.6x = 4.8 -> 5 physical px.
         assert_eq!(
-            (icon.resolved_rect.x - label.resolved_rect.x - label.resolved_rect.width).to_f32(),
-            3.125
+            (icon.resolved_rect.x - label.resolved_rect.x - label.resolved_rect.width).raw(),
+            5
         );
     }
 
@@ -4751,7 +4480,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(2),
+            height: Some(2.0),
             background: Some(Color::BLACK),
             ..Default::default()
         });
@@ -4760,7 +4489,7 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(2),
+            height: Some(2.0),
             background: Some(Color::BLACK),
             ..Default::default()
         });
@@ -4773,14 +4502,14 @@ mod tests {
                 direction: LayoutDirection::Row,
             }))
             .with_style(DecorationStyle {
-                height: Some(30),
+                height: Some(30.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::Box(BoxNode {
                 direction: LayoutDirection::Row,
             }))
             .with_style(DecorationStyle {
-                height: Some(30),
+                height: Some(30.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4794,10 +4523,10 @@ mod tests {
         let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(20),
+                border_radius: Some(20.0),
                 ..Default::default()
             })
             .with_children(vec![
@@ -4809,7 +4538,7 @@ mod tests {
                         direction: LayoutDirection::Row,
                     }))
                     .with_style(DecorationStyle {
-                        width: Some(2),
+                        width: Some(2.0),
                         ..Default::default()
                     }),
                     anchor_column,
@@ -4817,7 +4546,7 @@ mod tests {
                         direction: LayoutDirection::Row,
                     }))
                     .with_style(DecorationStyle {
-                        width: Some(2),
+                        width: Some(2.0),
                         ..Default::default()
                     }),
                 ]),
@@ -4851,20 +4580,20 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            gap: Some(3),
+            gap: Some(3.0),
             ..Default::default()
         })
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::Label(LabelNode { text: "A".into() }))
                 .with_style(DecorationStyle {
-                    width: Some(11),
-                    height: Some(20),
+                    width: Some(11.0),
+                    height: Some(20.0),
                     color: Some(Color::WHITE),
                     ..Default::default()
                 }),
             DecorationNode::new(DecorationNodeKind::AppIcon).with_style(DecorationStyle {
-                width: Some(11),
-                height: Some(20),
+                width: Some(11.0),
+                height: Some(20.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4874,21 +4603,21 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            gap: Some(3),
+            gap: Some(3.0),
             background: Some(Color::BLACK),
             ..Default::default()
         })
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::Label(LabelNode { text: "A".into() }))
                 .with_style(DecorationStyle {
-                    width: Some(11),
-                    height: Some(20),
+                    width: Some(11.0),
+                    height: Some(20.0),
                     color: Some(Color::BLACK),
                     ..Default::default()
                 }),
             DecorationNode::new(DecorationNodeKind::AppIcon).with_style(DecorationStyle {
-                width: Some(11),
-                height: Some(20),
+                width: Some(11.0),
+                height: Some(20.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4897,13 +4626,13 @@ mod tests {
         let mut layout = DecorationTree::new(original)
             .layout_for_client_with_scale(LogicalRect::new(50, 40, 200, 120), 1.6)
             .expect("layout should succeed");
-        reapply_tree_preserving_layout(&mut layout.root, &updated, None, 1.6);
+        reapply_tree_preserving_layout(&mut layout.root, &updated, None);
 
         let label = &layout.root.children[0];
         let icon = &layout.root.children[1];
         assert_eq!(
-            (icon.resolved_rect.x - label.resolved_rect.x - label.resolved_rect.width).to_f32(),
-            3.125
+            (icon.resolved_rect.x - label.resolved_rect.x - label.resolved_rect.width).raw(),
+            5
         );
     }
 
@@ -4918,8 +4647,8 @@ mod tests {
                     action: WindowAction::Close,
                 }))
                 .with_style(DecorationStyle {
-                    width: Some(18),
-                    height: Some(18),
+                    width: Some(18.0),
+                    height: Some(18.0),
                     ..Default::default()
                 }),
                 DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -4931,8 +4660,9 @@ mod tests {
             .expect("layout should succeed");
         let button = &layout.root.children[0];
 
-        assert_eq!(button.resolved_rect.width.to_f32(), 18.125);
-        assert_eq!(button.resolved_rect.height.to_f32(), 18.125);
+        // 18 at 1.6x = 28.8 -> 29 physical px.
+        assert_eq!(button.resolved_rect.width.raw(), 29);
+        assert_eq!(button.resolved_rect.height.raw(), 29);
     }
 
     #[test]
@@ -4941,10 +4671,10 @@ mod tests {
             action: WindowAction::Close,
         }))
         .with_style(DecorationStyle {
-            width: Some(16),
-            height: Some(16),
+            width: Some(16.0),
+            height: Some(16.0),
             border: Some(BorderStyle {
-                width: 1,
+                width: 1.0,
                 color: Color::WHITE,
             }),
             ..Default::default()
@@ -4954,15 +4684,15 @@ mod tests {
             fit: ImageFit::Contain,
         }))
         .with_style(DecorationStyle {
-            width: Some(16),
-            height: Some(16),
+            width: Some(16.0),
+            height: Some(16.0),
             position: Some(StylePosition::Absolute),
             ..Default::default()
         });
         let overlay = DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
             .with_style(DecorationStyle {
-                width: Some(16),
-                height: Some(16),
+                width: Some(16.0),
+                height: Some(16.0),
                 position: Some(StylePosition::Relative),
                 ..Default::default()
             })
@@ -4972,7 +4702,7 @@ mod tests {
         }))
         .with_style(DecorationStyle {
             border: Some(BorderStyle {
-                width: 2,
+                width: 2.0,
                 color: Color::WHITE,
             }),
             ..Default::default()
@@ -5007,8 +4737,8 @@ mod tests {
                 action: WindowAction::Close,
             }))
             .with_style(DecorationStyle {
-                width: Some(16),
-                height: Some(16),
+                width: Some(16.0),
+                height: Some(16.0),
                 ..Default::default()
             }),
         ]);
@@ -5023,20 +4753,20 @@ mod tests {
             direction: LayoutDirection::Row,
         }))
         .with_style(DecorationStyle {
-            height: Some(30),
+            height: Some(30.0),
             padding: Edges {
-                left: 8,
-                right: 8,
+                left: 8.0,
+                right: 8.0,
                 ..Default::default()
             },
-            gap: Some(8),
+            gap: Some(8.0),
             align_items: Some(AlignItems::Center),
             ..Default::default()
         })
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::AppIcon).with_style(DecorationStyle {
-                width: Some(16),
-                height: Some(16),
+                width: Some(16.0),
+                height: Some(16.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::Label(LabelNode {
@@ -5045,7 +4775,7 @@ mod tests {
             .with_style(DecorationStyle {
                 flex_grow: Some(1.0),
                 flex_shrink: Some(1.0),
-                min_width: Some(0),
+                min_width: Some(0.0),
                 ..Default::default()
             }),
             close_button,
@@ -5053,10 +4783,10 @@ mod tests {
         let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(10),
+                border_radius: Some(10.0),
                 ..Default::default()
             })
             .with_children(vec![
@@ -5084,7 +4814,140 @@ mod tests {
 
         assert_eq!(slot, client_rect);
         assert_eq!(layout.root.rect.x, client_rect.x - 2);
-        assert_eq!(layout.root.rect.width, client_rect.width + 5);
+        // Border 2 at 1.25x is 3 physical px per side, i.e. a constant 2
+        // logical px inset; the one-pixel slack is absorbed by the client
+        // sampling, not by a size-dependent inset.
+        assert_eq!(layout.root.rect.width, client_rect.width + 4);
+    }
+
+    /// Every node rendered through the root frame must land exactly on the
+    /// physical pixels the layout chose, wherever the window sits and at any
+    /// fractional scale: layout and rendering share one pixel grid.
+    #[test]
+    fn rendered_node_edges_match_layout_pixels_at_fractional_scales() {
+        let button = |action| {
+            DecorationNode::new(DecorationNodeKind::Button(ButtonNode { action })).with_style(
+                DecorationStyle {
+                    width: Some(15.5),
+                    height: Some(15.5),
+                    border: Some(BorderStyle {
+                        width: 0.75,
+                        color: Color::WHITE,
+                    }),
+                    border_radius: Some(7.75),
+                    ..Default::default()
+                },
+            )
+        };
+        let titlebar = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Row,
+        }))
+        .with_style(DecorationStyle {
+            height: Some(29.5),
+            padding: Edges::symmetric(7.25, 0.0),
+            gap: Some(5.5),
+            align_items: Some(AlignItems::Center),
+            justify_content: Some(JustifyContent::SpaceBetween),
+            ..Default::default()
+        })
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Label(LabelNode {
+                text: "title".into(),
+            }))
+            .with_style(DecorationStyle {
+                flex_grow: Some(1.0),
+                ..Default::default()
+            }),
+            button(WindowAction::Minimize),
+            button(WindowAction::Close),
+        ]);
+        let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
+            .with_style(DecorationStyle {
+                border: Some(BorderStyle {
+                    width: 1.5,
+                    color: Color::WHITE,
+                }),
+                border_radius: Some(10.0),
+                ..Default::default()
+            })
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Column,
+                }))
+                .with_children(vec![titlebar, DecorationNode::new(DecorationNodeKind::WindowSlot)]),
+            ]);
+        let tree = DecorationTree::new(root);
+
+        fn check(node: &ComputedDecorationNode, root: LogicalRect, scale: f64) {
+            let scale_xy = smithay::utils::Scale::from((scale, scale));
+            let output_geo = smithay::utils::Rectangle::new((0, 0).into(), (0, 0).into());
+            let mapped = crate::backend::visual::relative_physical_rect_from_root_precise(
+                node.frame.precise_rect(node.resolved_rect),
+                root,
+                Default::default(),
+                output_geo,
+                scale_xy,
+            );
+            assert_eq!(
+                (mapped.loc.x, mapped.loc.y, mapped.size.w, mapped.size.h),
+                (
+                    node.resolved_rect.x.raw(),
+                    node.resolved_rect.y.raw(),
+                    node.resolved_rect.width.raw(),
+                    node.resolved_rect.height.raw(),
+                ),
+                "node {:?} at scale {scale}",
+                node.kind,
+            );
+            for child in &node.children {
+                check(child, root, scale);
+            }
+        }
+
+        for scale in [1.0, 1.25, 1.5, 1.6, 1.75, 1.8, 2.25] {
+            for (x, y) in [(0, 0), (1, 3), (777, 401), (2561, 1439)] {
+                let layout = tree
+                    .layout_for_client_with_scale(LogicalRect::new(x, y, 641, 417), scale)
+                    .expect("layout should succeed");
+                check(&layout.root, layout.root.rect, scale);
+            }
+        }
+    }
+
+    /// Pointer hit testing uses the rendered pixel rects: at 1.5x a button
+    /// whose layout edge falls between logical pixels is hit exactly up to
+    /// its last rendered physical pixel and not beyond it.
+    #[test]
+    fn hit_test_follows_rendered_pixels_at_fractional_scale() {
+        let tree = DecorationTree::new(
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                direction: LayoutDirection::Row,
+            }))
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
+                    action: WindowAction::Close,
+                }))
+                .with_style(DecorationStyle {
+                    width: Some(15.5),
+                    height: Some(20.0),
+                    ..Default::default()
+                }),
+                DecorationNode::new(DecorationNodeKind::WindowSlot),
+            ]),
+        );
+        let layout = tree
+            .layout_with_scale(LogicalRect::new(100, 50, 200, 100), 1.5)
+            .expect("layout should succeed");
+        // 15.5 logical at 1.5x = 23.25 -> 23 physical px = 15.333 logical.
+        let button_right = 100.0 + 23.0 / 1.5;
+        assert_eq!(
+            layout.hit_test_at(button_right - 0.01, 60.0),
+            DecorationHitTestResult::Action(WindowAction::Close)
+        );
+        assert_eq!(
+            layout.hit_test_at(button_right + 0.01, 60.0),
+            DecorationHitTestResult::ClientArea
+        );
     }
 
     #[test]

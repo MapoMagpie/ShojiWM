@@ -371,21 +371,21 @@ pub struct EffectEvaluationCacheEntry {
     animating: bool,
 }
 
-type BumpSharedEdgeGeometryMap<'a> =
-    BumpHashMap<&'a str, SharedEdgeNodeGeometry, DefaultHashBuilder, &'a Bump>;
+type BumpNodeGeometryMap<'a> =
+    BumpHashMap<&'a str, NodeGeometry, DefaultHashBuilder, &'a Bump>;
 
-trait SharedEdgeGeometryLookup {
-    fn shared_edge_geometry(&self, stable_id: &str) -> Option<SharedEdgeNodeGeometry>;
+trait NodeGeometryLookup {
+    fn node_geometry(&self, stable_id: &str) -> Option<NodeGeometry>;
 }
 
-impl SharedEdgeGeometryLookup for std::collections::HashMap<String, SharedEdgeNodeGeometry> {
-    fn shared_edge_geometry(&self, stable_id: &str) -> Option<SharedEdgeNodeGeometry> {
+impl NodeGeometryLookup for std::collections::HashMap<String, NodeGeometry> {
+    fn node_geometry(&self, stable_id: &str) -> Option<NodeGeometry> {
         self.get(stable_id).copied()
     }
 }
 
-impl SharedEdgeGeometryLookup for BumpSharedEdgeGeometryMap<'_> {
-    fn shared_edge_geometry(&self, stable_id: &str) -> Option<SharedEdgeNodeGeometry> {
+impl NodeGeometryLookup for BumpNodeGeometryMap<'_> {
+    fn node_geometry(&self, stable_id: &str) -> Option<NodeGeometry> {
         self.get(stable_id).copied()
     }
 }
@@ -770,8 +770,7 @@ pub struct ContentClip {
 
 impl WindowDecorationState {
     pub fn hit_test(&self, point: Point<f64, Logical>) -> DecorationHitTestResult {
-        let logical = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
-        self.layout.hit_test(logical)
+        self.layout.hit_test_at(point.x, point.y)
     }
 
     pub fn managed_window_allows_render(&self) -> bool {
@@ -1139,7 +1138,7 @@ impl ShojiWM {
         self.layout_scale_for_rect_with_visible(Some(rect), None)
     }
 
-    fn decoration_raster_scale_for_window(&self, window: &Window) -> i32 {
+    fn decoration_raster_scale_for_window(&self, window: &Window) -> f64 {
         let visible_outputs = self.visible_outputs_for_window(window);
         let rect = self
             .window_decorations
@@ -1148,7 +1147,7 @@ impl ShojiWM {
         self.raster_scale_for_rect_with_visible(rect, visible_outputs.as_deref())
     }
 
-    fn decoration_raster_scale_for_rect(&self, rect: LogicalRect) -> i32 {
+    fn decoration_raster_scale_for_rect(&self, rect: LogicalRect) -> f64 {
         self.raster_scale_for_rect_with_visible(Some(rect), None)
     }
 
@@ -1194,10 +1193,11 @@ impl ShojiWM {
         &self,
         rect: Option<LogicalRect>,
         visible_outputs: Option<&[String]>,
-    ) -> i32 {
-        self.fold_candidate_scales(rect, visible_outputs, 1, |acc, scale| {
-            acc.max(scale.ceil() as i32)
-        })
+    ) -> f64 {
+        // Decoration text and icons are rasterized at the layout scale itself,
+        // so their buffers cover exactly the physical pixels the layout gave
+        // them instead of being drawn at `ceil(scale)` and resampled down.
+        self.layout_scale_for_rect_with_visible(rect, visible_outputs)
     }
 
     fn fold_candidate_scales<T, F>(
@@ -1296,12 +1296,16 @@ impl ShojiWM {
             decoration.tree = crate::ssd::DecorationTree::new(node);
             if let Ok(layout) = decoration
                 .tree
-                .layout_for_client_with_scale(decoration.client_rect, decoration.layout_scale)
+                .layout_for_client_with_subpixel(
+                    decoration.client_rect,
+                    decoration.layout_scale,
+                    decoration.root_subpixel_offset,
+                )
             {
                 decoration.layout = layout;
-                let shared_edges = build_shared_edge_geometry_map(&decoration.layout);
+                let node_geometry = build_node_geometry_map(&decoration.layout);
                 decoration.content_clip =
-                    content_clip_for_layout(&decoration.tree, &decoration.layout, &shared_edges);
+                    content_clip_for_layout(&decoration.tree, &decoration.layout, &node_geometry);
                 let order_map = build_render_order_map(&decoration.layout);
                 decoration.buffers = build_cached_buffers(&decoration.layout, &order_map);
                 decoration.shader_buffers = build_shader_buffers(&decoration.layout, &order_map);
@@ -3266,10 +3270,19 @@ impl ShojiWM {
                         layout_scale,
                     )?;
                     let layout_started_at = Instant::now();
+                    let layout_subpixel = self
+                        .window_decorations
+                        .get(&window)
+                        .map(|cached| cached.root_subpixel_offset)
+                        .unwrap_or_default();
                     let layout = {
                         timescope::scope!("ssd window layout");
-                        tree.layout_for_client_with_scale(layout_client_rect, layout_scale)
-                            .map_err(super::DecorationEvaluationError::Layout)?
+                        tree.layout_for_client_with_subpixel(
+                            layout_client_rect,
+                            layout_scale,
+                            layout_subpixel,
+                        )
+                        .map_err(super::DecorationEvaluationError::Layout)?
                     };
                     let layout_ms = layout_started_at.elapsed().as_secs_f64() * 1000.0;
                     push_damage_pair(
@@ -3285,8 +3298,8 @@ impl ShojiWM {
                     let clip_started_at = Instant::now();
                     let content_clip = {
                         timescope::scope!("ssd window clip");
-                        let shared_edges = build_shared_edge_geometry_map(&layout);
-                        content_clip_for_layout(&tree, &layout, &shared_edges)
+                        let node_geometry = build_node_geometry_map(&layout);
+                        content_clip_for_layout(&tree, &layout, &node_geometry)
                     };
                     let clip_ms = clip_started_at.elapsed().as_secs_f64() * 1000.0;
                     let order_started_at = Instant::now();
@@ -3486,9 +3499,10 @@ impl ShojiWM {
                             timescope::scope!("ssd window layout");
                             cached
                                 .tree
-                                .layout_for_client_with_scale(
+                                .layout_for_client_with_subpixel(
                                     cached_effective_client_rect,
                                     layout_scale,
+                                    cached.root_subpixel_offset,
                                 )
                                 .map_err(super::DecorationEvaluationError::Layout)?
                         };
@@ -3505,11 +3519,11 @@ impl ShojiWM {
                         let clip_started_at = Instant::now();
                         {
                             timescope::scope!("ssd window clip");
-                            let shared_edges = build_shared_edge_geometry_map(&cached.layout);
+                            let node_geometry = build_node_geometry_map(&cached.layout);
                             cached.content_clip = content_clip_for_layout(
                                 &cached.tree,
                                 &cached.layout,
-                                &shared_edges,
+                                &node_geometry,
                             );
                         }
                         let clip_ms = clip_started_at.elapsed().as_secs_f64() * 1000.0;
@@ -3988,18 +4002,17 @@ impl ShojiWM {
                                         &mut cached.layout.root,
                                         &cached.tree.root,
                                         None,
-                                        cached.layout_scale,
                                     );
-                                    cached.layout.root.sync_root_bounds(cached.layout_scale);
+                                    cached.layout.root.sync_root_bounds();
                                 }
                                 {
                                     timescope::scope!("ssd window clip");
-                                    let shared_edges =
-                                        build_shared_edge_geometry_map(&cached.layout);
+                                    let node_geometry =
+                                        build_node_geometry_map(&cached.layout);
                                     cached.content_clip = content_clip_for_layout(
                                         &cached.tree,
                                         &cached.layout,
-                                        &shared_edges,
+                                        &node_geometry,
                                     );
                                 }
                                 let order_map = {
@@ -4120,9 +4133,10 @@ impl ShojiWM {
                                     timescope::scope!("ssd window layout");
                                     cached
                                         .tree
-                                        .layout_for_client_with_scale(
+                                        .layout_for_client_with_subpixel(
                                             layout_client_rect,
                                             layout_scale,
+                                            cached.root_subpixel_offset,
                                         )
                                         .map_err(super::DecorationEvaluationError::Layout)?
                                 };
@@ -4131,12 +4145,12 @@ impl ShojiWM {
                                 client_rect_potentially_stale = has_active_animation;
                                 {
                                     timescope::scope!("ssd window clip");
-                                    let shared_edges =
-                                        build_shared_edge_geometry_map(&cached.layout);
+                                    let node_geometry =
+                                        build_node_geometry_map(&cached.layout);
                                     cached.content_clip = content_clip_for_layout(
                                         &cached.tree,
                                         &cached.layout,
-                                        &shared_edges,
+                                        &node_geometry,
                                     );
                                 }
                                 let order_map = {
@@ -4385,7 +4399,7 @@ impl ShojiWM {
                     .closing_window_snapshots
                     .get(&window_id)
                     .map(|closing| self.decoration_raster_scale_for_rect(closing.live.rect))
-                    .unwrap_or(1);
+                    .unwrap_or(1.0);
                 if let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) {
                     let previous_root = transformed_root_rect(
                         closing.decoration.layout.root.rect,
@@ -4456,11 +4470,11 @@ impl ShojiWM {
                                             closing.decoration.layout_scale,
                                         )
                                         .map_err(super::DecorationEvaluationError::Layout)?;
-                                    let shared_edges = build_shared_edge_geometry_map(&layout);
+                                    let node_geometry = build_node_geometry_map(&layout);
                                     let content_clip = content_clip_for_layout(
                                         &closing.decoration.tree,
                                         &layout,
-                                        &shared_edges,
+                                        &node_geometry,
                                     );
                                     let order_map = build_render_order_map(&layout);
                                     closing.decoration.layout = layout;
@@ -4570,19 +4584,14 @@ impl ShojiWM {
                                 &mut closing.decoration.layout.root,
                                 &closing.decoration.tree.root,
                                 None,
-                                closing.decoration.layout_scale,
                             );
-                            closing
-                                .decoration
-                                .layout
-                                .root
-                                .sync_root_bounds(closing.decoration.layout_scale);
-                            let shared_edges =
-                                build_shared_edge_geometry_map(&closing.decoration.layout);
+                            closing.decoration.layout.root.sync_root_bounds();
+                            let node_geometry =
+                                build_node_geometry_map(&closing.decoration.layout);
                             closing.decoration.content_clip = content_clip_for_layout(
                                 &closing.decoration.tree,
                                 &closing.decoration.layout,
-                                &shared_edges,
+                                &node_geometry,
                             );
                             let order_map = build_render_order_map(&closing.decoration.layout);
                             if dirty_node_ids.is_empty() {
@@ -4660,11 +4669,11 @@ impl ShojiWM {
                                     closing.decoration.layout_scale,
                                 )
                                 .map_err(super::DecorationEvaluationError::Layout)?;
-                            let shared_edges = build_shared_edge_geometry_map(&layout);
+                            let node_geometry = build_node_geometry_map(&layout);
                             let content_clip = content_clip_for_layout(
                                 &closing.decoration.tree,
                                 &layout,
-                                &shared_edges,
+                                &node_geometry,
                             );
                             let order_map = build_render_order_map(&layout);
                             let buffers = build_cached_buffers(&layout, &order_map);
@@ -4722,11 +4731,11 @@ impl ShojiWM {
                                         closing.decoration.layout_scale,
                                     )
                                     .map_err(super::DecorationEvaluationError::Layout)?;
-                                let shared_edges = build_shared_edge_geometry_map(&layout);
+                                let node_geometry = build_node_geometry_map(&layout);
                                 let content_clip = content_clip_for_layout(
                                     &closing.decoration.tree,
                                     &layout,
-                                    &shared_edges,
+                                    &node_geometry,
                                 );
                                 let order_map = build_render_order_map(&layout);
                                 closing.decoration.layout = layout;
@@ -4884,7 +4893,7 @@ impl ShojiWM {
                 })
                 .collect::<std::collections::HashMap<_, _>>();
             for (window_id, closing) in self.closing_window_snapshots.iter_mut() {
-                let closing_raster_scale = *closing_scales.get(window_id).unwrap_or(&1);
+                let closing_raster_scale = *closing_scales.get(window_id).unwrap_or(&1.0);
                 let order_map = build_render_order_map(&closing.decoration.layout);
                 closing.decoration.buffers =
                     build_cached_buffers(&closing.decoration.layout, &order_map);
@@ -5085,11 +5094,9 @@ impl ShojiWM {
                     decoration.layout.root.rect,
                     decoration.visual_transform,
                 );
-                let local_logical =
-                    LogicalPoint::new(local_point.x.floor() as i32, local_point.y.floor() as i32);
                 decoration
                     .layout
-                    .interaction_target_at(local_logical)
+                    .interaction_target_at_precise(local_point.x, local_point.y)
                     .map(|target| (window.clone(), target))
             })?
         })
@@ -5302,6 +5309,20 @@ impl ShojiWM {
                 }
             }
 
+            // A sub-pixel change of the root *size* moves the root's far edge
+            // by a physical pixel without changing any integer rect: relayout
+            // so the decoration follows (the client slot absorbs it).
+            let subpixel_size_changed = force_rect_size
+                && self.window_decorations.get(&window).is_some_and(|decoration| {
+                    decoration.layout.root.frame.root_extra_px
+                        != root_subpixel_extra_px(
+                            current_root.width,
+                            current_root.height,
+                            decoration.root_subpixel_offset,
+                            decoration.layout_scale,
+                        )
+                });
+
             // When an Override rect animation is in flight we want the client
             // configured at its **final** target size — not the animated
             // intermediate — so its buffer arrives at the right resolution
@@ -5359,7 +5380,7 @@ impl ShojiWM {
             let should_configure =
                 configure_size_changed || needs_xdg_state_configure || tiled_state_changed;
 
-            if desired_root == current_root && !should_configure {
+            if desired_root == current_root && !should_configure && !subpixel_size_changed {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
                 if managed_rect_debug_enabled() {
                     info!(
@@ -5401,7 +5422,7 @@ impl ShojiWM {
                 }
             };
 
-            if desired_client == current_client && !should_configure {
+            if desired_client == current_client && !should_configure && !subpixel_size_changed {
                 record_managed_rect_path_event(ManagedRectPathEvent::ApplyNoop);
                 if managed_rect_debug_enabled() {
                     info!(
@@ -5522,7 +5543,7 @@ impl ShojiWM {
                         .remove(&window_id);
                 }
             }
-            if size_changed {
+            if size_changed || subpixel_size_changed {
                 timescope::scope!("ssd apply managed size rebuild");
                 let window_raster_scale = self.decoration_raster_scale_for_window(&window);
                 if force_rect_size
@@ -5534,7 +5555,11 @@ impl ShojiWM {
                         timescope::scope!("ssd apply managed size layout");
                         decoration
                             .tree
-                            .layout_for_client_with_scale(desired_client, decoration.layout_scale)
+                            .layout_for_client_with_subpixel(
+                                desired_client,
+                                decoration.layout_scale,
+                                decoration.root_subpixel_offset,
+                            )
                             .map_err(super::DecorationEvaluationError::Layout)
                             .ok()
                     };
@@ -5542,15 +5567,15 @@ impl ShojiWM {
                         let (content_clip, buffers, shader_buffers, text_buffers, icon_buffers) = {
                             timescope::scope!("ssd apply managed size buffers");
                             let arena = Bump::new();
-                            let shared_edges = build_shared_edge_geometry_map_in(&layout, &arena);
+                            let node_geometry = build_node_geometry_map_in(&layout, &arena);
                             let content_clip =
-                                content_clip_for_layout(&decoration.tree, &layout, &shared_edges);
+                                content_clip_for_layout(&decoration.tree, &layout, &node_geometry);
                             let order_map = build_render_order_map(&layout);
                             let (buffers, mut shader_buffers) = build_cached_buffers_and_shaders(
                                 &layout,
                                 &order_map,
                                 None,
-                                &shared_edges,
+                                &node_geometry,
                             );
                             freeze_manual_shader_buffers(
                                 &previous_shader_buffers,
@@ -5560,33 +5585,33 @@ impl ShojiWM {
                                 timescope::scope!("ssd apply managed size text buffers");
                                 if text_buffers_need_raster_for_layout(
                                     &layout,
-                                    &shared_edges,
+                                    &node_geometry,
                                     &previous_text_buffers,
                                     window_raster_scale,
                                 ) {
-                                    build_text_buffers_with_shared_edges(
+                                    build_text_buffers_with_node_geometry(
                                         &layout,
                                         &order_map,
-                                        &shared_edges,
+                                        &node_geometry,
                                         window_raster_scale,
                                         &mut self.text_rasterizer,
                                         &previous_text_buffers,
                                     )
                                 } else {
-                                    retarget_text_buffers_with_shared_edges(
+                                    retarget_text_buffers_with_node_geometry(
                                         &layout,
                                         &order_map,
-                                        &shared_edges,
+                                        &node_geometry,
                                         &previous_text_buffers,
                                     )
                                 }
                             };
                             let icon_buffers = {
                                 timescope::scope!("ssd apply managed size icon buffers");
-                                retarget_icon_buffers_with_shared_edges(
+                                retarget_icon_buffers_with_node_geometry(
                                     &layout,
                                     &order_map,
-                                    &shared_edges,
+                                    &node_geometry,
                                     &decoration.snapshot,
                                     &decoration.icon_buffers,
                                 )
@@ -5623,7 +5648,7 @@ impl ShojiWM {
                 desired_root.width,
                 desired_root.height,
             ));
-            if size_changed {
+            if size_changed || subpixel_size_changed {
                 self.snapshot_dirty_window_ids.insert(window_id);
             }
             self.window_scene_generation = self.window_scene_generation.wrapping_add(1);
@@ -5662,7 +5687,7 @@ impl ShojiWM {
                 .closing_window_snapshots
                 .get(&window_id)
                 .map(|closing| self.decoration_raster_scale_for_rect(closing.live.rect))
-                .unwrap_or(1);
+                .unwrap_or(1.0);
 
             let Some(closing) = self.closing_window_snapshots.get_mut(&window_id) else {
                 continue;
@@ -5729,9 +5754,9 @@ impl ShojiWM {
                         continue;
                     }
                 };
-                let shared_edges = build_shared_edge_geometry_map(&layout);
+                let node_geometry = build_node_geometry_map(&layout);
                 let content_clip =
-                    content_clip_for_layout(&closing.decoration.tree, &layout, &shared_edges);
+                    content_clip_for_layout(&closing.decoration.tree, &layout, &node_geometry);
                 let order_map = build_render_order_map(&layout);
                 let mut shader_buffers = build_shader_buffers(&layout, &order_map);
                 freeze_manual_shader_buffers(&previous_shader_buffers, &mut shader_buffers);
@@ -5844,9 +5869,16 @@ fn retain_effect_texture_cache_for_live_ids<T>(
 fn content_clip_for_layout(
     _tree: &DecorationTree,
     layout: &ComputedDecorationTree,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
 ) -> Option<ContentClip> {
-    slot_content_clip_for_node(&layout.root, None, None, shared_edges)
+    let mut clip = slot_content_clip_for_node(&layout.root, None, None, node_geometry)?;
+    if let Some(slot) = layout.window_slot_rect() {
+        clip.rect = Rectangle::new(
+            Point::from((slot.x, slot.y)),
+            (slot.width, slot.height).into(),
+        );
+    }
+    Some(clip)
 }
 
 /// Snap an animated rect's edges to the physical pixel grid (multiples of
@@ -6243,13 +6275,13 @@ fn managed_client_rect_for_root(
             )
             .map_err(super::DecorationEvaluationError::Layout)?
         };
-        let shared_edges = {
-            timescope::scope!("ssd managed client rect probe shared edges");
-            build_shared_edge_geometry_map(&probe_layout)
+        let node_geometry = {
+            timescope::scope!("ssd managed client rect probe node geometry");
+            build_node_geometry_map(&probe_layout)
         };
         let content_clip = {
             timescope::scope!("ssd managed client rect probe content clip");
-            let Some(content_clip) = content_clip_for_layout(tree, &probe_layout, &shared_edges)
+            let Some(content_clip) = content_clip_for_layout(tree, &probe_layout, &node_geometry)
             else {
                 return Ok(desired_root);
             };
@@ -6290,13 +6322,13 @@ fn managed_client_rect_for_root(
         )
         .map_err(super::DecorationEvaluationError::Layout)?
     };
-    let shared_edges = {
-        timescope::scope!("ssd managed client rect final shared edges");
-        build_shared_edge_geometry_map(&final_layout)
+    let node_geometry = {
+        timescope::scope!("ssd managed client rect final node geometry");
+        build_node_geometry_map(&final_layout)
     };
     let content_clip = {
         timescope::scope!("ssd managed client rect final content clip");
-        let Some(content_clip) = content_clip_for_layout(tree, &final_layout, &shared_edges) else {
+        let Some(content_clip) = content_clip_for_layout(tree, &final_layout, &node_geometry) else {
             return Ok(desired_root);
         };
         content_clip
@@ -6341,29 +6373,17 @@ fn fit_children_inner_hole_rect(
     node: &super::ComputedDecorationNode,
     border_width: i32,
 ) -> LogicalRect {
-    let fallback_inner_rect = node.rect.inset(super::Edges {
-        top: border_width,
-        right: border_width,
-        bottom: border_width,
-        left: border_width,
-    });
+    let fallback_inner_rect = node.rect.inset_uniform(border_width);
 
-    let inner_rect = fit_children_inner_clip_resolved(node)
-        .map(|clip| clip.rect.round_to_logical_rect())
-        .unwrap_or_else(|| node.resolved_content_rect.round_to_logical_rect());
+    let inner_rect = node.frame.logical_rect(
+        fit_children_inner_clip_resolved(node)
+            .map(|clip| clip.rect)
+            .unwrap_or(node.resolved_content_rect),
+    );
     if inner_rect.width <= 0 || inner_rect.height <= 0 {
         fallback_inner_rect
     } else {
         inner_rect
-    }
-}
-
-fn precise_rect_from_resolved(rect: crate::ssd::ResolvedLogicalRect) -> PreciseLogicalRect {
-    PreciseLogicalRect {
-        x: rect.x.to_f32(),
-        y: rect.y.to_f32(),
-        width: rect.width.to_f32(),
-        height: rect.height.to_f32(),
     }
 }
 
@@ -6386,23 +6406,24 @@ fn fit_children_inner_clip_logical(
         return None;
     }
     node.style.border?;
-    let border_width = node.resolved_border_width.round_to_i32().max(0);
+    let border_width = node.frame.logical_len_rounded(node.resolved_border_width).max(0);
     let rect = fit_children_inner_hole_rect(node, border_width);
     if rect.width <= 0 || rect.height <= 0 {
         return None;
     }
     Some(super::DecorationClip {
         rect,
-        radius: (node.resolved_border_radius - node.resolved_border_width)
-            .round_to_i32()
+        radius: node
+            .frame
+            .logical_len_rounded(node.resolved_border_radius - node.resolved_border_width)
             .max(0),
     })
 }
 
 fn normal_border_inner_rect(node: &super::ComputedDecorationNode) -> Option<LogicalRect> {
     node.style.border?;
-    let border_width = node.resolved_border_width.round_to_i32().max(0);
-    let rect = node.rect.inset(super::Edges::all(border_width));
+    let border_width = node.frame.logical_len_rounded(node.resolved_border_width).max(0);
+    let rect = node.rect.inset_uniform(border_width);
     (rect.width > 0 && rect.height > 0).then_some(rect)
 }
 
@@ -6411,13 +6432,10 @@ fn normal_border_inner_rect_precise(
 ) -> Option<PreciseLogicalRect> {
     node.style.border?;
     let border_width = node.resolved_border_width;
-    let rect = node.resolved_rect.inset(super::ResolvedLayoutEdges {
-        top: border_width,
-        right: border_width,
-        bottom: border_width,
-        left: border_width,
-    });
-    (rect.width.raw() > 0 && rect.height.raw() > 0).then(|| precise_rect_from_resolved(rect))
+    let rect = node
+        .resolved_rect
+        .inset(super::ResolvedLayoutEdges::all(border_width));
+    (rect.width.raw() > 0 && rect.height.raw() > 0).then(|| node.frame.precise_rect(rect))
 }
 
 fn node_child_mask_resolved(
@@ -6430,15 +6448,15 @@ fn slot_content_clip_for_node(
     node: &super::ComputedDecorationNode,
     nearest_border: Option<(i32, i32)>,
     nearest_mask: Option<crate::ssd::ResolvedDecorationClip>,
-    _shared_edges: &impl SharedEdgeGeometryLookup,
+    _node_geometry: &impl NodeGeometryLookup,
 ) -> Option<ContentClip> {
     let next_border = if matches!(node.kind, super::DecorationNodeKind::WindowBorder) {
         node.style
             .border
-            .map(|border| {
+            .map(|_| {
                 (
-                    border.width.max(0),
-                    node.style.border_radius.unwrap_or(0).max(0),
+                    node.frame.logical_len_rounded(node.resolved_border_width),
+                    node.frame.logical_len_rounded(node.resolved_border_radius),
                 )
             })
             .or(nearest_border)
@@ -6463,35 +6481,30 @@ fn slot_content_clip_for_node(
                     radius: (node.resolved_border_radius - node.resolved_border_width)
                         .max(crate::ssd::ResolvedLayoutValue::ZERO),
                 });
+        let frame = node.frame;
         let slot_rect = node.resolved_rect;
-        let slot_rect_precise = precise_rect_from_resolved(slot_rect);
+        let slot_rect_precise = frame.precise_rect(slot_rect);
         let clips_surface = next_mask.is_some();
         let mask = next_mask.unwrap_or(inherited_clip);
-        let mask_rect_precise = precise_rect_from_resolved(mask.rect);
+        let mask_rect_precise = frame.precise_rect(mask.rect);
         let corner_radii_precise = if mask.radius.raw() > 0 {
-            [mask.radius.to_f32().max(0.0); 4]
+            [frame.logical_len(mask.radius).max(0.0); 4]
         } else {
             [0.0; 4]
         };
         let corner_radii = corner_radii_precise.map(|radius| radius.round().max(0.0) as i32);
+        let slot_logical = frame.logical_rect(slot_rect);
+        let mask_logical = frame.logical_rect(mask.rect);
         return Some(ContentClip {
             rect: Rectangle::new(
-                Point::from((slot_rect.x.round_to_i32(), slot_rect.y.round_to_i32())),
-                (
-                    slot_rect.width.round_to_i32(),
-                    slot_rect.height.round_to_i32(),
-                )
-                    .into(),
+                Point::from((slot_logical.x, slot_logical.y)),
+                (slot_logical.width, slot_logical.height).into(),
             ),
             rect_precise: slot_rect_precise,
             clips_surface,
             mask_rect: Rectangle::new(
-                Point::from((mask.rect.x.round_to_i32(), mask.rect.y.round_to_i32())),
-                (
-                    mask.rect.width.round_to_i32(),
-                    mask.rect.height.round_to_i32(),
-                )
-                    .into(),
+                Point::from((mask_logical.x, mask_logical.y)),
+                (mask_logical.width, mask_logical.height).into(),
             ),
             mask_rect_precise,
             // Client surfaces should stay rectangular inside the reserved slot.
@@ -6507,7 +6520,7 @@ fn slot_content_clip_for_node(
 
     node.children
         .iter()
-        .find_map(|child| slot_content_clip_for_node(child, next_border, next_mask, _shared_edges))
+        .find_map(|child| slot_content_clip_for_node(child, next_border, next_mask, _node_geometry))
 }
 
 impl DecorationTree {
@@ -6524,10 +6537,25 @@ impl DecorationTree {
         client_rect: LogicalRect,
         scale: f64,
     ) -> Result<ComputedDecorationTree, super::DecorationLayoutError> {
+        self.layout_for_client_with_subpixel(client_rect, scale, Default::default())
+    }
+
+    /// `layout_for_client_with_scale` for a root whose managed rect has
+    /// sub-logical-pixel edges (`subpixel`): the root's physical size becomes
+    /// `round((width + right - left) · scale)`, so a rect animation resizes the
+    /// window in physical-pixel steps. The client slot absorbs the difference;
+    /// the logical rects keep the integer size.
+    pub(crate) fn layout_for_client_with_subpixel(
+        &self,
+        client_rect: LogicalRect,
+        scale: f64,
+        subpixel: crate::backend::visual::RootSubpixelEdges,
+    ) -> Result<ComputedDecorationTree, super::DecorationLayoutError> {
         let initial = self.layout_with_window_slot_size(
             LogicalRect::new(0, 0, client_rect.width, client_rect.height),
             Some((client_rect.width, client_rect.height)),
             scale,
+            (0, 0),
         )?;
         let slot = initial
             .window_slot_rect()
@@ -6539,15 +6567,13 @@ impl DecorationTree {
         let extra_right = (initial_bounds.x + initial_bounds.width) - (slot.x + slot.width);
         let extra_bottom = (initial_bounds.y + initial_bounds.height) - (slot.y + slot.height);
 
+        let root_width = client_rect.width + extra_left + extra_right;
+        let root_height = client_rect.height + extra_top + extra_bottom;
         let desired = self.layout_with_window_slot_size(
-            LogicalRect::new(
-                0,
-                0,
-                client_rect.width + extra_left + extra_right,
-                client_rect.height + extra_top + extra_bottom,
-            ),
+            LogicalRect::new(0, 0, root_width, root_height),
             Some((client_rect.width, client_rect.height)),
             scale,
+            root_subpixel_extra_px(root_width, root_height, subpixel, scale),
         )?;
 
         let desired_slot = desired
@@ -6565,18 +6591,43 @@ impl DecorationTree {
         bounds: LogicalRect,
         window_slot_size: Option<(i32, i32)>,
         scale: f64,
+        root_extra_px: (i32, i32),
     ) -> Result<ComputedDecorationTree, super::DecorationLayoutError> {
         self.validate()?;
 
-        let mut root =
-            super::layout_node_with_scale(&self.root, bounds, None, window_slot_size, scale)?;
-        root.sync_root_bounds(scale);
+        let mut root = super::layout_node_with_scale(
+            &self.root,
+            bounds,
+            window_slot_size,
+            scale,
+            root_extra_px,
+        )?;
+        root.sync_root_bounds();
         if root.window_slot_rect().is_none() {
             return Err(super::DecorationLayoutError::MissingComputedWindowSlot);
         }
 
         Ok(ComputedDecorationTree { root })
     }
+}
+
+/// Physical pixels a root of integer logical size `width × height` gains from
+/// its managed rect's sub-logical-pixel edges.
+fn root_subpixel_extra_px(
+    width: i32,
+    height: i32,
+    subpixel: crate::backend::visual::RootSubpixelEdges,
+    scale: f64,
+) -> (i32, i32) {
+    let scale = scale.abs().max(0.0001);
+    let extra = |len: i32, start: f64, end: f64| {
+        super::round_half_up((len as f64 + end - start) * scale)
+            - super::round_half_up(len as f64 * scale)
+    };
+    (
+        extra(width, subpixel.left, subpixel.right),
+        extra(height, subpixel.top, subpixel.bottom),
+    )
 }
 
 impl ComputedDecorationTree {
@@ -6588,6 +6639,8 @@ impl ComputedDecorationTree {
 }
 
 impl super::ComputedDecorationNode {
+    /// Moves the node by whole logical pixels. The physical-pixel layout is
+    /// root-local, so only the frame origin and the logical views shift.
     fn translated(&self, dx: i32, dy: i32) -> Self {
         Self {
             stable_id: self.stable_id.clone(),
@@ -6601,18 +6654,8 @@ impl super::ComputedDecorationNode {
                 self.rect.width,
                 self.rect.height,
             ),
-            resolved_rect: crate::ssd::ResolvedLogicalRect {
-                x: self.resolved_rect.x + crate::ssd::ResolvedLayoutValue::from_i32(dx),
-                y: self.resolved_rect.y + crate::ssd::ResolvedLayoutValue::from_i32(dy),
-                width: self.resolved_rect.width,
-                height: self.resolved_rect.height,
-            },
-            resolved_content_rect: crate::ssd::ResolvedLogicalRect {
-                x: self.resolved_content_rect.x + crate::ssd::ResolvedLayoutValue::from_i32(dx),
-                y: self.resolved_content_rect.y + crate::ssd::ResolvedLayoutValue::from_i32(dy),
-                width: self.resolved_content_rect.width,
-                height: self.resolved_content_rect.height,
-            },
+            resolved_rect: self.resolved_rect,
+            resolved_content_rect: self.resolved_content_rect,
             resolved_border_width: self.resolved_border_width,
             resolved_border_radius: self.resolved_border_radius,
             effective_clip: self.effective_clip.map(|clip| super::DecorationClip {
@@ -6624,17 +6667,8 @@ impl super::ComputedDecorationNode {
                 ),
                 radius: clip.radius,
             }),
-            resolved_effective_clip: self.resolved_effective_clip.map(|clip| {
-                crate::ssd::ResolvedDecorationClip {
-                    rect: crate::ssd::ResolvedLogicalRect {
-                        x: clip.rect.x + crate::ssd::ResolvedLayoutValue::from_i32(dx),
-                        y: clip.rect.y + crate::ssd::ResolvedLayoutValue::from_i32(dy),
-                        width: clip.rect.width,
-                        height: clip.rect.height,
-                    },
-                    radius: clip.radius,
-                }
-            }),
+            resolved_effective_clip: self.resolved_effective_clip,
+            frame: self.frame.translated(dx as f64, dy as f64),
             children: self
                 .children
                 .iter()
@@ -6752,8 +6786,8 @@ fn build_cached_buffers(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedDecorationBuffer> {
-    let shared_edges = build_shared_edge_geometry_map(layout);
-    let (buffers, _) = build_cached_buffers_and_shaders(layout, order_map, None, &shared_edges);
+    let node_geometry = build_node_geometry_map(layout);
+    let (buffers, _) = build_cached_buffers_and_shaders(layout, order_map, None, &node_geometry);
     buffers
 }
 
@@ -6761,8 +6795,8 @@ fn build_shader_buffers(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedShaderEffect> {
-    let shared_edges = build_shared_edge_geometry_map(layout);
-    let (_, buffers) = build_cached_buffers_and_shaders(layout, order_map, None, &shared_edges);
+    let node_geometry = build_node_geometry_map(layout);
+    let (_, buffers) = build_cached_buffers_and_shaders(layout, order_map, None, &node_geometry);
     buffers
 }
 
@@ -6770,7 +6804,7 @@ fn build_cached_buffers_and_shaders(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
 ) -> (Vec<CachedDecorationBuffer>, Vec<CachedShaderEffect>) {
     let mut buffers = Vec::new();
     let mut shader_buffers = Vec::new();
@@ -6786,7 +6820,7 @@ fn build_cached_buffers_and_shaders(
         None,
         order_map,
         dirty_node_ids,
-        shared_edges,
+        node_geometry,
         &mut buffers,
         &mut shader_buffers,
     );
@@ -6802,26 +6836,26 @@ fn suggested_window_offset(layout: &ComputedDecorationTree) -> Option<(i32, i32)
 fn build_text_buffers_with_fallback(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    raster_scale: i32,
+    raster_scale: f64,
     rasterizer: &mut crate::backend::text::TextRasterizer,
     previous: &[CachedDecorationLabel],
 ) -> Vec<CachedDecorationLabel> {
-    let shared_edges = build_shared_edge_geometry_map(layout);
-    build_text_buffers_with_shared_edges(
+    let node_geometry = build_node_geometry_map(layout);
+    build_text_buffers_with_node_geometry(
         layout,
         order_map,
-        &shared_edges,
+        &node_geometry,
         raster_scale,
         rasterizer,
         previous,
     )
 }
 
-fn build_text_buffers_with_shared_edges(
+fn build_text_buffers_with_node_geometry(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
-    raster_scale: i32,
+    node_geometry: &impl NodeGeometryLookup,
+    raster_scale: f64,
     rasterizer: &mut crate::backend::text::TextRasterizer,
     previous: &[CachedDecorationLabel],
 ) -> Vec<CachedDecorationLabel> {
@@ -6831,7 +6865,7 @@ fn build_text_buffers_with_shared_edges(
         "root".into(),
         order_map,
         None,
-        shared_edges,
+        node_geometry,
         raster_scale,
         rasterizer,
         previous,
@@ -6843,26 +6877,26 @@ fn build_text_buffers_with_shared_edges(
 fn build_icon_buffers(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    raster_scale: i32,
+    raster_scale: f64,
     snapshot: &WaylandWindowSnapshot,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
 ) -> Vec<CachedDecorationIcon> {
-    let shared_edges = build_shared_edge_geometry_map(layout);
-    build_icon_buffers_with_shared_edges(
+    let node_geometry = build_node_geometry_map(layout);
+    build_icon_buffers_with_node_geometry(
         layout,
         order_map,
-        &shared_edges,
+        &node_geometry,
         raster_scale,
         snapshot,
         rasterizer,
     )
 }
 
-fn build_icon_buffers_with_shared_edges(
+fn build_icon_buffers_with_node_geometry(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
-    raster_scale: i32,
+    node_geometry: &impl NodeGeometryLookup,
+    raster_scale: f64,
     snapshot: &WaylandWindowSnapshot,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
 ) -> Vec<CachedDecorationIcon> {
@@ -6872,7 +6906,7 @@ fn build_icon_buffers_with_shared_edges(
         "root".into(),
         order_map,
         None,
-        shared_edges,
+        node_geometry,
         raster_scale,
         snapshot,
         rasterizer,
@@ -6881,10 +6915,10 @@ fn build_icon_buffers_with_shared_edges(
     buffers
 }
 
-fn retarget_text_buffers_with_shared_edges(
+fn retarget_text_buffers_with_node_geometry(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     previous: &[CachedDecorationLabel],
 ) -> Vec<CachedDecorationLabel> {
     let mut buffers = Vec::new();
@@ -6892,7 +6926,7 @@ fn retarget_text_buffers_with_shared_edges(
         &layout.root,
         "root".into(),
         order_map,
-        shared_edges,
+        node_geometry,
         previous,
         &mut buffers,
     );
@@ -6903,7 +6937,7 @@ fn collect_retargeted_text_buffers(
     node: &super::ComputedDecorationNode,
     path: String,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     previous: &[CachedDecorationLabel],
     buffers: &mut Vec<CachedDecorationLabel>,
 ) {
@@ -6916,7 +6950,7 @@ fn collect_retargeted_text_buffers(
             child,
             format!("{path}/child-{index}"),
             order_map,
-            shared_edges,
+            node_geometry,
             previous,
             buffers,
         );
@@ -6934,19 +6968,19 @@ fn collect_retargeted_text_buffers(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
     let rect_precise = shared_geometry
         .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect));
+        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
     let clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
             node.resolved_effective_clip
-                .map(|clip| precise_rect_from_resolved(clip.rect))
+                .map(|clip| node.frame.precise_rect(clip.rect))
         });
     let clip_radius_precise = node
         .resolved_effective_clip
-        .map(|clip| clip.radius.to_f32().max(0.0));
+        .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
 
     buffer.owner_node_id = node.stable_id.clone();
     buffer.stable_key = stable_key.clone();
@@ -6966,10 +7000,10 @@ fn collect_retargeted_text_buffers(
     buffers.push(buffer);
 }
 
-fn retarget_icon_buffers_with_shared_edges(
+fn retarget_icon_buffers_with_node_geometry(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     snapshot: &WaylandWindowSnapshot,
     previous: &[CachedDecorationIcon],
 ) -> Vec<CachedDecorationIcon> {
@@ -6978,7 +7012,7 @@ fn retarget_icon_buffers_with_shared_edges(
         &layout.root,
         "root".into(),
         order_map,
-        shared_edges,
+        node_geometry,
         snapshot,
         previous,
         &mut buffers,
@@ -6990,7 +7024,7 @@ fn collect_retargeted_icon_buffers(
     node: &super::ComputedDecorationNode,
     path: String,
     order_map: &std::collections::HashMap<String, usize>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     snapshot: &WaylandWindowSnapshot,
     previous: &[CachedDecorationIcon],
     buffers: &mut Vec<CachedDecorationIcon>,
@@ -7004,7 +7038,7 @@ fn collect_retargeted_icon_buffers(
             child,
             format!("{path}/child-{index}"),
             order_map,
-            shared_edges,
+            node_geometry,
             snapshot,
             previous,
             buffers,
@@ -7026,19 +7060,19 @@ fn collect_retargeted_icon_buffers(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
     let rect_precise = shared_geometry
         .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect));
+        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
     let clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
             node.resolved_effective_clip
-                .map(|clip| precise_rect_from_resolved(clip.rect))
+                .map(|clip| node.frame.precise_rect(clip.rect))
         });
     let clip_radius_precise = node
         .resolved_effective_clip
-        .map(|clip| clip.radius.to_f32().max(0.0));
+        .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
 
     buffer.owner_node_id = node.stable_id.clone();
     buffer.stable_key = stable_key.clone();
@@ -7096,15 +7130,15 @@ fn rebuild_partial_buffers(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    let shared_edges = build_shared_edge_geometry_map(layout);
-    build_cached_buffers_and_shaders(layout, order_map, Some(&dirty_node_ids), &shared_edges)
+    let node_geometry = build_node_geometry_map(layout);
+    build_cached_buffers_and_shaders(layout, order_map, Some(&dirty_node_ids), &node_geometry)
 }
 
 fn rebuild_partial_text_buffers_with_fallback(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: &[String],
-    raster_scale: i32,
+    raster_scale: f64,
     rasterizer: &mut crate::backend::text::TextRasterizer,
     previous: &[CachedDecorationLabel],
 ) -> Vec<CachedDecorationLabel> {
@@ -7112,14 +7146,14 @@ fn rebuild_partial_text_buffers_with_fallback(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    let shared_edges = build_shared_edge_geometry_map(layout);
+    let node_geometry = build_node_geometry_map(layout);
     let mut buffers = Vec::new();
     collect_text_buffers(
         &layout.root,
         "root".into(),
         order_map,
         Some(&dirty_node_ids),
-        &shared_edges,
+        &node_geometry,
         raster_scale,
         rasterizer,
         previous,
@@ -7132,7 +7166,7 @@ fn rebuild_partial_icon_buffers(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: &[String],
-    raster_scale: i32,
+    raster_scale: f64,
     snapshot: &WaylandWindowSnapshot,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
 ) -> Vec<CachedDecorationIcon> {
@@ -7140,14 +7174,14 @@ fn rebuild_partial_icon_buffers(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    let shared_edges = build_shared_edge_geometry_map(layout);
+    let node_geometry = build_node_geometry_map(layout);
     let mut buffers = Vec::new();
     collect_icon_buffers(
         &layout.root,
         "root".into(),
         order_map,
         Some(&dirty_node_ids),
-        &shared_edges,
+        &node_geometry,
         raster_scale,
         snapshot,
         rasterizer,
@@ -7334,7 +7368,7 @@ fn collect_render_orders(
 
     if let Some(border) = node.style.border {
         let color = border.color.with_opacity(node.style.opacity);
-        if color.a > 0 && border.width > 0 {
+        if color.a > 0 && border.width > 0.0 {
             map.insert(format!("{path}:border"), *order);
             *order += 1;
         }
@@ -7378,7 +7412,7 @@ fn collect_cached_buffers(
     nearest_rounded_clip_radius_precise: Option<f32>,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     buffers: &mut Vec<CachedDecorationBuffer>,
     shader_buffers: &mut Vec<CachedShaderEffect>,
 ) {
@@ -7394,15 +7428,15 @@ fn collect_cached_buffers(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
 
-    let node_radius = node.resolved_border_radius.round_to_i32().max(0);
+    let node_radius = node.frame.logical_len_rounded(node.resolved_border_radius).max(0);
     let current_clip_rect = ancestor_clip.map(|clip| clip.rect);
     let current_clip_radius = ancestor_clip.map(|clip| clip.radius).unwrap_or(0);
     let current_clip_rect_precise = ancestor_clip_rect_precise
-        .or_else(|| ancestor_resolved_clip.map(|clip| precise_rect_from_resolved(clip.rect)));
+        .or_else(|| ancestor_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)));
     let current_clip_radius_precise = ancestor_clip_radius_precise
-        .or_else(|| ancestor_resolved_clip.map(|clip| clip.radius.to_f32().max(0.0)));
+        .or_else(|| ancestor_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0)));
     let border_fit = node.style.effective_border_fit(&node.kind);
     let fit_children = matches!(border_fit, super::BorderFit::FitChildren);
     let fit_children_inner_clip_resolved = if fit_children {
@@ -7411,12 +7445,12 @@ fn collect_cached_buffers(
         None
     };
     let fit_children_inner_clip_precise = if fit_children {
-        fit_children_inner_clip_resolved.map(|clip| precise_rect_from_resolved(clip.rect))
+        fit_children_inner_clip_resolved.map(|clip| node.frame.precise_rect(clip.rect))
     } else {
         None
     };
     let fit_children_inner_radius_precise = if fit_children {
-        fit_children_inner_clip_resolved.map(|clip| clip.radius.to_f32().max(0.0))
+        fit_children_inner_clip_resolved.map(|clip| node.frame.logical_len(clip.radius).max(0.0))
     } else {
         None
     };
@@ -7431,17 +7465,17 @@ fn collect_cached_buffers(
         shared_geometry
             .map(|geometry| geometry.content_rect_precise)
             .or(fit_children_inner_clip_precise)
-            .or_else(|| child_resolved_clip.map(|clip| precise_rect_from_resolved(clip.rect)))
+            .or_else(|| child_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)))
     } else {
         shared_geometry
             .and_then(|geometry| geometry.clip_rect_precise)
-            .or_else(|| child_resolved_clip.map(|clip| precise_rect_from_resolved(clip.rect)))
+            .or_else(|| child_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)))
     };
     let child_clip_radius_precise = if fit_children {
         fit_children_inner_radius_precise
-            .or_else(|| child_resolved_clip.map(|clip| clip.radius.to_f32().max(0.0)))
+            .or_else(|| child_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0)))
     } else {
-        child_resolved_clip.map(|clip| clip.radius.to_f32().max(0.0))
+        child_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0))
     };
     let effective_clip_rect = if current_clip_radius_precise.unwrap_or(0.0) > 0.0 {
         current_clip_rect
@@ -7503,7 +7537,7 @@ fn collect_cached_buffers(
     let border_hole_rect = if fit_children {
         fit_children_inner_clip.map(|clip| clip.rect).or_else(|| {
             node.style.border.map(|_border| {
-                fit_children_inner_hole_rect(node, node.resolved_border_width.round_to_i32().max(0))
+                fit_children_inner_hole_rect(node, node.frame.logical_len_rounded(node.resolved_border_width).max(0))
             })
         })
     } else {
@@ -7515,7 +7549,7 @@ fn collect_cached_buffers(
             .or(fit_children_inner_clip_precise)
             .or_else(|| {
                 (!node.children.is_empty()).then(|| {
-                    precise_rect_from_resolved(
+                    node.frame.precise_rect(
                         fit_children_inner_clip_resolved
                             .map(|clip| clip.rect)
                             .unwrap_or(node.resolved_content_rect),
@@ -7528,14 +7562,14 @@ fn collect_cached_buffers(
     let border_hole_radius = fit_children_inner_clip
         .map(|clip| clip.radius.max(0))
         .unwrap_or_else(|| {
-            (node.resolved_border_radius - node.resolved_border_width)
-                .round_to_i32()
+            node.frame
+                .logical_len_rounded(node.resolved_border_radius - node.resolved_border_width)
                 .max(0)
         });
     let border_hole_radius_precise = fit_children_inner_radius_precise.or_else(|| {
         (node.style.border.is_some()).then(|| {
-            (node.resolved_border_radius - node.resolved_border_width)
-                .to_f32()
+            node.frame
+                .logical_len(node.resolved_border_radius - node.resolved_border_width)
                 .max(0.0)
         })
     });
@@ -7549,7 +7583,7 @@ fn collect_cached_buffers(
             if include_node {
                 if let Some(border) = node.style.border {
                     let color = border.color.with_opacity(node.style.opacity);
-                    if color.a > 0 && border.width > 0 {
+                    if color.a > 0 && border.width > 0.0 {
                         let current_order = *order_map
                             .get(&format!("{path}:border"))
                             .unwrap_or(&usize::MAX);
@@ -7562,7 +7596,7 @@ fn collect_cached_buffers(
                                 shared_geometry
                                     .map(|geometry| geometry.rect_precise)
                                     .unwrap_or_else(|| {
-                                        precise_rect_from_resolved(node.resolved_rect)
+                                        node.frame.precise_rect(node.resolved_rect)
                                     }),
                             ),
                             color,
@@ -7577,8 +7611,8 @@ fn collect_cached_buffers(
                             ),
                             radius: node_radius,
                             radius_precise: (!node.children.is_empty())
-                                .then(|| node.resolved_border_radius.to_f32().max(0.0)),
-                            border_width: node.resolved_border_width.to_f32().max(0.0),
+                                .then(|| node.frame.logical_len(node.resolved_border_radius).max(0.0)),
+                            border_width: node.frame.logical_len(node.resolved_border_width).max(0.0),
                             hole_rect: border_hole_rect,
                             hole_rect_precise: border_hole_rect_precise,
                             hole_radius: border_hole_radius,
@@ -7605,7 +7639,7 @@ fn collect_cached_buffers(
                         rect_precise: Some(
                             shared_geometry
                                 .map(|geometry| geometry.rect_precise)
-                                .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect)),
+                                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
                         ),
                         shader: effect.shader.clone(),
                         clip_rect: effective_clip_rect,
@@ -7629,11 +7663,11 @@ fn collect_cached_buffers(
                                         .unwrap_or(&usize::MAX),
                                     format!("{path}:fill-top"),
                                     node.rect,
-                                    Some(precise_rect_from_resolved(node.resolved_rect)),
+                                    Some(node.frame.precise_rect(node.resolved_rect)),
                                     background,
                                     node.stable_id.clone(),
                                     node_radius,
-                                    Some(node.resolved_border_radius.to_f32().max(0.0)),
+                                    Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
                                     0.0,
                                     Some(inner_rect),
                                     border_hole_radius,
@@ -7654,11 +7688,11 @@ fn collect_cached_buffers(
                                         .unwrap_or(&usize::MAX),
                                     format!("{path}:fill"),
                                     node.rect,
-                                    Some(precise_rect_from_resolved(node.resolved_rect)),
+                                    Some(node.frame.precise_rect(node.resolved_rect)),
                                     background,
                                     node.stable_id.clone(),
                                     node_radius,
-                                    Some(node.resolved_border_radius.to_f32().max(0.0)),
+                                    Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
                                     0.0,
                                     None,
                                     0,
@@ -7678,11 +7712,11 @@ fn collect_cached_buffers(
                                     .unwrap_or(&usize::MAX),
                                 format!("{path}:fill"),
                                 node.rect,
-                                Some(precise_rect_from_resolved(node.resolved_rect)),
+                                Some(node.frame.precise_rect(node.resolved_rect)),
                                 background,
                                 node.stable_id.clone(),
                                 node_radius,
-                                Some(node.resolved_border_radius.to_f32().max(0.0)),
+                                Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
                                 0.0,
                                 None,
                                 0,
@@ -7710,7 +7744,7 @@ fn collect_cached_buffers(
                     next_nearest_rounded_clip_radius_precise,
                     order_map,
                     dirty_node_ids,
-                    shared_edges,
+                    node_geometry,
                     buffers,
                     shader_buffers,
                 );
@@ -7724,8 +7758,8 @@ fn collect_text_buffers(
     path: String,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
-    raster_scale: i32,
+    node_geometry: &impl NodeGeometryLookup,
+    raster_scale: f64,
     rasterizer: &mut crate::backend::text::TextRasterizer,
     previous: &[CachedDecorationLabel],
     buffers: &mut Vec<CachedDecorationLabel>,
@@ -7740,7 +7774,7 @@ fn collect_text_buffers(
             format!("{path}/child-{index}"),
             order_map,
             dirty_node_ids,
-            shared_edges,
+            node_geometry,
             raster_scale,
             rasterizer,
             previous,
@@ -7763,7 +7797,7 @@ fn collect_text_buffers(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
     let color = node.style.color.unwrap_or(super::Color::WHITE);
     if color.a == 0 {
         return;
@@ -7774,15 +7808,15 @@ fn collect_text_buffers(
         rect_precise: Some(
             shared_geometry
                 .map(|geometry| geometry.rect_precise)
-                .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect)),
+                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
         ),
         text: label.text.clone(),
         color: color.with_opacity(node.style.opacity),
-        font_size: node.style.font_size.unwrap_or(13),
+        font_size: node.style.font_size.unwrap_or(13.0) as f32,
         font_weight: node.style.font_weight.clone(),
         font_family: node.style.font_family.clone(),
         text_align: node.style.text_align.clone(),
-        line_height: node.style.line_height,
+        line_height: node.style.line_height.map(|value| value as f32),
         raster_scale,
     };
 
@@ -7790,16 +7824,16 @@ fn collect_text_buffers(
     let order = *order_map.get(&stable_key).unwrap_or(&usize::MAX);
     let current_rect_precise = shared_geometry
         .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect));
+        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
     let current_clip_rect_precise = shared_geometry
         .and_then(|geometry| geometry.clip_rect_precise)
         .or_else(|| {
             node.resolved_effective_clip
-                .map(|clip| precise_rect_from_resolved(clip.rect))
+                .map(|clip| node.frame.precise_rect(clip.rect))
         });
     let current_clip_radius_precise = node
         .resolved_effective_clip
-        .map(|clip| clip.radius.to_f32().max(0.0));
+        .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
 
     if label_debug_enabled() {
         info!(
@@ -7905,14 +7939,14 @@ fn fallback_text_buffer(
 
 fn text_buffers_need_raster_for_layout(
     layout: &ComputedDecorationTree,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     previous: &[CachedDecorationLabel],
-    raster_scale: i32,
+    raster_scale: f64,
 ) -> bool {
     text_buffers_need_raster_for_node(
         &layout.root,
         "root".into(),
-        shared_edges,
+        node_geometry,
         previous,
         raster_scale,
     )
@@ -7921,9 +7955,9 @@ fn text_buffers_need_raster_for_layout(
 fn text_buffers_need_raster_for_node(
     node: &super::ComputedDecorationNode,
     path: String,
-    shared_edges: &impl SharedEdgeGeometryLookup,
+    node_geometry: &impl NodeGeometryLookup,
     previous: &[CachedDecorationLabel],
-    raster_scale: i32,
+    raster_scale: f64,
 ) -> bool {
     if node.style.visible == Some(false) {
         return false;
@@ -7933,7 +7967,7 @@ fn text_buffers_need_raster_for_node(
         text_buffers_need_raster_for_node(
             child,
             format!("{path}/child-{index}"),
-            shared_edges,
+            node_geometry,
             previous,
             raster_scale,
         )
@@ -7966,10 +8000,10 @@ fn text_buffers_need_raster_for_node(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
     let rect_precise = shared_geometry
         .map(|geometry| geometry.rect_precise)
-        .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect));
+        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect));
     let previous_rect_precise = previous_buffer
         .rendered_rect_precise
         .unwrap_or_else(|| precise_rect_from_logical(previous_buffer.rendered_rect));
@@ -7988,8 +8022,8 @@ fn collect_icon_buffers(
     path: String,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
-    shared_edges: &impl SharedEdgeGeometryLookup,
-    raster_scale: i32,
+    node_geometry: &impl NodeGeometryLookup,
+    raster_scale: f64,
     snapshot: &WaylandWindowSnapshot,
     rasterizer: &mut crate::backend::icon::IconRasterizer,
     buffers: &mut Vec<CachedDecorationIcon>,
@@ -8004,7 +8038,7 @@ fn collect_icon_buffers(
             format!("{path}/child-{index}"),
             order_map,
             dirty_node_ids,
-            shared_edges,
+            node_geometry,
             raster_scale,
             snapshot,
             rasterizer,
@@ -8029,14 +8063,14 @@ fn collect_icon_buffers(
     let shared_geometry = node
         .stable_id
         .as_deref()
-        .and_then(|stable_id| shared_edges.shared_edge_geometry(stable_id));
+        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
 
     let spec = IconSpec {
         rect: node.rect,
         rect_precise: Some(
             shared_geometry
                 .map(|geometry| geometry.rect_precise)
-                .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect)),
+                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
         ),
         icon: snapshot.icon.clone(),
         app_id: snapshot.app_id.clone(),
@@ -8055,7 +8089,7 @@ fn collect_icon_buffers(
         buffer.rect_precise = Some(
             shared_geometry
                 .map(|geometry| geometry.rect_precise)
-                .unwrap_or_else(|| precise_rect_from_resolved(node.resolved_rect)),
+                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
         );
         buffer.clip_rect = node.effective_clip.map(|clip| clip.rect);
         buffer.clip_radius = node.effective_clip.map(|clip| clip.radius).unwrap_or(0);
@@ -8063,11 +8097,11 @@ fn collect_icon_buffers(
             .and_then(|geometry| geometry.clip_rect_precise)
             .or_else(|| {
                 node.resolved_effective_clip
-                    .map(|clip| precise_rect_from_resolved(clip.rect))
+                    .map(|clip| node.frame.precise_rect(clip.rect))
             });
         buffer.clip_radius_precise = node
             .resolved_effective_clip
-            .map(|clip| clip.radius.to_f32().max(0.0));
+            .map(|clip| node.frame.logical_len(clip.radius).max(0.0));
         buffers.push(buffer);
     }
 }
@@ -8195,591 +8229,72 @@ fn gap_debug_layout_enabled() -> bool {
         || crate::env_flag!("SHOJI_GAP_DEBUG")
 }
 
-fn resolved_rect_right(rect: crate::ssd::ResolvedLogicalRect) -> f32 {
-    rect.x.to_f32() + rect.width.to_f32()
-}
-
-fn resolved_rect_bottom(rect: crate::ssd::ResolvedLogicalRect) -> f32 {
-    rect.y.to_f32() + rect.height.to_f32()
-}
-
 fn format_resolved_rect(rect: crate::ssd::ResolvedLogicalRect) -> String {
     format!(
-        "x={:.3}, y={:.3}, w={:.3}, h={:.3}, right={:.3}, bottom={:.3}",
-        rect.x.to_f32(),
-        rect.y.to_f32(),
-        rect.width.to_f32(),
-        rect.height.to_f32(),
-        resolved_rect_right(rect),
-        resolved_rect_bottom(rect),
+        "px x={}, y={}, w={}, h={}, right={}, bottom={}",
+        rect.x.raw(),
+        rect.y.raw(),
+        rect.width.raw(),
+        rect.height.raw(),
+        rect.right().raw(),
+        rect.bottom().raw(),
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct SharedEdgeId(u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedEdgeAxis {
-    Horizontal,
-    Vertical,
-}
-
+/// Global logical geometry of a laid-out node, derived exactly from its
+/// physical-pixel layout (`origin + px / scale`), keyed by stable id for the
+/// buffer builders.
 #[derive(Debug, Clone, Copy)]
-struct SharedEdgeSpec {
-    axis: SharedEdgeAxis,
-    logical_raw: i32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SharedEdgeRect {
-    left: SharedEdgeId,
-    top: SharedEdgeId,
-    right: SharedEdgeId,
-    bottom: SharedEdgeId,
-}
-
-#[derive(Debug, Clone)]
-struct SharedEdgeTreeNode {
-    stable_id: String,
-    kind: &'static str,
-    rect: SharedEdgeRect,
-    content_rect: SharedEdgeRect,
-    clip_rect: Option<SharedEdgeRect>,
-    children: Vec<SharedEdgeTreeNode>,
-}
-
-#[derive(Debug, Clone)]
-struct SharedEdgeTree {
-    edges: Vec<SharedEdgeSpec>,
-    root: SharedEdgeTreeNode,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct SharedEdgeNodeGeometry {
+struct NodeGeometry {
     rect_precise: PreciseLogicalRect,
     content_rect_precise: PreciseLogicalRect,
     clip_rect_precise: Option<PreciseLogicalRect>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct SharedEdgeNodeRefs {
-    rect: SharedEdgeRect,
-    content: SharedEdgeRect,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SharedEdgeBuildContext {
-    parent: Option<SharedEdgeNodeRefs>,
-    previous_sibling: Option<SharedEdgeNodeRefs>,
-}
-
-#[derive(Default)]
-struct SharedEdgeBuilder {
-    next_id: u32,
-    edges: Vec<SharedEdgeSpec>,
-}
-
-impl SharedEdgeBuilder {
-    fn matching_edge(
-        &self,
-        axis: SharedEdgeAxis,
-        logical_raw: i32,
-        candidates: &[SharedEdgeId],
-    ) -> Option<SharedEdgeId> {
-        candidates.iter().copied().find(|candidate| {
-            let spec = self.spec(*candidate);
-            spec.axis == axis && spec.logical_raw == logical_raw
-        })
-    }
-
-    fn new_edge(&mut self, axis: SharedEdgeAxis, logical_raw: i32) -> SharedEdgeId {
-        let id = SharedEdgeId(self.next_id);
-        self.next_id += 1;
-        self.edges.push(SharedEdgeSpec { axis, logical_raw });
-        id
-    }
-
-    fn edge_with_context(
-        &mut self,
-        axis: SharedEdgeAxis,
-        logical_raw: i32,
-        parent_candidates: &[SharedEdgeId],
-        previous_candidates: &[SharedEdgeId],
-    ) -> SharedEdgeId {
-        if let Some(existing) = self.matching_edge(axis, logical_raw, parent_candidates) {
-            return existing;
-        }
-        if let Some(existing) = self.matching_edge(axis, logical_raw, previous_candidates) {
-            return existing;
-        }
-
-        self.new_edge(axis, logical_raw)
-    }
-
-    fn spec(&self, id: SharedEdgeId) -> SharedEdgeSpec {
-        self.edges[id.0 as usize]
-    }
-
-    fn rect_from_resolved(
-        &mut self,
-        rect: crate::ssd::ResolvedLogicalRect,
-        context: SharedEdgeBuildContext,
-    ) -> SharedEdgeRect {
-        let parent_left = context
-            .parent
-            .map(|parent| [parent.rect.left, parent.content.left]);
-        let parent_top = context
-            .parent
-            .map(|parent| [parent.rect.top, parent.content.top]);
-        let parent_right = context
-            .parent
-            .map(|parent| [parent.rect.right, parent.content.right]);
-        let parent_bottom = context
-            .parent
-            .map(|parent| [parent.rect.bottom, parent.content.bottom]);
-        let previous_vertical = context.previous_sibling.map(|previous| {
-            [
-                previous.rect.left,
-                previous.rect.right,
-                previous.content.left,
-                previous.content.right,
-            ]
-        });
-        let previous_horizontal = context.previous_sibling.map(|previous| {
-            [
-                previous.rect.top,
-                previous.rect.bottom,
-                previous.content.top,
-                previous.content.bottom,
-            ]
-        });
-
-        SharedEdgeRect {
-            left: self.edge_with_context(
-                SharedEdgeAxis::Vertical,
-                rect.x.raw(),
-                parent_left.as_ref().map(|ids| &ids[..]).unwrap_or(&[]),
-                previous_vertical
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            top: self.edge_with_context(
-                SharedEdgeAxis::Horizontal,
-                rect.y.raw(),
-                parent_top.as_ref().map(|ids| &ids[..]).unwrap_or(&[]),
-                previous_horizontal
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            right: self.edge_with_context(
-                SharedEdgeAxis::Vertical,
-                (rect.x + rect.width).raw(),
-                parent_right.as_ref().map(|ids| &ids[..]).unwrap_or(&[]),
-                previous_vertical
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            bottom: self.edge_with_context(
-                SharedEdgeAxis::Horizontal,
-                (rect.y + rect.height).raw(),
-                parent_bottom.as_ref().map(|ids| &ids[..]).unwrap_or(&[]),
-                previous_horizontal
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-        }
-    }
-
-    fn inner_rect_from_resolved(
-        &mut self,
-        rect: crate::ssd::ResolvedLogicalRect,
-        context: SharedEdgeBuildContext,
-        rect_refs: SharedEdgeRect,
-    ) -> SharedEdgeRect {
-        let parent_left = context
-            .parent
-            .map(|parent| [rect_refs.left, parent.rect.left, parent.content.left]);
-        let parent_top = context
-            .parent
-            .map(|parent| [rect_refs.top, parent.rect.top, parent.content.top]);
-        let parent_right = context
-            .parent
-            .map(|parent| [rect_refs.right, parent.rect.right, parent.content.right]);
-        let parent_bottom = context
-            .parent
-            .map(|parent| [rect_refs.bottom, parent.rect.bottom, parent.content.bottom]);
-        let own_left = [rect_refs.left];
-        let own_top = [rect_refs.top];
-        let own_right = [rect_refs.right];
-        let own_bottom = [rect_refs.bottom];
-        let previous_vertical = context.previous_sibling.map(|previous| {
-            [
-                previous.rect.left,
-                previous.rect.right,
-                previous.content.left,
-                previous.content.right,
-            ]
-        });
-        let previous_horizontal = context.previous_sibling.map(|previous| {
-            [
-                previous.rect.top,
-                previous.rect.bottom,
-                previous.content.top,
-                previous.content.bottom,
-            ]
-        });
-
-        SharedEdgeRect {
-            left: self.edge_with_context(
-                SharedEdgeAxis::Vertical,
-                rect.x.raw(),
-                parent_left
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&own_left),
-                previous_vertical
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            top: self.edge_with_context(
-                SharedEdgeAxis::Horizontal,
-                rect.y.raw(),
-                parent_top.as_ref().map(|ids| &ids[..]).unwrap_or(&own_top),
-                previous_horizontal
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            right: self.edge_with_context(
-                SharedEdgeAxis::Vertical,
-                (rect.x + rect.width).raw(),
-                parent_right
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&own_right),
-                previous_vertical
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-            bottom: self.edge_with_context(
-                SharedEdgeAxis::Horizontal,
-                (rect.y + rect.height).raw(),
-                parent_bottom
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&own_bottom),
-                previous_horizontal
-                    .as_ref()
-                    .map(|ids| &ids[..])
-                    .unwrap_or(&[]),
-            ),
-        }
-    }
-
-    fn build_node(
-        &mut self,
-        node: &super::ComputedDecorationNode,
-        context: SharedEdgeBuildContext,
-    ) -> SharedEdgeTreeNode {
-        let rect = self.rect_from_resolved(node.resolved_rect, context);
-        let content_rect = self.inner_rect_from_resolved(node.resolved_content_rect, context, rect);
-        let clip_rect = node
-            .resolved_effective_clip
-            .map(|clip| self.inner_rect_from_resolved(clip.rect, context, content_rect));
-        let refs = SharedEdgeNodeRefs {
-            rect,
-            content: content_rect,
-        };
-        let mut previous_sibling = None;
-        let mut children = Vec::with_capacity(node.children.len());
-        for child in &node.children {
-            let is_absolute = matches!(child.style.position, Some(super::StylePosition::Absolute));
-            let child_context = if is_absolute {
-                SharedEdgeBuildContext::default()
-            } else {
-                SharedEdgeBuildContext {
-                    parent: Some(refs),
-                    previous_sibling,
-                }
-            };
-            let child_node = self.build_node(child, child_context);
-            if !is_absolute {
-                previous_sibling = Some(SharedEdgeNodeRefs {
-                    rect: child_node.rect,
-                    content: child_node.content_rect,
-                });
-            }
-            children.push(child_node);
-        }
-
-        SharedEdgeTreeNode {
-            stable_id: node.stable_id.as_deref().unwrap_or("<none>").to_string(),
-            kind: node_kind_name(&node.kind),
-            rect,
-            content_rect,
-            clip_rect,
-            children,
+impl NodeGeometry {
+    fn for_node(node: &super::ComputedDecorationNode) -> Self {
+        let frame = node.frame;
+        Self {
+            rect_precise: frame.precise_rect(node.resolved_rect),
+            content_rect_precise: frame.precise_rect(node.resolved_content_rect),
+            clip_rect_precise: node
+                .resolved_effective_clip
+                .map(|clip| frame.precise_rect(clip.rect)),
         }
     }
 }
 
-fn build_shared_edge_tree(layout: &ComputedDecorationTree) -> SharedEdgeTree {
-    let mut builder = SharedEdgeBuilder::default();
-    let root = builder.build_node(&layout.root, SharedEdgeBuildContext::default());
-    SharedEdgeTree {
-        edges: builder.edges,
-        root,
-    }
-}
-
-fn collect_shared_edge_geometry_map_node(
-    builder: &mut SharedEdgeBuilder,
-    node: &super::ComputedDecorationNode,
-    context: SharedEdgeBuildContext,
-    out: &mut std::collections::HashMap<String, SharedEdgeNodeGeometry>,
-) -> SharedEdgeNodeRefs {
-    let rect = builder.rect_from_resolved(node.resolved_rect, context);
-    let content_rect = builder.inner_rect_from_resolved(node.resolved_content_rect, context, rect);
-    let clip_rect = node
-        .resolved_effective_clip
-        .map(|clip| builder.inner_rect_from_resolved(clip.rect, context, content_rect));
-    let refs = SharedEdgeNodeRefs {
-        rect,
-        content: content_rect,
-    };
-
-    if let Some(stable_id) = node.stable_id.as_deref() {
-        out.insert(
-            stable_id.to_string(),
-            SharedEdgeNodeGeometry {
-                rect_precise: precise_rect_from_shared_edges(&builder.edges, rect),
-                content_rect_precise: precise_rect_from_shared_edges(&builder.edges, content_rect),
-                clip_rect_precise: clip_rect
-                    .map(|rect| precise_rect_from_shared_edges(&builder.edges, rect)),
-            },
-        );
-    }
-
-    let mut previous_sibling = None;
-    for child in &node.children {
-        let is_absolute = matches!(child.style.position, Some(super::StylePosition::Absolute));
-        let child_context = if is_absolute {
-            SharedEdgeBuildContext::default()
-        } else {
-            SharedEdgeBuildContext {
-                parent: Some(refs),
-                previous_sibling,
-            }
-        };
-        let child_refs = collect_shared_edge_geometry_map_node(builder, child, child_context, out);
-        if !is_absolute {
-            previous_sibling = Some(child_refs);
-        }
-    }
-
-    refs
-}
-
-fn collect_shared_edge_geometry_map_node_in<'a>(
-    builder: &mut SharedEdgeBuilder,
+fn collect_node_geometry<'a>(
     node: &'a super::ComputedDecorationNode,
-    context: SharedEdgeBuildContext,
-    out: &mut BumpSharedEdgeGeometryMap<'a>,
-) -> SharedEdgeNodeRefs {
-    let rect = builder.rect_from_resolved(node.resolved_rect, context);
-    let content_rect = builder.inner_rect_from_resolved(node.resolved_content_rect, context, rect);
-    let clip_rect = node
-        .resolved_effective_clip
-        .map(|clip| builder.inner_rect_from_resolved(clip.rect, context, content_rect));
-    let refs = SharedEdgeNodeRefs {
-        rect,
-        content: content_rect,
-    };
-
+    insert: &mut impl FnMut(&'a str, NodeGeometry),
+) {
     if let Some(stable_id) = node.stable_id.as_deref() {
-        out.insert(
-            stable_id,
-            SharedEdgeNodeGeometry {
-                rect_precise: precise_rect_from_shared_edges(&builder.edges, rect),
-                content_rect_precise: precise_rect_from_shared_edges(&builder.edges, content_rect),
-                clip_rect_precise: clip_rect
-                    .map(|rect| precise_rect_from_shared_edges(&builder.edges, rect)),
-            },
-        );
+        insert(stable_id, NodeGeometry::for_node(node));
     }
-
-    let mut previous_sibling = None;
     for child in &node.children {
-        let is_absolute = matches!(child.style.position, Some(super::StylePosition::Absolute));
-        let child_context = if is_absolute {
-            SharedEdgeBuildContext::default()
-        } else {
-            SharedEdgeBuildContext {
-                parent: Some(refs),
-                previous_sibling,
-            }
-        };
-        let child_refs =
-            collect_shared_edge_geometry_map_node_in(builder, child, child_context, out);
-        if !is_absolute {
-            previous_sibling = Some(child_refs);
-        }
-    }
-
-    refs
-}
-
-fn precise_rect_from_shared_edges(
-    edges: &[SharedEdgeSpec],
-    rect: SharedEdgeRect,
-) -> PreciseLogicalRect {
-    let left = edges[rect.left.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let top = edges[rect.top.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let right = edges[rect.right.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let bottom = edges[rect.bottom.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-
-    PreciseLogicalRect {
-        x: left,
-        y: top,
-        width: (right - left).max(0.0),
-        height: (bottom - top).max(0.0),
+        collect_node_geometry(child, insert);
     }
 }
 
-fn build_shared_edge_geometry_map(
+fn build_node_geometry_map(
     layout: &ComputedDecorationTree,
-) -> std::collections::HashMap<String, SharedEdgeNodeGeometry> {
+) -> std::collections::HashMap<String, NodeGeometry> {
     let mut map = std::collections::HashMap::new();
-    let mut builder = SharedEdgeBuilder::default();
-    collect_shared_edge_geometry_map_node(
-        &mut builder,
-        &layout.root,
-        SharedEdgeBuildContext::default(),
-        &mut map,
-    );
+    collect_node_geometry(&layout.root, &mut |id, geometry| {
+        map.insert(id.to_string(), geometry);
+    });
     map
 }
 
-fn build_shared_edge_geometry_map_in<'a>(
+fn build_node_geometry_map_in<'a>(
     layout: &'a ComputedDecorationTree,
     arena: &'a Bump,
-) -> BumpSharedEdgeGeometryMap<'a> {
-    let mut map = BumpSharedEdgeGeometryMap::new_in(arena);
-    let mut builder = SharedEdgeBuilder::default();
-    collect_shared_edge_geometry_map_node_in(
-        &mut builder,
-        &layout.root,
-        SharedEdgeBuildContext::default(),
-        &mut map,
-    );
+) -> BumpNodeGeometryMap<'a> {
+    let mut map = BumpNodeGeometryMap::new_in(arena);
+    collect_node_geometry(&layout.root, &mut |id, geometry| {
+        map.insert(id, geometry);
+    });
     map
-}
-
-fn format_shared_edge_id(id: SharedEdgeId) -> String {
-    format!("e{}", id.0)
-}
-
-fn format_shared_edge_rect(rect: SharedEdgeRect) -> String {
-    format!(
-        "L={}, T={}, R={}, B={}",
-        format_shared_edge_id(rect.left),
-        format_shared_edge_id(rect.top),
-        format_shared_edge_id(rect.right),
-        format_shared_edge_id(rect.bottom),
-    )
-}
-
-fn format_shared_edge_rect_values(rect: SharedEdgeRect, tree: &SharedEdgeTree) -> String {
-    let left = tree.edges[rect.left.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let top = tree.edges[rect.top.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let right = tree.edges[rect.right.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    let bottom = tree.edges[rect.bottom.0 as usize].logical_raw as f32
-        / crate::ssd::RESOLVED_LAYOUT_SUBPIXELS as f32;
-    format!("left={left:.3}, top={top:.3}, right={right:.3}, bottom={bottom:.3}")
-}
-
-fn log_gap_shared_edge_tree(snapshot: &WaylandWindowSnapshot, layout: &ComputedDecorationTree) {
-    let tree = build_shared_edge_tree(layout);
-    let slot_node = find_shared_edge_node_by_kind(&tree.root, "window-slot");
-
-    info!(
-        window_id = snapshot.id,
-        title = snapshot.title,
-        edge_count = tree.edges.len(),
-        root_rect_edges = %format_shared_edge_rect(tree.root.rect),
-        root_content_edges = %format_shared_edge_rect(tree.root.content_rect),
-        slot_rect_edges = slot_node.map(|node| format_shared_edge_rect(node.rect)),
-        slot_content_edges = slot_node.map(|node| format_shared_edge_rect(node.content_rect)),
-        "gap shared edge summary"
-    );
-
-    log_gap_shared_edge_node(snapshot, &tree, &tree.root, None, 0);
-}
-
-fn find_shared_edge_node_by_kind<'a>(
-    node: &'a SharedEdgeTreeNode,
-    kind: &str,
-) -> Option<&'a SharedEdgeTreeNode> {
-    if node.kind == kind {
-        return Some(node);
-    }
-
-    node.children
-        .iter()
-        .find_map(|child| find_shared_edge_node_by_kind(child, kind))
-}
-
-fn log_gap_shared_edge_node(
-    snapshot: &WaylandWindowSnapshot,
-    tree: &SharedEdgeTree,
-    node: &SharedEdgeTreeNode,
-    parent: Option<&SharedEdgeTreeNode>,
-    depth: usize,
-) {
-    info!(
-        window_id = snapshot.id,
-        depth,
-        kind = node.kind,
-        stable_id = node.stable_id,
-        rect_edges = %format_shared_edge_rect(node.rect),
-        rect_edge_values = %format_shared_edge_rect_values(node.rect, tree),
-        content_edges = %format_shared_edge_rect(node.content_rect),
-        content_edge_values = %format_shared_edge_rect_values(node.content_rect, tree),
-        clip_edges = node.clip_rect.map(format_shared_edge_rect),
-        clip_edge_values = node
-            .clip_rect
-            .map(|rect| format_shared_edge_rect_values(rect, tree)),
-        shares_parent_content_left = parent
-            .map(|parent| node.rect.left == parent.content_rect.left),
-        shares_parent_content_top = parent
-            .map(|parent| node.rect.top == parent.content_rect.top),
-        shares_parent_content_right = parent
-            .map(|parent| node.rect.right == parent.content_rect.right),
-        shares_parent_content_bottom = parent
-            .map(|parent| node.rect.bottom == parent.content_rect.bottom),
-        rect_shares_own_content_left = node.rect.left == node.content_rect.left,
-        rect_shares_own_content_top = node.rect.top == node.content_rect.top,
-        rect_shares_own_content_right = node.rect.right == node.content_rect.right,
-        rect_shares_own_content_bottom = node.rect.bottom == node.content_rect.bottom,
-        "gap shared edge node"
-    );
-
-    for child in &node.children {
-        log_gap_shared_edge_node(snapshot, tree, child, Some(node), depth + 1);
-    }
 }
 
 fn log_gap_layout_tree(
@@ -8795,35 +8310,21 @@ fn log_gap_layout_tree(
     };
 
     let root = &layout.root;
-    let root_content_rect = root.resolved_content_rect.round_to_logical_rect();
     info!(
         window_id = snapshot.id,
         title = snapshot.title,
+        scale = root.frame.scale,
         client_rect = %format_rect(client_rect),
         root_rect = %format_rect(root.rect),
         root_rect_resolved = %format_resolved_rect(root.resolved_rect),
-        root_content_rect = %format_rect(root_content_rect),
         root_content_rect_resolved = %format_resolved_rect(root.resolved_content_rect),
         slot_rect = %format_rect(slot_rect),
         slot_rect_resolved = %format_resolved_rect(slot_resolved_rect),
         logical_slot_right_delta_vs_client = (slot_rect.x + slot_rect.width) - (client_rect.x + client_rect.width),
         logical_slot_bottom_delta_vs_client = (slot_rect.y + slot_rect.height) - (client_rect.y + client_rect.height),
-        resolved_slot_right_delta_vs_client = resolved_rect_right(slot_resolved_rect)
-            - (client_rect.x + client_rect.width) as f32,
-        resolved_slot_bottom_delta_vs_client = resolved_rect_bottom(slot_resolved_rect)
-            - (client_rect.y + client_rect.height) as f32,
-        logical_root_content_right_delta_vs_slot = (root_content_rect.x + root_content_rect.width)
-            - (slot_rect.x + slot_rect.width),
-        logical_root_content_bottom_delta_vs_slot = (root_content_rect.y + root_content_rect.height)
-            - (slot_rect.y + slot_rect.height),
-        resolved_root_content_right_delta_vs_slot = resolved_rect_right(root.resolved_content_rect)
-            - resolved_rect_right(slot_resolved_rect),
-        resolved_root_content_bottom_delta_vs_slot = resolved_rect_bottom(root.resolved_content_rect)
-            - resolved_rect_bottom(slot_resolved_rect),
         "gap layout summary"
     );
 
-    log_gap_shared_edge_tree(snapshot, layout);
     log_gap_layout_node(snapshot, root, None, 0);
 }
 
@@ -8833,47 +8334,6 @@ fn log_gap_layout_node(
     parent: Option<&super::ComputedDecorationNode>,
     depth: usize,
 ) {
-    let rect_right = node.rect.x + node.rect.width;
-    let rect_bottom = node.rect.y + node.rect.height;
-    let content_rect = node.resolved_content_rect.round_to_logical_rect();
-    let content_right = content_rect.x + content_rect.width;
-    let content_bottom = content_rect.y + content_rect.height;
-
-    let parent_outer_left_delta =
-        parent.map(|parent| node.resolved_rect.x.to_f32() - parent.resolved_rect.x.to_f32());
-    let parent_content_left_delta = parent
-        .map(|parent| node.resolved_rect.x.to_f32() - parent.resolved_content_rect.x.to_f32());
-    let parent_outer_top_delta =
-        parent.map(|parent| node.resolved_rect.y.to_f32() - parent.resolved_rect.y.to_f32());
-    let parent_content_top_delta = parent
-        .map(|parent| node.resolved_rect.y.to_f32() - parent.resolved_content_rect.y.to_f32());
-    let parent_outer_right_delta =
-        parent.map(|parent| (parent.rect.x + parent.rect.width) - rect_right);
-    let parent_content_right_delta = parent.map(|parent| {
-        let parent_content_rect = parent.resolved_content_rect.round_to_logical_rect();
-        (parent_content_rect.x + parent_content_rect.width) - rect_right
-    });
-    let parent_outer_right_delta_resolved = parent.map(|parent| {
-        resolved_rect_right(parent.resolved_rect) - resolved_rect_right(node.resolved_rect)
-    });
-    let parent_content_right_delta_resolved = parent.map(|parent| {
-        resolved_rect_right(parent.resolved_content_rect) - resolved_rect_right(node.resolved_rect)
-    });
-
-    let child_union = (!node.children.is_empty()).then(|| {
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_right = f32::NEG_INFINITY;
-        let mut max_bottom = f32::NEG_INFINITY;
-        for child in &node.children {
-            min_x = min_x.min(child.resolved_rect.x.to_f32());
-            min_y = min_y.min(child.resolved_rect.y.to_f32());
-            max_right = max_right.max(resolved_rect_right(child.resolved_rect));
-            max_bottom = max_bottom.max(resolved_rect_bottom(child.resolved_rect));
-        }
-        (min_x, min_y, max_right, max_bottom)
-    });
-
     info!(
         window_id = snapshot.id,
         depth,
@@ -8881,39 +8341,17 @@ fn log_gap_layout_node(
         stable_id = node.stable_id.as_deref().unwrap_or("<none>"),
         rect = %format_rect(node.rect),
         rect_resolved = %format_resolved_rect(node.resolved_rect),
-        rect_right,
-        rect_bottom,
-        content_rect = %format_rect(content_rect),
         content_rect_resolved = %format_resolved_rect(node.resolved_content_rect),
-        content_right,
-        content_bottom,
-        border_width_logical = node.resolved_border_width.round_to_i32(),
-        border_width_resolved = node.resolved_border_width.to_f32(),
-        border_radius_logical = node.resolved_border_radius.round_to_i32(),
-        border_radius_resolved = node.resolved_border_radius.to_f32(),
+        border_width_px = node.resolved_border_width.raw(),
+        border_radius_px = node.resolved_border_radius.raw(),
         parent_kind = parent
             .map(|parent| node_kind_name(&parent.kind))
             .unwrap_or("<root>"),
-        parent_outer_left_delta,
-        parent_content_left_delta,
-        parent_outer_top_delta,
-        parent_content_top_delta,
-        parent_outer_right_delta,
-        parent_content_right_delta,
-        parent_outer_right_delta_resolved,
-        parent_content_right_delta_resolved,
-        child_union_left_resolved = child_union.map(|union| union.0),
-        child_union_top_resolved = child_union.map(|union| union.1),
-        child_union_right_resolved = child_union.map(|union| union.2),
-        child_union_bottom_resolved = child_union.map(|union| union.3),
-        child_union_right_delta_from_outer = child_union
-            .map(|union| resolved_rect_right(node.resolved_rect) - union.2),
-        child_union_right_delta_from_content = child_union
-            .map(|union| resolved_rect_right(node.resolved_content_rect) - union.2),
-        child_union_bottom_delta_from_outer = child_union
-            .map(|union| resolved_rect_bottom(node.resolved_rect) - union.3),
-        child_union_bottom_delta_from_content = child_union
-            .map(|union| resolved_rect_bottom(node.resolved_content_rect) - union.3),
+        parent_content_left_delta_px = parent
+            .map(|parent| node.resolved_rect.x.raw() - parent.resolved_content_rect.x.raw()),
+        parent_content_right_delta_px = parent.map(|parent| {
+            parent.resolved_content_rect.right().raw() - node.resolved_rect.right().raw()
+        }),
         "gap layout node"
     );
 
@@ -9299,7 +8737,7 @@ mod tests {
                 direction: LayoutDirection::Row,
             }))
             .with_style(DecorationStyle {
-                height: Some(30),
+                height: Some(30.0),
                 ..Default::default()
             }),
             DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -9308,10 +8746,10 @@ mod tests {
         let mut root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(10),
+                border_radius: Some(10.0),
                 ..Default::default()
             })
             .with_children(vec![glass]);
@@ -9322,7 +8760,7 @@ mod tests {
             .layout_for_client_with_scale(LogicalRect::new(103, 133, 400, 300), scale)
             .expect("layout should succeed");
         let arena = Bump::new();
-        let shared = build_shared_edge_geometry_map_in(&layout, &arena);
+        let shared = build_node_geometry_map_in(&layout, &arena);
         let order = build_render_order_map(&layout);
         let (_buffers, shaders) = build_cached_buffers_and_shaders(&layout, &order, None, &shared);
         let glass_cache = shaders
@@ -9466,7 +8904,7 @@ mod tests {
             },
         ))
         .with_style(DecorationStyle {
-            height: Some(30),
+            height: Some(30.0),
             background: Some(Color::BLACK),
             ..Default::default()
         });
@@ -9482,10 +8920,10 @@ mod tests {
         let mut root = DecorationNode::new(DecorationNodeKind::WindowBorder)
             .with_style(DecorationStyle {
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(10),
+                border_radius: Some(10.0),
                 ..Default::default()
             })
             .with_children(vec![inner]);
@@ -9497,11 +8935,11 @@ mod tests {
         eprintln!(
             "root rect={:?} content(resolved)={:?} effective_clip={:?}",
             layout.root.rect,
-            layout.root.resolved_content_rect.round_to_logical_rect(),
+            layout.root.frame.logical_rect(layout.root.resolved_content_rect),
             layout.root.effective_clip,
         );
         let arena = Bump::new();
-        let shared = build_shared_edge_geometry_map_in(&layout, &arena);
+        let shared = build_node_geometry_map_in(&layout, &arena);
         let order = build_render_order_map(&layout);
         let (buffers, shaders) =
             build_cached_buffers_and_shaders(&layout, &order, None, &shared);
@@ -9826,8 +9264,8 @@ mod tests {
             },
         ))
         .with_style(DecorationStyle {
-            width: Some(64),
-            height: Some(64),
+            width: Some(64.0),
+            height: Some(64.0),
             ..Default::default()
         });
         shader.stable_id = Some("root.ShaderEffect[0]".into());
@@ -9980,7 +9418,7 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 1,
+                        width: 1.0,
                         color: Color::WHITE,
                     }),
                     ..Default::default()
@@ -9994,7 +9432,7 @@ mod tests {
                             direction: LayoutDirection::Row,
                         }))
                         .with_style(DecorationStyle {
-                            height: Some(30),
+                            height: Some(30.0),
                             ..Default::default()
                         }),
                         DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -10020,8 +9458,8 @@ mod tests {
         .with_style(DecorationStyle {
             position: Some(StylePosition::Relative),
             padding: Edges {
-                left: 12,
-                right: 12,
+                left: 12.0,
+                right: 12.0,
                 ..Default::default()
             },
             ..Default::default()
@@ -10029,10 +9467,10 @@ mod tests {
         .with_children(vec![
             DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                 DecorationStyle {
-                    width: Some(10),
-                    height: Some(18),
+                    width: Some(10.0),
+                    height: Some(18.0),
                     margin: Edges {
-                        left: 32,
+                        left: 32.0,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -10041,8 +9479,8 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
                 DecorationStyle {
                     position: Some(StylePosition::Absolute),
-                    width: Some(96),
-                    height: Some(18),
+                    width: Some(96.0),
+                    height: Some(18.0),
                     ..Default::default()
                 },
             ),
@@ -10051,7 +9489,7 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
                     ..Default::default()
@@ -10065,13 +9503,13 @@ mod tests {
                             direction: LayoutDirection::Row,
                         }))
                         .with_style(DecorationStyle {
-                            height: Some(30),
+                            height: Some(30.0),
                             padding: Edges {
-                                left: 8,
-                                right: 8,
+                                left: 8.0,
+                                right: 8.0,
                                 ..Default::default()
                             },
-                            gap: Some(8),
+                            gap: Some(8.0),
                             ..Default::default()
                         })
                         .with_children(vec![
@@ -10107,8 +9545,8 @@ mod tests {
         let layout = tree
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("window slot placement should exist");
 
         assert!(!clip.clips_surface);
@@ -10120,18 +9558,18 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowSlot).with_style(DecorationStyle {
                 overflow: Some(Overflow::Hidden),
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(12),
+                border_radius: Some(12.0),
                 ..Default::default()
             }),
         );
         let layout = tree
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("window slot placement should exist");
 
         assert!(!clip.clips_surface);
@@ -10144,10 +9582,10 @@ mod tests {
                 DecorationNode::new(DecorationNodeKind::Box(BoxNode::default()))
                     .with_style(DecorationStyle {
                         border: Some(BorderStyle {
-                            width: 2,
+                            width: 2.0,
                             color: Color::WHITE,
                         }),
-                        border_radius: Some(12),
+                        border_radius: Some(12.0),
                         overflow,
                         ..Default::default()
                     })
@@ -10160,8 +9598,8 @@ mod tests {
             let layout = tree
                 .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
                 .expect("layout should succeed");
-            let shared_edges = build_shared_edge_geometry_map(&layout);
-            let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+            let node_geometry = build_node_geometry_map(&layout);
+            let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
                 .expect("window slot placement should exist");
             assert_eq!(clip.clips_surface, expected);
         }
@@ -10173,10 +9611,10 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
-                    border_radius: Some(18),
+                    border_radius: Some(18.0),
                     ..Default::default()
                 })
                 .with_children(vec![
@@ -10188,7 +9626,7 @@ mod tests {
                             direction: LayoutDirection::Row,
                         }))
                         .with_style(DecorationStyle {
-                            height: Some(30),
+                            height: Some(30.0),
                             ..Default::default()
                         }),
                         DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -10200,8 +9638,8 @@ mod tests {
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
         let slot = layout.window_slot_rect().expect("slot should exist");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("content clip should exist");
 
         assert_eq!(clip.rect.loc.x, slot.x);
@@ -10221,10 +9659,10 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
-                    border_radius: Some(18),
+                    border_radius: Some(18.0),
                     ..Default::default()
                 })
                 .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
@@ -10233,8 +9671,8 @@ mod tests {
         let layout = tree
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("content clip should exist");
 
         assert!(clip.clips_surface);
@@ -10251,10 +9689,10 @@ mod tests {
             .with_style(DecorationStyle {
                 overflow: Some(Overflow::Hidden),
                 border: Some(BorderStyle {
-                    width: 2,
+                    width: 2.0,
                     color: Color::WHITE,
                 }),
-                border_radius: Some(18),
+                border_radius: Some(18.0),
                 ..Default::default()
             })
             .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
@@ -10263,8 +9701,8 @@ mod tests {
         let layout = tree
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("content clip should exist");
 
         assert!(clip.clips_surface);
@@ -10279,10 +9717,10 @@ mod tests {
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
-                    border_radius: Some(18),
+                    border_radius: Some(18.0),
                     ..Default::default()
                 })
                 .with_children(vec![
@@ -10290,7 +9728,7 @@ mod tests {
                         direction: LayoutDirection::Column,
                     }))
                     .with_style(DecorationStyle {
-                        padding: Edges::all(5),
+                        padding: Edges::all(5.0),
                         ..Default::default()
                     })
                     .with_children(vec![
@@ -10298,7 +9736,7 @@ mod tests {
                             direction: LayoutDirection::Row,
                         }))
                         .with_style(DecorationStyle {
-                            height: Some(30),
+                            height: Some(30.0),
                             ..Default::default()
                         }),
                         DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -10310,8 +9748,8 @@ mod tests {
             .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.25)
             .expect("layout should succeed");
         let slot = layout.window_slot_rect().expect("slot should exist");
-        let shared_edges = build_shared_edge_geometry_map(&layout);
-        let clip = content_clip_for_layout(&tree, &layout, &shared_edges)
+        let node_geometry = build_node_geometry_map(&layout);
+        let clip = content_clip_for_layout(&tree, &layout, &node_geometry)
             .expect("content clip should exist");
 
         assert_eq!(clip.rect.loc.x, slot.x);
@@ -10326,65 +9764,20 @@ mod tests {
         assert!(clip.corner_radii_precise[3] > 0.0);
     }
 
+    /// Tiled windows are sized root -> client (configure) -> root (layout of
+    /// the committed client). Both directions must agree for every size, or
+    /// the configure size flips by a pixel on every pass and the client keeps
+    /// resizing.
     #[test]
-    fn slot_content_clip_uses_nearest_rounded_mask_radius() {
-        let rounded_mask = crate::ssd::ResolvedDecorationClip {
-            rect: crate::ssd::ResolvedLogicalRect {
-                x: crate::ssd::ResolvedLayoutValue::from_raw(100),
-                y: crate::ssd::ResolvedLayoutValue::from_raw(200),
-                width: crate::ssd::ResolvedLayoutValue::from_raw(1000),
-                height: crate::ssd::ResolvedLayoutValue::from_raw(800),
-            },
-            radius: crate::ssd::ResolvedLayoutValue::from_i32(18),
-        };
-        let radius = rounded_mask.radius.to_f32();
-
-        assert_eq!([radius; 4], [18.0, 18.0, 18.0, 18.0]);
-    }
-
-    #[test]
-    fn shared_edge_tree_reuses_parent_content_edges_for_window_border() {
+    fn managed_root_and_client_sizes_round_trip_at_fractional_scales() {
         let tree = DecorationTree::new(
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
-                    ..Default::default()
-                })
-                .with_children(vec![
-                    DecorationNode::new(DecorationNodeKind::Box(BoxNode {
-                        direction: LayoutDirection::Column,
-                    }))
-                    .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
-                ]),
-        );
-
-        let layout = tree
-            .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.75)
-            .expect("layout should succeed");
-        let edge_tree = build_shared_edge_tree(&layout);
-        let window_border = &edge_tree.root.children[0];
-
-        assert_eq!(edge_tree.root.content_rect.left, window_border.rect.left);
-        assert_eq!(edge_tree.root.content_rect.top, window_border.rect.top);
-        assert_eq!(edge_tree.root.content_rect.right, window_border.rect.right);
-        assert_eq!(
-            edge_tree.root.content_rect.bottom,
-            window_border.rect.bottom
-        );
-    }
-
-    #[test]
-    fn shared_edge_tree_reuses_box_edges_when_content_matches_rect() {
-        let tree = DecorationTree::new(
-            DecorationNode::new(DecorationNodeKind::WindowBorder)
-                .with_style(DecorationStyle {
-                    border: Some(BorderStyle {
-                        width: 2,
-                        color: Color::WHITE,
-                    }),
+                    border_radius: Some(10.0),
                     ..Default::default()
                 })
                 .with_children(vec![
@@ -10396,7 +9789,7 @@ mod tests {
                             direction: LayoutDirection::Row,
                         }))
                         .with_style(DecorationStyle {
-                            height: Some(30),
+                            height: Some(30.0),
                             ..Default::default()
                         }),
                         DecorationNode::new(DecorationNodeKind::WindowSlot),
@@ -10404,102 +9797,75 @@ mod tests {
                 ]),
         );
 
-        let layout = tree
-            .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.75)
-            .expect("layout should succeed");
-        let edge_tree = build_shared_edge_tree(&layout);
-        let inner_box = &edge_tree.root.children[0];
-        let window_slot = &inner_box.children[1];
-
-        assert_eq!(inner_box.rect.left, inner_box.content_rect.left);
-        assert_eq!(inner_box.rect.top, inner_box.content_rect.top);
-        assert_eq!(inner_box.rect.right, inner_box.content_rect.right);
-        assert_eq!(inner_box.rect.bottom, inner_box.content_rect.bottom);
-
-        assert_eq!(inner_box.content_rect.left, window_slot.rect.left);
-        assert_eq!(inner_box.content_rect.right, window_slot.rect.right);
+        for scale in [1.0, 1.25, 1.5, 1.6, 1.75, 1.8, 2.0] {
+            let mut insets = None;
+            for width in 900..960 {
+                for (x, y) in [(0, 0), (37, 11)] {
+                    let root = LogicalRect::new(x, y, width, width - 7);
+                    let client = managed_client_rect_for_root(&tree, root, scale)
+                        .expect("client rect");
+                    let layout = tree
+                        .layout_for_client_with_scale(client, scale)
+                        .expect("layout");
+                    assert_eq!(layout.root.rect, root, "scale {scale} root {root:?}");
+                    assert_eq!(layout.window_slot_rect(), Some(client));
+                    let current = (
+                        client.x - root.x,
+                        client.y - root.y,
+                        root.width - client.width,
+                        root.height - client.height,
+                    );
+                    assert_eq!(*insets.get_or_insert(current), current, "scale {scale}");
+                }
+            }
+        }
     }
 
+    /// A rect animation resizes in physical-pixel steps: the sub-logical-pixel
+    /// part of the root size reaches the physical layout, while every logical
+    /// rect (and with it the client configure size) stays on the integer size.
     #[test]
-    fn shared_edge_tree_reuses_adjacent_row_sibling_boundary() {
+    fn sub_pixel_root_size_grows_the_physical_layout_only() {
         let tree = DecorationTree::new(
             DecorationNode::new(DecorationNodeKind::WindowBorder)
                 .with_style(DecorationStyle {
                     border: Some(BorderStyle {
-                        width: 2,
+                        width: 2.0,
                         color: Color::WHITE,
                     }),
                     ..Default::default()
                 })
-                .with_children(vec![
-                    DecorationNode::new(DecorationNodeKind::Box(BoxNode {
-                        direction: LayoutDirection::Row,
-                    }))
-                    .with_children(vec![
-                        DecorationNode::new(DecorationNodeKind::Box(BoxNode {
-                            direction: LayoutDirection::Column,
-                        }))
-                        .with_style(DecorationStyle {
-                            width: Some(120),
-                            ..Default::default()
-                        }),
-                        DecorationNode::new(DecorationNodeKind::WindowSlot),
-                    ]),
-                ]),
+                .with_children(vec![DecorationNode::new(DecorationNodeKind::WindowSlot)]),
         );
+        let scale = 1.5;
+        let client = LogicalRect::new(100, 100, 600, 400);
+        let base = tree.layout_for_client_with_scale(client, scale).expect("layout");
+        let base_root_px = base.root.resolved_rect;
+        let base_slot_px = base.root.resolved_window_slot_rect().expect("slot");
 
-        let layout = tree
-            .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.75)
-            .expect("layout should succeed");
-        let edge_tree = build_shared_edge_tree(&layout);
-        let row_box = &edge_tree.root.children[0];
-        let left_box = &row_box.children[0];
-        let window_slot = &row_box.children[1];
-
-        assert_eq!(left_box.rect.right, window_slot.rect.left);
-        assert_eq!(left_box.rect.top, window_slot.rect.top);
-        assert_eq!(left_box.rect.bottom, window_slot.rect.bottom);
-    }
-
-    #[test]
-    fn shared_edge_tree_reuses_adjacent_column_sibling_boundary() {
-        let tree = DecorationTree::new(
-            DecorationNode::new(DecorationNodeKind::WindowBorder)
-                .with_style(DecorationStyle {
-                    border: Some(BorderStyle {
-                        width: 2,
-                        color: Color::WHITE,
-                    }),
-                    ..Default::default()
-                })
-                .with_children(vec![
-                    DecorationNode::new(DecorationNodeKind::Box(BoxNode {
-                        direction: LayoutDirection::Column,
-                    }))
-                    .with_children(vec![
-                        DecorationNode::new(DecorationNodeKind::Box(BoxNode {
-                            direction: LayoutDirection::Row,
-                        }))
-                        .with_style(DecorationStyle {
-                            height: Some(48),
-                            ..Default::default()
-                        }),
-                        DecorationNode::new(DecorationNodeKind::WindowSlot),
-                    ]),
-                ]),
-        );
-
-        let layout = tree
-            .layout_for_client_with_scale(LogicalRect::new(50, 100, 800, 600), 1.75)
-            .expect("layout should succeed");
-        let edge_tree = build_shared_edge_tree(&layout);
-        let column_box = &edge_tree.root.children[0];
-        let header_box = &column_box.children[0];
-        let window_slot = &column_box.children[1];
-
-        assert_eq!(header_box.rect.bottom, window_slot.rect.top);
-        assert_eq!(header_box.rect.left, window_slot.rect.left);
-        assert_eq!(header_box.rect.right, window_slot.rect.right);
+        for right in [0.2, 0.34, 0.49] {
+            let subpixel = crate::backend::visual::RootSubpixelEdges {
+                right,
+                bottom: right,
+                ..Default::default()
+            };
+            let layout = tree
+                .layout_for_client_with_subpixel(client, scale, subpixel)
+                .expect("layout");
+            let root = &layout.root;
+            let expected_width = crate::ssd::round_half_up(
+                (base.root.rect.width as f64 + right) * scale,
+            );
+            assert_eq!(root.resolved_rect.width.raw(), expected_width, "right {right}");
+            let slot_px = root.resolved_window_slot_rect().expect("slot");
+            assert_eq!(
+                slot_px.width.raw() - base_slot_px.width.raw(),
+                root.resolved_rect.width.raw() - base_root_px.width.raw(),
+                "the slot absorbs the extra pixels"
+            );
+            assert_eq!(root.rect, base.root.rect);
+            assert_eq!(layout.window_slot_rect(), Some(client));
+        }
     }
 
     /// The drag path must keep the pointer's sub-logical-pixel motion.

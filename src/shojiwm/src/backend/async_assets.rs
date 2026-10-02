@@ -21,7 +21,6 @@ pub enum AsyncAssetResult {
         spec_hash: u64,
         width: i32,
         height: i32,
-        raster_scale: i32,
         pixels: Vec<u8>,
     },
     TextMissing {
@@ -31,7 +30,6 @@ pub enum AsyncAssetResult {
         spec_hash: u64,
         width: i32,
         height: i32,
-        raster_scale: i32,
         pixels: Vec<u8>,
     },
     IconMissing {
@@ -59,7 +57,6 @@ pub fn spawn_async_asset_worker(
                                     spec_hash,
                                     width: rendered.width,
                                     height: rendered.height,
-                                    raster_scale: spec.raster_scale.max(1),
                                     pixels: rendered.pixels,
                                 }
                             } else {
@@ -74,7 +71,6 @@ pub fn spawn_async_asset_worker(
                                     spec_hash,
                                     width: rendered.width,
                                     height: rendered.height,
-                                    raster_scale: spec.raster_scale.max(1),
                                     pixels: rendered.pixels,
                                 }
                             } else {

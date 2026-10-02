@@ -63,7 +63,9 @@ pub struct IconSpec {
     /// instead of performing app-icon theme lookup. Used by the `Image` node.
     pub asset_path: Option<String>,
     pub image_fit: Option<ImageFit>,
-    pub raster_scale: i32,
+    /// Exact rasterization scale (the layout scale), so the buffer maps
+    /// one-to-one onto the node's physical pixels.
+    pub raster_scale: f64,
 }
 
 #[derive(Debug, Default)]
@@ -142,7 +144,7 @@ impl IconRasterizer {
     }
 
     pub fn render_icon_pixels(&mut self, spec: &IconSpec) -> Option<RenderedIconPixels> {
-        let (key, target_width, target_height, raster_scale) = icon_cache_key_for_spec(spec)?;
+        let (key, target_width, target_height, _) = icon_cache_key_for_spec(spec)?;
 
         let rgba = if let Some(asset_path) = spec.asset_path.as_deref() {
             let extension = std::path::Path::new(asset_path)
@@ -195,7 +197,7 @@ impl IconRasterizer {
             &pixels,
             Fourcc::Argb8888,
             (target_width, target_height),
-            raster_scale,
+            1,
             smithay::utils::Transform::Normal,
             None,
         );
@@ -228,7 +230,6 @@ impl IconRasterizer {
         spec_hash: u64,
         width: i32,
         height: i32,
-        raster_scale: i32,
         pixels: Vec<u8>,
     ) {
         self.async_in_flight.remove(&spec_hash);
@@ -240,7 +241,7 @@ impl IconRasterizer {
                     &pixels,
                     Fourcc::Argb8888,
                     (width, height),
-                    raster_scale.max(1),
+                    1,
                     smithay::utils::Transform::Normal,
                     None,
                 ),
@@ -310,7 +311,7 @@ pub fn hash_icon_spec(spec: &IconSpec) -> u64 {
             )
         })
         .hash(&mut hasher);
-    spec.raster_scale.hash(&mut hasher);
+    spec.raster_scale.to_bits().hash(&mut hasher);
     spec.app_id.hash(&mut hasher);
     spec.asset_path.hash(&mut hasher);
     match spec.image_fit {
@@ -332,12 +333,12 @@ pub fn hash_icon_spec(spec: &IconSpec) -> u64 {
     hasher.finish()
 }
 
-fn icon_cache_key_for_spec(spec: &IconSpec) -> Option<(IconCacheKey, i32, i32, i32)> {
+fn icon_cache_key_for_spec(spec: &IconSpec) -> Option<(IconCacheKey, i32, i32, f64)> {
     if spec.rect.width <= 0 || spec.rect.height <= 0 {
         return None;
     }
 
-    let raster_scale = spec.raster_scale.max(1);
+    let raster_scale = spec.raster_scale.max(0.0001);
     let logical_width = spec
         .rect_precise
         .map(|rect| rect.width)
@@ -527,6 +528,7 @@ fn memory_icon_element(
         None,
         Kind::Unspecified,
     )?;
+    let element = crate::backend::clipped_memory::ExactMemoryElement::new(element, Some(physical));
     let clip_rect = icon.clip_rect.or_else(|| {
         icon.clip_rect_precise.map(|clip_rect| {
             LogicalRect::new(
@@ -1096,7 +1098,7 @@ mod tests {
             app_id: None,
             asset_path: Some("/tmp/icon.svg".into()),
             image_fit: Some(ImageFit::Contain),
-            raster_scale: 1,
+            raster_scale: 1.0,
         };
         let mut cover = base.clone();
         cover.image_fit = Some(ImageFit::Cover);
@@ -1135,7 +1137,7 @@ mod tests {
             app_id: None,
             asset_path: Some(path.to_string_lossy().into_owned()),
             image_fit: Some(ImageFit::Contain),
-            raster_scale: 2,
+            raster_scale: 2.0,
         };
 
         let rendered = rasterizer.render_icon(&spec);

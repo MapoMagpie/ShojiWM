@@ -1587,14 +1587,12 @@ impl ShojiWM {
                             spec_hash,
                             width,
                             height,
-                            raster_scale,
                             pixels,
                         } => {
                             state.text_rasterizer.handle_async_ready(
                                 spec_hash,
                                 width,
                                 height,
-                                raster_scale,
                                 pixels,
                             );
                             should_redraw = true;
@@ -1606,14 +1604,12 @@ impl ShojiWM {
                             spec_hash,
                             width,
                             height,
-                            raster_scale,
                             pixels,
                         } => {
                             state.icon_rasterizer.handle_async_ready(
                                 spec_hash,
                                 width,
                                 height,
-                                raster_scale,
                                 pixels,
                             );
                             should_redraw = true;

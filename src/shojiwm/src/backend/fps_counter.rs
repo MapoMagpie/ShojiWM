@@ -235,7 +235,9 @@ fn emit_line(
                 None,
                 Kind::Unspecified,
             ) {
-                out.push(DecorationTextureElements::Memory(element));
+                out.push(DecorationTextureElements::Memory(
+                    crate::backend::clipped_memory::ExactMemoryElement::new(element, None),
+                ));
             }
         }
         cursor_x_logical += advance;

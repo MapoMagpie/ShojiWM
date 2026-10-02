@@ -13,9 +13,107 @@ use smithay::{
 use crate::backend::visual::{PreciseLogicalRect, snapped_precise_logical_rect_in_area_space};
 use crate::ssd::LogicalRect;
 
+/// A memory buffer drawn into an exact physical rectangle.
+///
+/// Smithay sizes memory elements in whole logical pixels, which cannot express
+/// a layout box of e.g. 29 physical px at 1.5x (19.33 logical). Decoration
+/// text and icons are rasterized at the layout scale to exactly their layout
+/// box, so this pins the destination to that box and the buffer is sampled
+/// one texel per output pixel.
+#[derive(Debug)]
+pub struct ExactMemoryElement {
+    inner: MemoryRenderBufferRenderElement<GlesRenderer>,
+    geometry: Option<Rectangle<i32, Physical>>,
+}
+
+impl ExactMemoryElement {
+    pub fn new(
+        inner: MemoryRenderBufferRenderElement<GlesRenderer>,
+        geometry: Option<Rectangle<i32, Physical>>,
+    ) -> Self {
+        Self { inner, geometry }
+    }
+}
+
+impl Element for ExactMemoryElement {
+    fn id(&self) -> &Id {
+        self.inner.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.inner.current_commit()
+    }
+
+    fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.geometry.unwrap_or_else(|| self.inner.geometry(scale))
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.inner.src()
+    }
+
+    fn transform(&self) -> Transform {
+        self.inner.transform()
+    }
+
+    fn damage_since(
+        &self,
+        scale: Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        let damage = self.inner.damage_since(scale, commit);
+        match self.geometry {
+            // Inner damage is in the inner element's own (unpinned) space;
+            // any change repaints the whole pinned box.
+            Some(geometry) if !damage.is_empty() => {
+                DamageSet::from_slice(&[Rectangle::from_size(geometry.size)])
+            }
+            _ => damage,
+        }
+    }
+
+    fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        OpaqueRegions::default()
+    }
+
+    fn alpha(&self) -> f32 {
+        self.inner.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.inner.kind()
+    }
+}
+
+impl RenderElement<GlesRenderer> for ExactMemoryElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+        cache: Option<&smithay::utils::user_data::UserDataMap>,
+    ) -> Result<(), GlesError> {
+        RenderElement::<GlesRenderer>::draw(
+            &self.inner,
+            frame,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            cache,
+        )
+    }
+
+    fn underlying_storage(&self, _renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
+        None
+    }
+}
+
 #[derive(Debug)]
 pub struct ClippedMemoryElement {
-    inner: MemoryRenderBufferRenderElement<GlesRenderer>,
+    inner: ExactMemoryElement,
     program: GlesTexProgram,
     clip_rect: PreciseLogicalRect,
     clip_radius: f32,
@@ -28,7 +126,7 @@ struct ClippedMemoryProgram(GlesTexProgram);
 impl ClippedMemoryElement {
     pub fn new(
         renderer: &mut GlesRenderer,
-        inner: MemoryRenderBufferRenderElement<GlesRenderer>,
+        inner: ExactMemoryElement,
         scale: Scale<f64>,
         element_rect: LogicalRect,
         clip_rect: LogicalRect,

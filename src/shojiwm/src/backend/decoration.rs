@@ -1696,6 +1696,7 @@ mod tests {
             resolved_border_radius: Default::default(),
             effective_clip: None,
             resolved_effective_clip: None,
+            frame: Default::default(),
             children,
         }
     }

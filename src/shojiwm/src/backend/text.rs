@@ -46,7 +46,9 @@ pub struct CachedDecorationLabel {
     pub rect_precise: Option<PreciseLogicalRect>,
     pub rendered_rect: LogicalRect,
     pub rendered_rect_precise: Option<PreciseLogicalRect>,
-    pub raster_scale: i32,
+    /// Exact rasterization scale (the layout scale), so the buffer maps
+    /// one-to-one onto the node's physical pixels.
+    pub raster_scale: f64,
     pub clip_rect: Option<LogicalRect>,
     pub clip_radius: i32,
     pub clip_rect_precise: Option<PreciseLogicalRect>,
@@ -69,12 +71,15 @@ pub struct LabelSpec {
     pub rect_precise: Option<PreciseLogicalRect>,
     pub text: String,
     pub color: Color,
-    pub font_size: i32,
+    /// Logical font size; fractional sizes are allowed.
+    pub font_size: f32,
     pub font_weight: Option<serde_json::Value>,
     pub font_family: Option<Vec<String>>,
     pub text_align: Option<String>,
-    pub line_height: Option<i32>,
-    pub raster_scale: i32,
+    pub line_height: Option<f32>,
+    /// Exact rasterization scale (the layout scale), so the buffer maps
+    /// one-to-one onto the node's physical pixels.
+    pub raster_scale: f64,
 }
 
 #[derive(Debug)]
@@ -168,7 +173,7 @@ impl TextRasterizer {
                 &rendered.pixels,
                 Fourcc::Argb8888,
                 (rendered.width, rendered.height),
-                spec.raster_scale.max(1),
+                1,
                 smithay::utils::Transform::Normal,
                 None,
             ),
@@ -180,7 +185,7 @@ impl TextRasterizer {
             return None;
         }
 
-        let raster_scale = spec.raster_scale.max(1);
+        let raster_scale = spec.raster_scale.max(0.0001) as f32;
         let logical_width = spec
             .rect_precise
             .map(|rect| rect.width)
@@ -193,9 +198,9 @@ impl TextRasterizer {
             .max(0.0);
         let target_width = (logical_width * raster_scale as f32).round().max(1.0) as i32;
         let target_height = (logical_height * raster_scale as f32).round().max(1.0) as i32;
-        let font_size = spec.font_size.max(1) as f32 * raster_scale as f32;
+        let font_size = spec.font_size.max(1.0) * raster_scale as f32;
         let line_height =
-            spec.line_height.unwrap_or(spec.font_size.max(1) + 4) as f32 * raster_scale as f32;
+            spec.line_height.unwrap_or(spec.font_size.max(1.0) + 4.0) * raster_scale as f32;
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
 
@@ -247,7 +252,6 @@ impl TextRasterizer {
         spec_hash: u64,
         width: i32,
         height: i32,
-        raster_scale: i32,
         pixels: Vec<u8>,
     ) {
         self.async_in_flight.remove(&spec_hash);
@@ -259,7 +263,7 @@ impl TextRasterizer {
                     &pixels,
                     Fourcc::Argb8888,
                     (width, height),
-                    raster_scale.max(1),
+                    1,
                     smithay::utils::Transform::Normal,
                     None,
                 ),
@@ -295,8 +299,8 @@ impl LabelMeasurer {
             return cached;
         }
 
-        let font_size = spec.font_size.max(1) as f32;
-        let line_height = spec.line_height.unwrap_or((font_size.ceil() as i32) + 4) as f32;
+        let font_size = spec.font_size.max(1.0);
+        let line_height = spec.line_height.unwrap_or(font_size.ceil() + 4.0);
         let metrics = Metrics::new(font_size, line_height.max(1.0));
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let attrs = attrs_for_spec(spec);
@@ -349,10 +353,10 @@ pub fn hash_label_spec(spec: &LabelSpec) -> u64 {
     spec.color.g.hash(&mut hasher);
     spec.color.b.hash(&mut hasher);
     spec.color.a.hash(&mut hasher);
-    spec.font_size.hash(&mut hasher);
+    spec.font_size.to_bits().hash(&mut hasher);
     spec.text_align.hash(&mut hasher);
-    spec.line_height.hash(&mut hasher);
-    spec.raster_scale.hash(&mut hasher);
+    spec.line_height.map(f32::to_bits).hash(&mut hasher);
+    spec.raster_scale.to_bits().hash(&mut hasher);
     spec.font_family.hash(&mut hasher);
     spec.font_weight
         .as_ref()
@@ -364,8 +368,8 @@ pub fn hash_label_spec(spec: &LabelSpec) -> u64 {
 fn hash_label_measurement_spec(spec: &LabelSpec) -> u64 {
     let mut hasher = DefaultHasher::new();
     spec.text.hash(&mut hasher);
-    spec.font_size.hash(&mut hasher);
-    spec.line_height.hash(&mut hasher);
+    spec.font_size.to_bits().hash(&mut hasher);
+    spec.line_height.map(f32::to_bits).hash(&mut hasher);
     spec.font_family.hash(&mut hasher);
     spec.font_weight
         .as_ref()
@@ -376,7 +380,7 @@ fn hash_label_measurement_spec(spec: &LabelSpec) -> u64 {
 
 smithay::render_elements! {
     pub DecorationTextureElements<=GlesRenderer>;
-    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Memory=crate::backend::clipped_memory::ExactMemoryElement,
     Clipped=crate::backend::clipped_memory::ClippedMemoryElement,
 }
 
@@ -528,6 +532,7 @@ pub(crate) fn memory_text_element(
         None,
         Kind::Unspecified,
     )?;
+    let element = crate::backend::clipped_memory::ExactMemoryElement::new(element, Some(physical));
     let clip_rect = label.clip_rect.or_else(|| {
         label.clip_rect_precise.map(|clip_rect| {
             LogicalRect::new(

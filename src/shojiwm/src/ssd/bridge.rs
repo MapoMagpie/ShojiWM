@@ -278,34 +278,34 @@ pub enum WireEffectOutsets {
 pub struct WireStyle {
     pub width: Option<WireDimension>,
     pub height: Option<WireDimension>,
-    pub min_width: Option<i32>,
-    pub min_height: Option<i32>,
-    pub max_width: Option<i32>,
-    pub max_height: Option<i32>,
+    pub min_width: Option<f64>,
+    pub min_height: Option<f64>,
+    pub max_width: Option<f64>,
+    pub max_height: Option<f64>,
     pub flex_grow: Option<f32>,
     pub flex_shrink: Option<f32>,
-    pub gap: Option<i32>,
-    pub padding: Option<i32>,
-    pub padding_x: Option<i32>,
-    pub padding_y: Option<i32>,
-    pub padding_top: Option<i32>,
-    pub padding_right: Option<i32>,
-    pub padding_bottom: Option<i32>,
-    pub padding_left: Option<i32>,
-    pub margin: Option<i32>,
-    pub margin_x: Option<i32>,
-    pub margin_y: Option<i32>,
-    pub margin_top: Option<i32>,
-    pub margin_right: Option<i32>,
-    pub margin_bottom: Option<i32>,
-    pub margin_left: Option<i32>,
+    pub gap: Option<f64>,
+    pub padding: Option<f64>,
+    pub padding_x: Option<f64>,
+    pub padding_y: Option<f64>,
+    pub padding_top: Option<f64>,
+    pub padding_right: Option<f64>,
+    pub padding_bottom: Option<f64>,
+    pub padding_left: Option<f64>,
+    pub margin: Option<f64>,
+    pub margin_x: Option<f64>,
+    pub margin_y: Option<f64>,
+    pub margin_top: Option<f64>,
+    pub margin_right: Option<f64>,
+    pub margin_bottom: Option<f64>,
+    pub margin_left: Option<f64>,
     pub position: Option<String>,
     pub z_index: Option<i32>,
-    pub inset: Option<i32>,
-    pub top: Option<i32>,
-    pub right: Option<i32>,
-    pub bottom: Option<i32>,
-    pub left: Option<i32>,
+    pub inset: Option<f64>,
+    pub top: Option<f64>,
+    pub right: Option<f64>,
+    pub bottom: Option<f64>,
+    pub left: Option<f64>,
     pub overflow: Option<String>,
     pub pointer_events: Option<String>,
     pub transform: Option<WireNodeTransform>,
@@ -320,14 +320,14 @@ pub struct WireStyle {
     pub border_bottom: Option<WireBorderValue>,
     pub border_left: Option<WireBorderValue>,
     pub border_fit: Option<String>,
-    pub border_radius: Option<i32>,
+    pub border_radius: Option<f64>,
     pub visible: Option<bool>,
     pub cursor: Option<String>,
-    pub font_size: Option<i32>,
+    pub font_size: Option<f64>,
     pub font_weight: Option<serde_json::Value>,
     pub font_family: Option<WireFontFamily>,
     pub text_align: Option<String>,
-    pub line_height: Option<i32>,
+    pub line_height: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
@@ -350,13 +350,13 @@ pub enum WireFontFamily {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum WireDimension {
-    Pixels(i32),
+    Pixels(f64),
     Keyword(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct WireBorderValue {
-    pub px: i32,
+    pub px: f64,
     pub color: String,
 }
 
@@ -1291,7 +1291,7 @@ fn parse_justify_content(input: String) -> Result<JustifyContent, DecorationBrid
     }
 }
 
-fn parse_dimension(input: Option<WireDimension>) -> Result<Option<i32>, DecorationBridgeError> {
+fn parse_dimension(input: Option<WireDimension>) -> Result<Option<f64>, DecorationBridgeError> {
     match input {
         Some(WireDimension::Pixels(value)) => Ok(Some(value)),
         Some(WireDimension::Keyword(keyword)) => {
@@ -1309,11 +1309,11 @@ fn parse_border(input: WireBorderValue) -> Result<BorderStyle, DecorationBridgeE
 }
 
 fn position_offsets_from_parts(
-    inset: Option<i32>,
-    top: Option<i32>,
-    right: Option<i32>,
-    bottom: Option<i32>,
-    left: Option<i32>,
+    inset: Option<f64>,
+    top: Option<f64>,
+    right: Option<f64>,
+    bottom: Option<f64>,
+    left: Option<f64>,
 ) -> PositionOffsets {
     PositionOffsets {
         top: top.or(inset),
@@ -1324,15 +1324,15 @@ fn position_offsets_from_parts(
 }
 
 fn edges_from_parts(
-    all: Option<i32>,
-    horizontal: Option<i32>,
-    vertical: Option<i32>,
-    top: Option<i32>,
-    right: Option<i32>,
-    bottom: Option<i32>,
-    left: Option<i32>,
+    all: Option<f64>,
+    horizontal: Option<f64>,
+    vertical: Option<f64>,
+    top: Option<f64>,
+    right: Option<f64>,
+    bottom: Option<f64>,
+    left: Option<f64>,
 ) -> Edges {
-    let base = all.unwrap_or(0);
+    let base = all.unwrap_or(0.0);
     let horizontal = horizontal.unwrap_or(base);
     let vertical = vertical.unwrap_or(base);
 
@@ -1437,7 +1437,7 @@ mod tests {
         let tree = decode_tree_json(json).expect("json should decode");
 
         assert!(matches!(tree.kind, DecorationNodeKind::WindowBorder));
-        assert_eq!(tree.style.border.unwrap().width, 1);
+        assert_eq!(tree.style.border.unwrap().width, 1.0);
         assert_eq!(
             tree.window_border_interaction
                 .resize_hit_area
@@ -1542,8 +1542,8 @@ mod tests {
         let tree = decode_tree_json(json).expect("json should decode");
 
         assert_eq!(tree.stable_id.as_deref(), Some("root.Image[0]"));
-        assert_eq!(tree.style.width, Some(12));
-        assert_eq!(tree.style.height, Some(8));
+        assert_eq!(tree.style.width, Some(12.0));
+        assert_eq!(tree.style.height, Some(8.0));
         assert!(matches!(
             tree.kind,
             DecorationNodeKind::Image(ImageNode {

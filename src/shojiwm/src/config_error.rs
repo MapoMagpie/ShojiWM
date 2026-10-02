@@ -116,7 +116,7 @@ pub fn text_elements_for_output(
             text_width,
             30,
         ),
-        18,
+        18.0,
         Color::rgba(255, 210, 220, 255),
         output_geo,
         scale,
@@ -135,7 +135,7 @@ pub fn text_elements_for_output(
                 text_width,
                 22,
             ),
-            14,
+            14.0,
             Color::rgba(255, 238, 242, 255),
             output_geo,
             scale,
@@ -152,7 +152,7 @@ fn emit_label(
     rasterizer: &mut TextRasterizer,
     text: &str,
     rect: LogicalRect,
-    font_size: i32,
+    font_size: f32,
     color: Color,
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
@@ -167,8 +167,8 @@ fn emit_label(
         font_weight: None,
         font_family: None,
         text_align: None,
-        line_height: Some(rect.height),
-        raster_scale: scale.x.ceil().max(1.0) as i32,
+        line_height: Some(rect.height as f32),
+        raster_scale: scale.x.abs().max(1.0),
     };
     let Some(label) = rasterizer.render_label(&spec) else {
         return Ok(());

@@ -78,34 +78,6 @@ pub fn snapped_logical_rect_relative_with_mode(
     }
 }
 
-pub fn snapped_precise_logical_rect_relative_with_mode(
-    rect: PreciseLogicalRect,
-    origin: Point<i32, Logical>,
-    scale: Scale<f64>,
-    mode: RectSnapMode,
-) -> SnappedLogicalRect {
-    let scale_x = scale.x.abs().max(0.0001);
-    let scale_y = scale.y.abs().max(0.0001);
-    let left = (((rect.x - origin.x as f32) as f64) * scale_x).round() / scale_x;
-    let top = (((rect.y - origin.y as f32) as f64) * scale_y).round() / scale_y;
-    let (right, bottom) = match mode {
-        RectSnapMode::SharedEdges => (
-            ((((rect.x + rect.width) - origin.x as f32) as f64) * scale_x).round() / scale_x,
-            ((((rect.y + rect.height) - origin.y as f32) as f64) * scale_y).round() / scale_y,
-        ),
-        RectSnapMode::OriginAndSize => (
-            left + ((rect.width as f64) * scale_x).round() / scale_x,
-            top + ((rect.height as f64) * scale_y).round() / scale_y,
-        ),
-    };
-    SnappedLogicalRect {
-        x: left as f32,
-        y: top as f32,
-        width: (right - left).max(0.0) as f32,
-        height: (bottom - top).max(0.0) as f32,
-    }
-}
-
 pub fn snapped_logical_radius(radius: i32, scale: Scale<f64>) -> f32 {
     let scale_x = scale.x.abs().max(0.0001);
     (((radius.max(0)) as f64) * scale_x).round().max(0.0) as f32 / scale_x as f32
@@ -124,42 +96,6 @@ pub fn snapped_logical_rect_for_element(
         y: snapped_global.y - (element_origin.y - snap_origin.y) as f32,
         width: snapped_global.width,
         height: snapped_global.height,
-    }
-}
-
-pub fn snapped_logical_rect_in_element_space(
-    rect: LogicalRect,
-    element_rect: LogicalRect,
-    snap_origin: Point<i32, Logical>,
-    scale: Scale<f64>,
-    mode: RectSnapMode,
-) -> SnappedLogicalRect {
-    let snapped_global = snapped_logical_rect_relative_with_mode(rect, snap_origin, scale, mode);
-    let scale_x = scale.x.abs().max(0.0001);
-    let scale_y = scale.y.abs().max(0.0001);
-
-    let element_left_px = (((element_rect.x - snap_origin.x) as f64) * scale_x).round() as f32;
-    let element_top_px = (((element_rect.y - snap_origin.y) as f64) * scale_y).round() as f32;
-    let element_width_px = ((element_rect.width as f64) * scale_x).round().max(1.0) as f32;
-    let element_height_px = ((element_rect.height as f64) * scale_y).round().max(1.0) as f32;
-
-    let snapped_left_px = ((snapped_global.x as f64) * scale_x).round() as f32;
-    let snapped_top_px = ((snapped_global.y as f64) * scale_y).round() as f32;
-    let snapped_right_px =
-        (((snapped_global.x + snapped_global.width) as f64) * scale_x).round() as f32;
-    let snapped_bottom_px =
-        (((snapped_global.y + snapped_global.height) as f64) * scale_y).round() as f32;
-
-    let local_left_px = snapped_left_px - element_left_px;
-    let local_top_px = snapped_top_px - element_top_px;
-    let local_width_px = (snapped_right_px - snapped_left_px).max(0.0);
-    let local_height_px = (snapped_bottom_px - snapped_top_px).max(0.0);
-
-    SnappedLogicalRect {
-        x: local_left_px * element_rect.width.max(1) as f32 / element_width_px,
-        y: local_top_px * element_rect.height.max(1) as f32 / element_height_px,
-        width: local_width_px * element_rect.width.max(1) as f32 / element_width_px,
-        height: local_height_px * element_rect.height.max(1) as f32 / element_height_px,
     }
 }
 
@@ -231,18 +167,6 @@ pub fn snapped_precise_logical_rect_for_element(
     }
 }
 
-pub fn precise_logical_rect_in_element_space(
-    rect: PreciseLogicalRect,
-    element_rect: PreciseLogicalRect,
-) -> SnappedLogicalRect {
-    SnappedLogicalRect {
-        x: rect.x - element_rect.x,
-        y: rect.y - element_rect.y,
-        width: rect.width.max(0.0),
-        height: rect.height.max(0.0),
-    }
-}
-
 pub fn snapped_precise_logical_rect_in_area_space(
     rect: PreciseLogicalRect,
     element_rect: PreciseLogicalRect,
@@ -309,23 +233,6 @@ pub fn snapped_precise_logical_rect_in_root_frame_area_space(
         width: clip_physical.size.w.max(0) as f32 * area_width / element_width_px,
         height: clip_physical.size.h.max(0) as f32 * area_height / element_height_px,
     }
-}
-
-pub fn logical_rect_to_physical_buffer_rect(
-    rect: LogicalRect,
-    origin: Point<i32, Logical>,
-    scale: Scale<f64>,
-) -> Rectangle<i32, Buffer> {
-    let scale_x = scale.x.abs().max(0.0001);
-    let scale_y = scale.y.abs().max(0.0001);
-    let left = (((rect.x - origin.x) as f64) * scale_x).round() as i32;
-    let top = (((rect.y - origin.y) as f64) * scale_y).round() as i32;
-    let right = ((((rect.x + rect.width) - origin.x) as f64) * scale_x).round() as i32;
-    let bottom = ((((rect.y + rect.height) - origin.y) as f64) * scale_y).round() as i32;
-    Rectangle::new(
-        Point::from((left, top)),
-        ((right - left).max(0), (bottom - top).max(0)).into(),
-    )
 }
 
 pub fn logical_rect_to_physical_buffer_rect_f64(
@@ -769,52 +676,28 @@ pub fn root_physical_origin_precise(
     .to_physical_precise_round(output_scale)
 }
 
-fn root_physical_size_from_edges(
-    rect: LogicalRect,
-    root_subpixel: RootSubpixelEdges,
-    _output_geo: Rectangle<i32, Logical>,
-    output_scale: Scale<f64>,
-) -> smithay::utils::Size<i32, Physical> {
-    // Position-independent by design: the physical frame size derives from the
-    // logical size alone, never from where the window sits on the output.
-    // Snapping the edges in output-global space instead makes the size flip by
-    // ±1px with the window's position phase whenever `width × scale` is
-    // fractional, and every frame-mapped descendant (buttons, client slot,
-    // border holes) wobbles along with it as the window moves. The trade-off
-    // is that the far edge may shimmer by 1px during left/top-anchored
-    // resizes; interior stability during moves matters far more.
-    let scale_x = output_scale.x.abs().max(0.0001);
-    let scale_y = output_scale.y.abs().max(0.0001);
-    let width = ((rect.width as f64 + root_subpixel.right - root_subpixel.left) * scale_x).round();
-    let height = ((rect.height as f64 + root_subpixel.bottom - root_subpixel.top) * scale_y).round();
-    ((width.max(0.0) as i32), (height.max(0.0) as i32)).into()
-}
-
 fn relative_physical_rect_in_root_frame(
     left: f32,
     top: f32,
     right: f32,
     bottom: f32,
     root_rect: LogicalRect,
-    root_subpixel: RootSubpixelEdges,
-    output_geo: Rectangle<i32, Logical>,
+    _root_subpixel: RootSubpixelEdges,
+    _output_geo: Rectangle<i32, Logical>,
     output_scale: Scale<f64>,
 ) -> Rectangle<i32, Physical> {
-    let root_width = (root_rect.width.max(1)) as f32;
-    let root_height = (root_rect.height.max(1)) as f32;
-    let root_size =
-        root_physical_size_from_edges(root_rect, root_subpixel, output_geo, output_scale);
-    let root_x = root_rect.x as f32;
-    let root_y = root_rect.y as f32;
-
-    // The whole SSD tree is measured in one physical frame owned by the root
-    // decoration rect. The root frame itself is snapped from output-global
-    // left/right/top/bottom edges so its far edges stay fixed during fractional
-    // scale resizes. Descendants are then rounded in this root-local frame,
-    // preventing each element from choosing a different output-global phase.
-    let to_px_x = |x: f32| (((x - root_x) / root_width) * root_size.w.max(0) as f32).round() as i32;
-    let to_px_y =
-        |y: f32| (((y - root_y) / root_height) * root_size.h.max(0) as f32).round() as i32;
+    // SSD layout already places every node edge on the physical pixel grid,
+    // relative to the root origin (`root.x + px / scale`). Mapping back is a
+    // plain scale-and-round in root-local space, which recovers those exact
+    // pixels: no proportional re-fitting, no second quantization grid. The
+    // window's global placement (including its sub-logical-pixel offset)
+    // enters only through `root_physical_origin_precise`.
+    let scale_x = output_scale.x.abs().max(0.0001);
+    let scale_y = output_scale.y.abs().max(0.0001);
+    let root_x = root_rect.x as f64;
+    let root_y = root_rect.y as f64;
+    let to_px_x = |x: f32| round_half_up((x as f64 - root_x) * scale_x);
+    let to_px_y = |y: f32| round_half_up((y as f64 - root_y) * scale_y);
 
     let left_px = to_px_x(left);
     let top_px = to_px_y(top);
@@ -824,6 +707,10 @@ fn relative_physical_rect_in_root_frame(
         Point::from((left_px, top_px)),
         ((right_px - left_px).max(0), (bottom_px - top_px).max(0)).into(),
     )
+}
+
+fn round_half_up(value: f64) -> i32 {
+    crate::ssd::round_half_up(value)
 }
 
 pub fn relative_physical_rect_from_root(
@@ -901,31 +788,13 @@ pub fn relative_physical_rect_from_root_precise(
     )
 }
 
-// The three `_global_*` variants below historically snapped node edges in
+// The `_global_*` variants below historically snapped node edges in
 // output-global space. That made every result depend on the window's position
 // phase (`x × scale mod 1`), so backdrop geometry and fallback rects wobbled
 // by ±1px as the window moved at fractional scales. They now snap in
 // root-local space: subtract the root origin in logical space first, then
 // scale and round. Results are position-independent; the window's global
 // placement enters exactly once, via `root_physical_origin*`.
-
-pub fn relative_physical_rect_from_root_global_edges(
-    rect: LogicalRect,
-    root_rect: LogicalRect,
-    _output_geo: Rectangle<i32, Logical>,
-    output_scale: Scale<f64>,
-) -> Rectangle<i32, Physical> {
-    let scale_x = output_scale.x.abs().max(0.0001);
-    let scale_y = output_scale.y.abs().max(0.0001);
-    let left_px = (((rect.x - root_rect.x) as f64) * scale_x).round() as i32;
-    let top_px = (((rect.y - root_rect.y) as f64) * scale_y).round() as i32;
-    let right_px = ((((rect.x + rect.width) - root_rect.x) as f64) * scale_x).round() as i32;
-    let bottom_px = ((((rect.y + rect.height) - root_rect.y) as f64) * scale_y).round() as i32;
-    Rectangle::new(
-        Point::from((left_px, top_px)),
-        ((right_px - left_px).max(0), (bottom_px - top_px).max(0)).into(),
-    )
-}
 
 pub fn relative_physical_rect_from_root_global_origin_size(
     rect: LogicalRect,
