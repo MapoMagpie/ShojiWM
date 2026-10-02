@@ -1007,7 +1007,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "173852283a9a57a3cbe365d86e74dc428a09c50421477d5ad6fe9d9509e37737"
 dependencies = [
  "bitflags 2.11.0",
- "fontdb 0.23.0",
+ "fontdb",
  "harfrust 0.3.2",
  "linebender_resource_handle",
  "log",
@@ -1031,7 +1031,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d8c4e3a1d02f5269ed15c2d70b4647167856f66f228dcdf99050ab77bbb5a56"
 dependencies = [
  "bitflags 2.11.0",
- "fontdb 0.23.0",
+ "fontdb",
  "harfrust 0.5.2",
  "linebender_resource_handle",
  "log",
@@ -1855,20 +1855,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
 dependencies = [
  "roxmltree",
-]
-
-[[package]]
-name = "fontdb"
-version = "0.16.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0299020c3ef3f60f526a4f64ab4a3d4ce116b1acbf24cdd22da0068e5d81dc3"
-dependencies = [
- "fontconfig-parser",
- "log",
- "memmap2",
- "slotmap",
- "tinyvec",
- "ttf-parser 0.20.0",
 ]
 
 [[package]]
@@ -5104,10 +5090,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "shojiwm_ipc"
-version = "0.1.0"
-
-[[package]]
 name = "shojiwm_lib"
 version = "0.1.0"
 dependencies = [
@@ -5116,8 +5098,6 @@ dependencies = [
  "calloop 0.14.4",
  "cgmath",
  "cosmic-text 0.17.2",
- "fontdb 0.16.2",
- "fontdue",
  "hashbrown 0.15.5",
  "input",
  "mimalloc",
@@ -5141,10 +5121,6 @@ dependencies = [
  "xkbcommon",
  "xwayland-satellite",
 ]
-
-[[package]]
-name = "shojiwm_protocol"
-version = "0.1.0"
 
 [[package]]
 name = "shojiwm_rs"
@@ -6587,12 +6563,6 @@ dependencies = [
 
 [[package]]
 name = "ttf-parser"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f77d76d837a7830fe1d4f12b7b4ba4192c1888001c7164257e4bc6d21d96b4"
-
-[[package]]
-name = "ttf-parser"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
@@ -6729,7 +6699,7 @@ dependencies = [
  "base64",
  "data-url",
  "flate2",
- "fontdb 0.23.0",
+ "fontdb",
  "imagesize",
  "kurbo 0.11.3",
  "log",

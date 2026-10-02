@@ -1,5 +1,0 @@
-# !tyml @cargo/Cargo
-[package]
-name = "shojiwm_protocol"
-version = "0.1.0"
-edition = "2024"

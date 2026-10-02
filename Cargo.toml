@@ -5,8 +5,6 @@ members = [
     "src/shojiwm_lib",
     "src/shojiwm",
     "src/shojiwm_rs",
-    "src/shojiwm_protocol",
-    "src/shojiwm_ipc",
     "src/xdg-desktop-portal-shojiwm",
 ]
 
