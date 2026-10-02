@@ -8,3 +8,5 @@ edition = "2024"
 # crate depends on this and builds its own binary.
 [dependencies]
 shojiwm_lib = { path = "../shojiwm_lib" }
+serde_json = "1.0.140"
+tracing = "0.1.41"

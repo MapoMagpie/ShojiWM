@@ -1,6 +1,41 @@
 //! Write a ShojiWM config in Rust.
 //!
-//! A Rust config is an ordinary crate whose `main` hands a [`RustLauncher`] to
+//! Two levels are available:
+//!
+//! - **Reactive config** (recommended): the same model as the TypeScript
+//!   SDK. Register everything on [`COMPOSITOR`] from a setup function and
+//!   describe decorations with view builders whose props are signals; the
+//!   runtime tracks dependencies per node and sends the compositor minimal
+//!   patches.
+//!
+//!   ```no_run
+//!   use shojiwm_rs::prelude::*;
+//!
+//!   fn main() -> std::process::ExitCode {
+//!       run_config(|| {
+//!           COMPOSITOR.key.bind("terminal", "Super+T", || {
+//!               COMPOSITOR.process.spawn(Command::exec(["kitty"]));
+//!           });
+//!           COMPOSITOR.window.composition(|window| {
+//!               let border = window
+//!                   .is_focused()
+//!                   .map(|focused| if *focused { hex("#d7ba7d") } else { hex("#4f5666") });
+//!               WindowBorder::new()
+//!                   .style(Style::new().border(2.0, border).border_radius(10.0))
+//!                   .child(
+//!                       Flex::column()
+//!                           .child(Label::new(window.title()).style(Style::new().height(30.0)))
+//!                           .child(ClientWindow::new()),
+//!                   )
+//!           });
+//!       })
+//!   }
+//!   ```
+//!
+//! - **Raw runtime**: implement [`ConfigRuntime`] yourself and answer
+//!   [`RuntimeRequest`]s in place (see [`RustLauncher`]).
+//!
+//! A raw config is an ordinary crate whose `main` hands a [`RustLauncher`] to
 //! [`run`]. The config itself is a [`ConfigRuntime`]: it is called on the
 //! compositor thread, answers [`RuntimeRequest`]s in place (no serialization,
 //! no extra thread) and sends config deltas through the [`RuntimeHost`] it is
@@ -29,11 +64,68 @@
 //! }
 //! ```
 
+pub mod adapter;
+pub mod animation;
+pub mod assets;
+pub mod compositor;
+pub mod effect;
+pub mod ipc;
+pub mod reactive;
+mod runtime;
+pub mod style;
+pub mod view;
+pub mod window;
+pub mod window_stack;
+
+pub use adapter::{ConfigBuilder, ReactiveRuntime, run_config};
+pub use compositor::COMPOSITOR;
+
+/// Everything a reactive config usually needs.
+pub mod prelude {
+    pub use crate::{
+        COMPOSITOR, ConfigBuilder, run_config,
+        animation::{
+            Animation, AnimationOptions, Easing, Repeat, TimerHandle, cubic_bezier, now_ms,
+            set_interval, set_timeout,
+        },
+        compositor::{
+            Command, DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, OutputConfig,
+            OutputContext, Sender, SurfaceRef,
+        },
+        effect::{
+            Effect, Include, Invalidate, Source, Stage, StateTexture, SurfaceEffect,
+            SurfaceEffects, Uniform, backdrop_source, blend, dual_kawase_blur, image_source,
+            layer_source, noise, popup_source, render_to, render_to_if_dirty, save, saved, shader_input,
+            shader_stage, state_source, state_texture, unit, window_source, xray_backdrop_source,
+        },
+        reactive::{
+            Get, Memo, Prop, ReadSignal, Scope, Signal, batch, derive, effect, memo, on_cleanup,
+            signal, untrack,
+        },
+        style::{Border, FontWeight, Style, Transform2D, hex, rgba},
+        view::{
+            AppIcon, Button, Child, ClientWindow, Composition, Direction, Element, Flex, Image,
+            Label, ManagedTransform, ManagedWindow, Rect, ShaderEffect, WindowBorder,
+        },
+        window::{AnimationMode, ManagedAnimation, Window, WindowStateKey},
+        window_stack::{Placement, WindowStack},
+    };
+    pub use shojiwm_lib::ssd::{
+        AlignItems, BlendMode, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
+        PointerEvents, StylePosition, WindowAction,
+    };
+}
+
 pub use shojiwm_lib::run;
 pub use shojiwm_lib::runtime_api::{self, *};
 /// Data types a config reads (snapshots) and builds (decoration trees,
 /// effect configs).
 pub use shojiwm_lib::ssd;
+/// Config types the compositor consumes (outputs, input, processes, ...).
+pub use shojiwm_lib::{
+    config, cursor, keyboard_layout, runtime_debug, runtime_input, runtime_key_binding,
+    runtime_process, runtime_workspace,
+};
 
 /// [`RuntimeLauncher`] for a config compiled into the binary.
 pub struct RustLauncher<F> {

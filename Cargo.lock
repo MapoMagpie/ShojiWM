@@ -5126,7 +5126,9 @@ dependencies = [
 name = "shojiwm_rs"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "shojiwm_lib",
+ "tracing",
 ]
 
 [[package]]

@@ -134,6 +134,54 @@ Runtime-specific options are declared with `RuntimeLauncher::extra_args` and
 show up in `--help` under their own heading; the TypeScript runtime adds
 `--decoration-runtime <PATH>` (`SHOJI_DECORATION_RUNTIME`).
 
+## Reactive Rust config (`shojiwm_rs`)
+
+`shojiwm_rs` offers two levels. The raw one is `RustLauncher` + your own
+`ConfigRuntime`. The reactive one mirrors the TypeScript SDK so that configs
+port almost line by line:
+
+| TypeScript | Rust (`shojiwm_rs::prelude`) |
+|---|---|
+| `signal` / `computed` / `effect` | `signal` / `memo` / `effect` (`Copy` handles, SolidJS-style) |
+| `useState` in a component | `signal(..)` inside the composition (owned by it) |
+| `createWindowState("x", { default })` | `static X: WindowStateKey<T> = WindowStateKey::new("x", \|w\| ..)`, `window.state(&X)` |
+| `<Box>` `<Label>` `<Button>` `<Image>` `<AppIcon>` `<ShaderEffect>` `<WindowBorder>` `<ClientWindow/>` | `Flex::row()/column()`, `Label::new`, `Button::new`, `Image::new`, `AppIcon::new`, `ShaderEffect::new`, `WindowBorder::new`, `ClientWindow::new` |
+| `<ManagedWindow rect=.. zIndex=..>` | `ManagedWindow::new().rect(..).z_index(..)` |
+| `{cond && <X/>}` | `.child_dyn(move \|\| cond.get().then(\|\| x()))` |
+| `COMPOSITOR.key.bind(..)` etc. | `COMPOSITOR.key.bind(..)` (zero-sized controllers onto thread-local state) |
+| `compileEffect({ input, pipeline })` | `Effect::new(input).stage(..)`; `get(name)` is `saved(name)` |
+| `setTimeout` / `createPoll` | `set_timeout` / `set_interval` |
+| `createIpcServer()` | `shojiwm_rs::ipc::IpcServer` (same NDJSON protocol, socket threads + `COMPOSITOR.channel`) |
+
+How it maps onto the protocol (`src/shojiwm_rs/src/adapter.rs`):
+
+- The composition function runs **once** per window. Whatever its body reads
+  is tracked by a root observer; a change re-runs it (full tree), like the TS
+  re-evaluation. Props are tracked **per node**: a change marks that node, and
+  `EvaluateCached` answers with a `ReplaceNode` patch of the topmost dirty
+  node. A reactive shader uniform becomes a `ShaderUniform` patch.
+  `ManagedWindow` props have their own observer, which gives
+  `managed_window_only` replies.
+- Dirty windows are reported from `SchedulerTick` (and every mutation reply)
+  as `dirty_window_ids` / `dirty_managed_window_ids` / `dirty_window_node_ids`.
+- Listener calls run inside `batch`, so effects never re-enter a listener
+  that is still running; every request runs under `catch_unwind`, so a panic
+  in config code becomes a config error instead of taking down the session.
+- Relative asset paths resolve against `ConfigBuilder::asset_root`, else
+  `--runtime-dir`, else the `--config` directory.
+- No hot reload: a Rust config is recompiled, so `reload()` stays
+  `Unsupported`.
+
+The port of `packages/config` lives in
+`src/shojiwm_rs/examples/default_config/` (`main.rs` = `index.tsx`,
+`window_manager.rs` + `workspace.rs` = `window-manager.ts`). It shares the
+shaders and icons of `packages/config`:
+
+```sh
+cargo run -p shojiwm_rs --example default_config -- --dev
+cargo test -p shojiwm_rs --all-targets   # includes the example's smoke tests
+```
+
 ## Status and next steps
 
 Done:
@@ -144,8 +192,11 @@ Done:
   TypeScript evaluator any more (`as_embedded` is gone).
 - Config deltas left the reply structs and travel as `HostMessage`s; the TS
   wake op uses `RuntimeHost::wake` instead of `SIGUSR1`.
+- Reactive Rust config API in `shojiwm_rs` and the `default_config` example
+  porting `packages/config`.
 
 Next:
 
-- A Rust config API in `shojiwm_rs` and an example that ports the current
-  TypeScript config (`packages/config`) to Rust.
+- Run the `default_config` example on real hardware and compare it with the
+  TypeScript config side by side (only headless tests exist so far).
+- A `view!` macro on top of the builder API.
