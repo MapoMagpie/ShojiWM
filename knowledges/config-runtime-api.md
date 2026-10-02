@@ -68,12 +68,12 @@ runtime can start with a handful of requests and grow.
 | Item | Role |
 |---|---|
 | `RuntimeLauncher` | One per language. `name`, `default_config_path`, `extra_args`, `launch`. |
-| `ConfigRuntime` | The running config. `preload`, `enable`, `reload`, `request`, `post`, `shutdown`. Called on the compositor thread only. |
+| `ConfigRuntime` | The running config. `preload`, `enable`, `prepare_reload`, `reload`, `request`, `post`, `shutdown`. Called on the compositor thread only. |
 | `RuntimeRequest<'a>` | Needs an answer this turn: decoration evaluation (full / cached / policy / handlers / close), scheduler tick, window requests, input hooks, effects, workspace activation. Borrows its snapshots, never serialized. |
 | `RuntimeReply` | The direct answer. Side effects are not part of it. |
 | `RuntimeEvent` | Fire and forget: display / input / keyboard-layout state, async pointer and gesture hooks. |
 | `RuntimeHost` | Clone + Send handle back to the compositor: `send(HostMessage)` and `wake()`. |
-| `HostMessage` | Config deltas (outputs, workspaces, key bindings, pointer, input, event filter, processes, debug, cursor, env) and async hook results. |
+| `HostMessage` | Config deltas (outputs, workspaces, key bindings, pointer, input, event filter, processes, debug, cursor, env) async hook results, and `ReloadReady` for a reload prepared in the background. |
 | `RuntimeConfigDelta` | Helper that publishes a reply's worth of deltas in the canonical order. |
 | `RuntimeHandle` | Compositor side: typed wrappers, `Unhandled` fallbacks, de-duplication of posted state. |
 | `NullRuntime` | Answers everything with `Unhandled`. |
@@ -106,11 +106,38 @@ load, policy decisions).
 
 ### Hot reload
 
-`ConfigRuntime::reload` owns the whole swap. The TypeScript runtime calls
-`onDisable`, replaces the isolate and passes the persisted state to `onEnable`;
-a .NET runtime can keep the CLR and swap assemblies. On `Ok` the compositor
-drops every cached evaluation and asks again; the default implementation
-returns `RuntimeError::Unsupported`, shown as a config error.
+A reload has two halves so that a slow build never blocks the compositor:
+
+```text
+Super+Shift+R
+  → prepare_reload()          compositor thread, must return at once
+      Ready   → reload() right away
+      Pending → the runtime builds in the background; the old config keeps
+                answering requests meanwhile
+  → host.send(HostMessage::ReloadReady(Ok | Err))   any thread
+      Ok  → reload() at the next idle point of the event loop
+      Err → shown as a hot reload error, the old config stays
+```
+
+- `prepare_reload` defaults to `Ready`, so a runtime that loads quickly only
+  implements `reload`. The TypeScript runtime does that: `reload` calls
+  `onDisable`, replaces the isolate and passes the persisted state to
+  `onEnable`.
+- A runtime that compiles (C#, a Rust dylib) starts the build in
+  `prepare_reload`, answers `Pending`, and sends `ReloadReady` when the build
+  is done; `reload` then only swaps (a .NET runtime can keep the CLR and swap
+  assemblies). Repeated `Super+Shift+R` during a build call `prepare_reload`
+  again; coalescing or restarting the build is the runtime's call.
+- `ReloadReady` may also be sent unprompted, e.g. from a file watcher, to
+  reload on save.
+- `reload` returning `Ok` makes the compositor finalize closing windows, drop
+  every cached evaluation and ask again. The default `reload` returns
+  `RuntimeError::Unsupported`; a runtime without hot reload should rather
+  return it from `prepare_reload`, before anything is touched. `Unsupported`
+  is shown as a short notice that disappears after 3 seconds, any other error
+  as a hot reload error that stays until the next successful reload.
+- `src/shojiwm_rs/src/lib.rs` (`a_reload_can_be_prepared_in_the_background`)
+  shows the pattern in a few lines.
 
 ## Common command line
 
@@ -169,7 +196,7 @@ How it maps onto the protocol (`src/shojiwm_rs/src/adapter.rs`):
   in config code becomes a config error instead of taking down the session.
 - Relative asset paths resolve against `ConfigBuilder::asset_root`, else
   `--runtime-dir`, else the `--config` directory.
-- No hot reload: a Rust config is recompiled, so `reload()` stays
+- No hot reload: a Rust config is recompiled, so `prepare_reload()` returns
   `Unsupported`.
 
 The port of `packages/config` lives in

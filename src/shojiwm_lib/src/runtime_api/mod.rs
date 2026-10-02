@@ -52,9 +52,26 @@ pub trait ConfigRuntime {
         Ok(())
     }
 
-    /// Replace the loaded config with a fresh copy from disk, carrying over
-    /// whatever state the runtime persists across reloads. On success the
-    /// compositor drops every cached evaluation and asks again.
+    /// First half of a hot reload, called when the user asks for one
+    /// (`Super+Shift+R`). Must not block: a runtime whose config needs a slow
+    /// build (compiling C#, a Rust dylib, ...) starts it in the background,
+    /// answers [`ReloadPreparation::Pending`] and keeps serving the current
+    /// config until it sends [`HostMessage::ReloadReady`]. The compositor
+    /// then calls [`reload`](Self::reload) at a quiet point of its loop.
+    ///
+    /// The default answers [`ReloadPreparation::Ready`], which makes the
+    /// compositor call `reload` right away. An error is shown as a hot
+    /// reload error and the current config stays.
+    fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
+        Ok(ReloadPreparation::Ready)
+    }
+
+    /// Second half of a hot reload: replace the loaded config with the fresh
+    /// one, carrying over whatever state the runtime persists across reloads.
+    /// Runs on the compositor thread, so the slow part belongs in
+    /// [`prepare_reload`](Self::prepare_reload). On success the compositor
+    /// drops every cached evaluation and asks again; on error the runtime
+    /// should keep (or fall back to) the config it had.
     fn reload(&mut self) -> Result<(), RuntimeError> {
         Err(RuntimeError::Unsupported("hot reload"))
     }
@@ -69,6 +86,17 @@ pub trait ConfigRuntime {
 
     /// The compositor is exiting.
     fn shutdown(&mut self) {}
+}
+
+/// Answer of [`ConfigRuntime::prepare_reload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadPreparation {
+    /// The new config can be swapped in now; the compositor calls
+    /// [`ConfigRuntime::reload`] immediately.
+    Ready,
+    /// The new config is being prepared in the background. The runtime sends
+    /// [`HostMessage::ReloadReady`] once it is done (or failed).
+    Pending,
 }
 
 /// Starts a [`ConfigRuntime`]; one per config language.

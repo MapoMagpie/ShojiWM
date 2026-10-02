@@ -49,6 +49,12 @@ pub enum HostMessage {
     Cursor(RuntimeCursorConfigUpdate),
     /// Result of a posted (fire-and-forget) pointer or gesture hook.
     PointerHookResult(DecorationPointerMoveAsyncInvocation),
+    /// A hot reload prepared in the background is done. `Ok` makes the
+    /// compositor call `ConfigRuntime::reload` at the next quiet point of its
+    /// loop; `Err` is shown as a hot reload error and the current config
+    /// stays. A runtime may also send it unprompted, e.g. from a file
+    /// watcher, to start a reload on its own.
+    ReloadReady(Result<(), String>),
 }
 
 /// Config deltas that every runtime reply may carry. A runtime implementation

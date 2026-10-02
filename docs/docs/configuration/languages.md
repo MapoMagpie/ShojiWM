@@ -204,6 +204,11 @@ fn main() -> std::process::ExitCode {
 - **Side effects** — key bindings, outputs, processes, environment — go back
   through `RuntimeHost::send(HostMessage)`, which also works from other
   threads.
+- **Hot reload** has two halves. `prepare_reload` must return at once: a
+  runtime that has to compile (C#, ...) starts the build there, answers
+  `ReloadPreparation::Pending` and keeps serving the old config. When the
+  build is done it sends `HostMessage::ReloadReady`, and the compositor calls
+  `reload` to swap. A runtime that loads quickly only implements `reload`.
 - `SchedulerTick` and cached evaluations run every frame while something
   animates; keep those paths free of serialization.
 

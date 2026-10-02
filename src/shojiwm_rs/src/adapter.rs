@@ -13,8 +13,8 @@ use std::{
 use shojiwm_lib::{
     runtime_api::{
         ConfigRuntime, DecorationRequest, EffectRequest, HostMessage, InputRequest, LaunchContext,
-        RuntimeError, RuntimeEvent, RuntimeLauncher, RuntimeReply, RuntimeRequest, WindowRequest,
-        WorkspaceRequest,
+        ReloadPreparation, RuntimeError, RuntimeEvent, RuntimeLauncher, RuntimeReply,
+        RuntimeRequest, WindowRequest, WorkspaceRequest,
     },
     ssd::{
         BackgroundEffectConfig, DecorationCachedEvaluationResult, DecorationEvaluationResult,
@@ -894,6 +894,10 @@ impl ConfigRuntime for ReactiveRuntime {
             runtime::publish_pending();
             Ok(())
         })
+    }
+
+    fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
+        Err(RuntimeError::Unsupported("hot reload of a compiled Rust config"))
     }
 
     fn reload(&mut self) -> Result<(), RuntimeError> {

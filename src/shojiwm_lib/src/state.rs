@@ -112,7 +112,9 @@ use crate::runtime_process::{
     kill_runtime_service, should_restart_service, spawn_runtime_process,
 };
 use crate::runtime_workspace::RuntimeWorkspaceConfigUpdate;
-use crate::runtime_api::{HostMessage, RuntimeBoot, RuntimeHandle, RuntimeHost};
+use crate::runtime_api::{
+    HostMessage, ReloadPreparation, RuntimeBoot, RuntimeError, RuntimeHandle, RuntimeHost,
+};
 use crate::ssd::{
     BackgroundEffectConfig, DecorationInteractionSnapshot, DecorationInteractionTarget,
     DecorationPointerMoveAsyncInvocation, LogicalPoint, LogicalRect,
@@ -142,6 +144,8 @@ use crate::{
 use tracing::{debug, error, info, warn};
 
 const WAYLAND_CLIENT_MAX_BUFFER_SIZE: usize = 1024 * 1024;
+/// How long the "hot reload is not available" notice stays on screen.
+const HOT_RELOAD_UNAVAILABLE_NOTICE_DURATION: Duration = Duration::from_secs(3);
 
 fn runtime_dirty_debug_enabled() -> bool {
     use std::sync::OnceLock;
@@ -2657,6 +2661,7 @@ impl ShojiWM {
     /// effects land before the caller acts on the reply itself, and from the
     /// host ping for messages sent from the runtime's own thread.
     pub fn drain_runtime_host_messages(&mut self) {
+        let mut reload_ready = None;
         while let Some(message) = self.config_runtime.host().pop() {
             match message {
                 HostMessage::Env(updates) => {
@@ -2687,7 +2692,14 @@ impl ShojiWM {
                     let loop_handle = self.loop_handle.clone();
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
                 }
+                HostMessage::ReloadReady(result) => reload_ready = Some(result),
             }
+        }
+        // Swap at a quiet point of the loop rather than wherever the queue
+        // happened to be drained (mid input dispatch, mid evaluation, ...).
+        if let Some(result) = reload_ready {
+            self.loop_handle
+                .insert_idle(move |state| state.finish_prepared_reload(result));
         }
     }
 
@@ -2749,7 +2761,83 @@ impl ShojiWM {
         debug!(window_id = snapshot.id, "warmed up decoration runtime");
     }
 
+    /// `Super+Shift+R`: ask the runtime to prepare a hot reload. A runtime that
+    /// builds its config in the background answers `Pending` and finishes
+    /// later through `HostMessage::ReloadReady`.
     pub fn reload_decoration_runtime(&mut self) {
+        let preparation = self.config_runtime.prepare_reload();
+        self.drain_runtime_host_messages();
+        match preparation {
+            Ok(ReloadPreparation::Ready) => self.swap_reloaded_decoration_runtime(),
+            Ok(ReloadPreparation::Pending) => {
+                info!(
+                    runtime = self.config_runtime.name(),
+                    "preparing config hot reload in the background"
+                );
+            }
+            Err(error) => self.report_hot_reload_failure(error),
+        }
+    }
+
+    fn finish_prepared_reload(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.swap_reloaded_decoration_runtime(),
+            Err(error) => self.report_hot_reload_error(error),
+        }
+    }
+
+    fn report_hot_reload_error(&mut self, error: impl std::fmt::Debug + ToString) {
+        warn!(?error, runtime = self.config_runtime.name(), "failed to hot reload config");
+        self.config_error_report = Some(crate::config_error::ConfigErrorReport::hot_reload(error));
+        self.schedule_redraw();
+    }
+
+    /// A runtime without hot reload is not an error the user has to fix, so
+    /// it gets a notice that goes away on its own instead of a sticky error.
+    fn report_hot_reload_failure(&mut self, error: RuntimeError) {
+        if !matches!(error, RuntimeError::Unsupported(_)) {
+            self.report_hot_reload_error(error);
+            return;
+        }
+        info!(runtime = self.config_runtime.name(), %error, "config hot reload is not available");
+        // Never cover a real error with a notice that is about to vanish.
+        if self
+            .config_error_report
+            .as_ref()
+            .is_some_and(|report| report.expires_at.is_none())
+        {
+            return;
+        }
+        self.config_error_report = Some(
+            crate::config_error::ConfigErrorReport::hot_reload_unavailable(
+                error,
+                HOT_RELOAD_UNAVAILABLE_NOTICE_DURATION,
+            ),
+        );
+        self.schedule_redraw();
+        if let Err(error) = self.loop_handle.insert_source(
+            Timer::from_duration(HOT_RELOAD_UNAVAILABLE_NOTICE_DURATION),
+            |_, _, state| {
+                // A later notice carries a later deadline and its own timer.
+                if state
+                    .config_error_report
+                    .as_ref()
+                    .is_some_and(|report| report.is_expired(Instant::now()))
+                {
+                    state.config_error_report = None;
+                    // Effect failures hidden behind the notice must show up again.
+                    crate::backend::shader_effect::reset_effect_error_reports();
+                    state.request_full_damage();
+                    state.schedule_redraw();
+                }
+                TimeoutAction::Drop
+            },
+        ) {
+            warn!(?error, "failed to schedule hot reload notice removal");
+        }
+    }
+
+    fn swap_reloaded_decoration_runtime(&mut self) {
         // Windows that are mid-close hold GPU snapshots whose release depends
         // on the current config's close handshake (`closePoll` →
         // `finalizeClose`). The reloaded config knows nothing about them, so
@@ -2761,10 +2849,7 @@ impl ShojiWM {
         let reload_result = self.config_runtime.reload();
         self.drain_runtime_host_messages();
         if let Err(error) = reload_result {
-            warn!(?error, runtime = self.config_runtime.name(), "failed to hot reload config");
-            self.config_error_report =
-                Some(crate::config_error::ConfigErrorReport::hot_reload(error));
-            self.schedule_redraw();
+            self.report_hot_reload_failure(error);
             return;
         }
 

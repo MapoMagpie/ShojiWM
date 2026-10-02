@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ConfigRuntime, DecorationRequest, EffectRequest, InputRequest, NullRuntime, RuntimeError,
-    RuntimeEvent, RuntimeHost, RuntimeReply, RuntimeRequest, WindowRequest, WorkspaceRequest,
+    ConfigRuntime, DecorationRequest, EffectRequest, InputRequest, NullRuntime, ReloadPreparation,
+    RuntimeError, RuntimeEvent, RuntimeHost, RuntimeReply, RuntimeRequest, WindowRequest,
+    WorkspaceRequest,
 };
 use crate::{
     keyboard_layout::KeyboardLayoutSnapshot,
@@ -84,6 +85,10 @@ impl RuntimeHandle {
 
     pub fn enable(&mut self) -> Result<(), RuntimeError> {
         self.runtime.enable()
+    }
+
+    pub fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
+        self.runtime.prepare_reload()
     }
 
     pub fn reload(&mut self) -> Result<(), RuntimeError> {

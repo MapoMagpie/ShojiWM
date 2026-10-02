@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use smithay::{
     backend::renderer::{
         element::{Id, Kind, solid::SolidColorRenderElement},
@@ -16,12 +18,17 @@ use crate::{
 pub struct ConfigErrorReport {
     pub kind: ConfigErrorKind,
     pub message: String,
+    /// When set, the compositor drops the report at this point. Errors stay until fixed;
+    /// notices that need no action (hot reload not available) go away on their own.
+    pub expires_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigErrorKind {
     InitialLoad,
     HotReload,
+    /// The runtime cannot hot reload (e.g. a compiled Rust config). Shown briefly.
+    HotReloadUnavailable,
     Runtime,
     /// A shader or effect pipeline from the config failed. Unlike the others this one is owned
     /// by the render path, which replaces or clears it as the set of failures changes.
@@ -33,6 +40,7 @@ impl ConfigErrorReport {
         Self {
             kind: ConfigErrorKind::InitialLoad,
             message: error.to_string(),
+            expires_at: None,
         }
     }
 
@@ -40,13 +48,27 @@ impl ConfigErrorReport {
         Self {
             kind: ConfigErrorKind::HotReload,
             message: error.to_string(),
+            expires_at: None,
         }
+    }
+
+    pub fn hot_reload_unavailable(message: impl ToString, lifetime: Duration) -> Self {
+        Self {
+            kind: ConfigErrorKind::HotReloadUnavailable,
+            message: message.to_string(),
+            expires_at: Some(Instant::now() + lifetime),
+        }
+    }
+
+    pub fn is_expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
     }
 
     pub fn effect(error: impl ToString) -> Self {
         Self {
             kind: ConfigErrorKind::Effect,
             message: error.to_string(),
+            expires_at: None,
         }
     }
 
@@ -54,6 +76,7 @@ impl ConfigErrorReport {
         Self {
             kind: ConfigErrorKind::Runtime,
             message: error.to_string(),
+            expires_at: None,
         }
     }
 }
@@ -63,13 +86,17 @@ pub fn background_elements_for_output(
     output_geo: Rectangle<i32, Logical>,
     scale: Scale<f64>,
 ) -> Vec<SolidColorRenderElement> {
-    let Some(_) = report else {
+    let Some(report) = report else {
         return Vec::new();
     };
 
     let margin = 24;
     let width = (output_geo.size.w - margin * 2).clamp(1, 1100);
-    let height = (output_geo.size.h / 3).clamp(160, 420);
+    let height = match report.kind {
+        // Title and a single line of text.
+        ConfigErrorKind::HotReloadUnavailable => 84,
+        _ => (output_geo.size.h / 3).clamp(160, 420),
+    };
     let logical = Rectangle::new(Point::from((margin, margin)), (width, height).into());
     let physical = logical.to_physical_precise_round(scale);
 
@@ -99,6 +126,7 @@ pub fn text_elements_for_output(
     let title = match report.kind {
         ConfigErrorKind::InitialLoad => "ShojiWM config initial load failed",
         ConfigErrorKind::HotReload => "ShojiWM config hot reload failed",
+        ConfigErrorKind::HotReloadUnavailable => "ShojiWM config hot reload is not available",
         ConfigErrorKind::Runtime => "ShojiWM config runtime error",
         ConfigErrorKind::Effect => "ShojiWM effect error (the effect is disabled)",
     };
@@ -229,4 +257,20 @@ fn wrap_lines(message: &str, max_chars: usize) -> Vec<String> {
         }
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_hot_reload_unavailable_notice_expires() {
+        let now = Instant::now();
+        let notice = ConfigErrorReport::hot_reload_unavailable("x", Duration::from_secs(3));
+        assert!(!notice.is_expired(now));
+        assert!(notice.is_expired(now + Duration::from_secs(4)));
+
+        let error = ConfigErrorReport::hot_reload("x");
+        assert!(!error.is_expired(now + Duration::from_secs(3600)));
+    }
 }

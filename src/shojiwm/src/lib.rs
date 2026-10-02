@@ -211,7 +211,7 @@ mod tests {
 
     use super::*;
     use shojiwm_lib::runtime_api::{
-        HostMessage, NullRuntime, RuntimeHandle, RuntimeHost, cli::CommonArgs,
+        HostMessage, NullRuntime, ReloadPreparation, RuntimeHandle, RuntimeHost, cli::CommonArgs,
     };
 
     fn key_binding_ids(host: &RuntimeHost) -> Option<Vec<String>> {
@@ -313,6 +313,10 @@ COMPOSITOR.window.composition = (window) => <Label text={{window.title}} />;
         runtime.scheduler_tick(2.0).expect("scheduler should tick");
 
         write_config(true);
+        assert_eq!(
+            runtime.prepare_reload().expect("reload should prepare"),
+            ReloadPreparation::Ready
+        );
         runtime.reload().expect("config should hot reload");
         assert_eq!(
             key_binding_ids(&host),

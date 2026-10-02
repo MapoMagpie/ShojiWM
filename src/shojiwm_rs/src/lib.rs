@@ -212,4 +212,81 @@ mod tests {
         assert!(runtime.invoke_key_binding("any", 0).unwrap().invoked);
         assert!(runtime.scheduler_tick(0.0).unwrap().next_poll_in_ms.is_none());
     }
+
+    /// A runtime whose new config takes a while to build: `prepare_reload`
+    /// starts the build on another thread and returns at once, the old config
+    /// keeps answering, and `ReloadReady` tells the compositor when `reload`
+    /// can swap.
+    struct SlowBuild {
+        host: RuntimeHost,
+        generation: u32,
+        build: Option<std::sync::mpsc::Receiver<u32>>,
+    }
+
+    impl ConfigRuntime for SlowBuild {
+        fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let host = self.host.clone();
+            let next = self.generation + 1;
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                sender.send(next).unwrap();
+                host.send(HostMessage::ReloadReady(Ok(())));
+            });
+            self.build = Some(receiver);
+            Ok(ReloadPreparation::Pending)
+        }
+
+        fn reload(&mut self) -> Result<(), RuntimeError> {
+            let build = self
+                .build
+                .take()
+                .ok_or(RuntimeError::Unsupported("reload without a prepared build"))?;
+            self.generation = build
+                .recv()
+                .map_err(|error| RuntimeError::RuntimeProtocol(error.to_string()))?;
+            Ok(())
+        }
+
+        fn request(
+            &mut self,
+            _now_ms: f64,
+            request: RuntimeRequest<'_>,
+        ) -> Result<RuntimeReply, RuntimeError> {
+            Ok(match request {
+                RuntimeRequest::Input(InputRequest::KeyBinding { .. }) => {
+                    RuntimeReply::KeyBinding(ssd::DecorationKeyBindingInvocation {
+                        invoked: self.generation > 0,
+                        ..Default::default()
+                    })
+                }
+                _ => RuntimeReply::Unhandled,
+            })
+        }
+    }
+
+    #[test]
+    fn a_reload_can_be_prepared_in_the_background() {
+        let host = RuntimeHost::detached();
+        let runtime = SlowBuild {
+            host: host.clone(),
+            generation: 0,
+            build: None,
+        };
+        let mut runtime = RuntimeHandle::new("slow", Box::new(runtime), host.clone());
+
+        assert_eq!(runtime.prepare_reload().unwrap(), ReloadPreparation::Pending);
+        // The old config keeps answering while the build runs.
+        assert!(!runtime.invoke_key_binding("any", 0).unwrap().invoked);
+
+        let ready = loop {
+            if let Some(message) = host.pop() {
+                break message;
+            }
+            std::thread::yield_now();
+        };
+        assert!(matches!(ready, HostMessage::ReloadReady(Ok(()))));
+        runtime.reload().unwrap();
+        assert!(runtime.invoke_key_binding("any", 0).unwrap().invoked);
+    }
 }
