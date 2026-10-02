@@ -1,4 +1,9 @@
 interface EmbeddedRuntimeBridge {
+  createOverlay(output: string, placement: string, maxDuration: number, effect: unknown, persistent: boolean): number;
+  waitOverlay(id: number): Promise<void>;
+  waitOverlayClosed(id: number): Promise<void>;
+  updateOverlay(id: number, effect: unknown): void;
+  disposeOverlay(id: number): void;
   readRequest(): Promise<EmbeddedRuntimeRequest | null>;
   writeResponse(response: string): void;
   writeInteractionResponse(response: NativeInteractionSuccess): void;
@@ -300,6 +305,7 @@ import {
   enterLayerDependencyScope,
   isSignal,
   installAssetResolverBridge,
+  installOverlayBridge,
   installProcessResolverBridge,
   installRuntimeHooks,
   enterWindowEffectDependencyScope,
@@ -1401,6 +1407,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
   let composition: WindowCompositionFunction | null = null;
   let events: CompositorEventController | null = null;
   let effectConfig: RuntimeEffectConfig | null = null;
+  let handlingRequest = false;
 
   async function loadRuntimeConfig(): Promise<{
     composition: WindowCompositionFunction;
@@ -1425,6 +1432,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
       composition = resolveComposition(loadedConfig);
       events = resolveEvents(loadedConfig);
       effectConfig = resolveEffectConfig(loadedConfig);
+      installOverlayBridge(embeddedBridge, () => !handlingRequest);
     }
     return {
       composition: composition!,
@@ -1434,6 +1442,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
   }
 
   for await (const request of readEmbeddedMessages(embeddedBridge)) {
+    handlingRequest = true;
     try {
       if ("displayState" in request) {
         updateOutputState(request.displayState);
@@ -2258,6 +2267,8 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
         displayConfig: pendingDisplayConfigPayload(),
         workspaceConfig: pendingWorkspaceConfigPayload(),
       });
+    } finally {
+      handlingRequest = false;
     }
   }
 }

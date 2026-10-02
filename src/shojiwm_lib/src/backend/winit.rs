@@ -1074,6 +1074,7 @@ pub fn init_winit(
                             upper_layer_backdrop_windows,
                             fullscreen_scanout.is_some(),
                         ));
+                        let mut overlay_below_layers = scene_elements.len();
                         scene_elements.extend(
                             closing_snapshot_elements(renderer, state, &output, scale),
                         );
@@ -1970,6 +1971,7 @@ pub fn init_winit(
                             &mut state.popup_framebuffer_effect_states,
                             configured_background_effect.as_ref(),
                         );
+                        overlay_below_layers += layer_popup_elements.len();
                         layer_popup_elements.append(&mut scene_elements);
                         scene_elements = layer_popup_elements;
 
@@ -2002,7 +2004,13 @@ pub fn init_winit(
                                 .into_iter()
                                 .map(WinitRenderElements::Damage),
                         );
+                        overlay_below_layers += content_elements.len();
                         content_elements.extend(scene_elements);
+                        if !state.session_lock_active {
+                            state.output_overlays.render(renderer, &output,
+                                (output_geo.size.w, output_geo.size.h), scale, &mut content_elements,
+                                overlay_below_layers, WinitRenderElements::Snapshot);
+                        }
 
                         let mut elements: Vec<WinitRenderElements> = Vec::new();
                         let error_text_elements = crate::config_error::text_elements_for_output(
