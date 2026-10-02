@@ -5,7 +5,8 @@ sidebar_position: 2
 # ShojiWM Architecture
 
 In one sentence: **ShojiWM is a Wayland compositor with a fast core written in
-Rust, whose look and behavior you describe in TypeScript/TSX.**
+Rust, whose look and behavior you describe in TypeScript/TSX** (or in Rust, or
+any language with a config runtime).
 
 ## The big picture
 
@@ -27,7 +28,8 @@ flowchart LR
   be fast and reliable.
 - The **TypeScript config runtime** decides how windows look and behave. It runs
   inside the `shoji_wm` process on the Deno/V8 engine embedded through
-  RustyScript. You write this part.
+  RustyScript. You write this part — or write it in Rust instead, see
+  [below](#the-config-runtime-is-pluggable).
 - The core draws the final frame on the **GPU**.
 
 ## Two worlds: Rust core and TypeScript config
@@ -49,6 +51,23 @@ Node.js is therefore not required to run ShojiWM. It is only used by optional
 repository tooling such as standalone TypeScript checks and the Docusaurus
 documentation site.
 
+## The config runtime is pluggable
+
+The core does not depend on TypeScript. It talks to *a* config runtime through
+a language-neutral interface (`shojiwm_lib::runtime_api`): it sends typed
+requests (evaluate this window, run this key binding, tick the scheduler) and
+receives answers and side effects (key bindings, outputs, processes). Anything
+a runtime does not answer falls back to built-in behavior.
+
+| Crate | What it is |
+| --- | --- |
+| `shojiwm_lib` | The compositor and the runtime interface. No V8. |
+| `shoji_wm` | The TypeScript runtime (embedded V8) and the default `shoji_wm` binary. |
+| `shojiwm_rs` | The Rust runtime: configs written in Rust, with the same reactive model as the TypeScript SDK. |
+
+A runtime for another language is one more crate on top of `shojiwm_lib`. See
+[Config languages](../configuration/languages.md).
+
 ## Server-Side Decoration (SSD) flow
 
 ```mermaid
@@ -66,6 +85,11 @@ sequenceDiagram
 ## Directory layout
 
 ```
-src/        Rust core (compositor, IPC, protocol, portal)
-packages/   TypeScript SDK (shoji_wm) and user config
+src/shojiwm_lib/                  Compositor core and the config runtime interface
+src/shojiwm/                      TypeScript runtime and the default shoji_wm binary
+src/shojiwm_rs/                   Rust config runtime
+src/shojiwm_rs/examples/          The default config ported to Rust
+src/xdg-desktop-portal-shojiwm/   Screen-cast portal
+packages/shoji_wm/                TypeScript SDK
+packages/config/                  Default TypeScript config
 ```

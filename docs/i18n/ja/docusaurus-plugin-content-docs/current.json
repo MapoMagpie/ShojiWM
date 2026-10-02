@@ -16,7 +16,7 @@
     "description": "The label for category 'Configuration' in sidebar 'docsSidebar'"
   },
   "sidebar.docsSidebar.category.Configuration.link.generated-index.description": {
-    "message": "TypeScript と TSX で ShojiWM を設定します。",
+    "message": "TypeScript・TSX、Rust、または任意の言語で ShojiWM を設定します。",
     "description": "The generated-index page description for category 'Configuration' in sidebar 'docsSidebar'"
   },
   "sidebar.docsSidebar.category.Architecture": {

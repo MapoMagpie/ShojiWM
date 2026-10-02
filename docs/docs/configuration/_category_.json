@@ -3,6 +3,6 @@
   "position": 4,
   "link": {
     "type": "generated-index",
-    "description": "Configure ShojiWM with TypeScript and TSX."
+    "description": "Configure ShojiWM with TypeScript and TSX, Rust, or a language of your choice."
   }
 }

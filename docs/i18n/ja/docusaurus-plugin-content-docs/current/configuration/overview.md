@@ -4,9 +4,15 @@ sidebar_position: 1
 
 # 概要
 
-ShojiWM の設定はすべて TypeScript/TSX で書きます。設定ファイルは `shoji_wm` から
+ShojiWM の設定は標準では TypeScript/TSX で書きます。設定ファイルは `shoji_wm` から
 import する普通の TypeScript モジュールで、コンポジターとのやり取りはただ一つの
 ルートオブジェクト **`COMPOSITOR`** を通じて行います。
+
+:::note
+TypeScript は標準というだけで、必須ではありません。同じモデルを **Rust** でも使え、
+**その他の任意の言語** のランタイムをコンポジターに組み込むこともできます。
+詳しくは [設定言語](./languages.md) を参照してください。
+:::
 
 ```tsx
 import {COMPOSITOR, ManagedWindow, ClientWindow, WindowBorder} from 'shoji_wm';

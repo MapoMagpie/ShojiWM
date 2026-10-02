@@ -5,7 +5,8 @@ sidebar_position: 1
 # はじめに
 
 **ShojiWM** はプログラマブルな Wayland コンポジターです。ウィンドウの装飾・
-レイアウト・視覚エフェクトは TypeScript/TSX で記述し、コンポジターのコアは
+レイアウト・視覚エフェクトは標準では TypeScript/TSX で記述し（Rust や、自分で組み込んだ
+任意の言語でも書けます）、コンポジターのコアは
 [Smithay](https://github.com/Smithay/smithay) を基盤とした Rust で実装されています。
 
 ## 特徴
@@ -88,8 +89,12 @@ const LAYER_BLUR_MASK = compileLayerEffect({
 })
 ```
 
-- **ホットリロード** — セッションを再起動せずに設定を反復開発できます
+- **ホットリロード** — セッションを再起動せずに TypeScript の設定を反復開発できます
   （`Super` + `Shift` + `R`）。
+- **任意の設定言語** — TypeScript/TSX は標準で、Rust は `shojiwm_rs` で使えます
+  （デフォルト設定の Rust 移植が example として付属）。それ以外の言語も、言語に
+  依存しないランタイムインターフェースで組み込めます。詳しくは
+  [設定言語](./configuration/languages.md) を参照してください。
 
 ## 次に読むべきページ
 

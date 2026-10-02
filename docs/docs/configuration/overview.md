@@ -4,9 +4,15 @@ sidebar_position: 1
 
 # Overview
 
-ShojiWM is configured entirely from TypeScript/TSX. Your config is a normal
+ShojiWM is configured from TypeScript/TSX by default. Your config is a normal
 TypeScript module that imports from `shoji_wm` and talks to the compositor
 through a single root object: **`COMPOSITOR`**.
+
+:::note
+TypeScript is the default, not a requirement. The same model is available in
+**Rust**, and a runtime for **any other language** can plug into the
+compositor. See [Config languages](./languages.md).
+:::
 
 ```tsx
 import {COMPOSITOR, ManagedWindow, ClientWindow, WindowBorder} from 'shoji_wm';
