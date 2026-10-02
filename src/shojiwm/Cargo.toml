@@ -4,61 +4,17 @@ name = "shoji_wm"
 version = "0.1.0"
 edition = "2024"
 
+# The default ShojiWM: the compositor library plus the embedded TypeScript
+# config runtime. The binary keeps the historical `shoji_wm` name.
+[[bin]]
+name = "shoji_wm"
+path = "src/main.rs"
+
 [dependencies]
-bitflags = "2.11.0"
-thiserror = "2.0.12"
-smithay = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52",
-    features = ["use_system_lib", "xwayland"]
-}
-smithay-drm-extras = {
-    git = "https://github.com/bea4dev/smithay.git",
-    rev = "ba36cf26cd7cdf4431319392301c82ea226dfc52",
-    package = "smithay-drm-extras",
-    default-features = false
-}
-# xwayland-satellite, run in-process on its own thread (see
-# `xwayland_satellite.rs`). Renamed so the crate does not clash with that module.
-satellite = {
-    package = "xwayland-satellite",
-    git = "https://github.com/bea4dev/xwayland-satellite.git",
-    rev = "000dd9834a4964d2363bb197adbcf55092909030"
-}
-wayland-protocols = { version = "0.32.12", features = ["server", "staging"] }
-wayland-protocols-wlr = { version = "0.3.12", features = ["server"] }
-wayland-server = { version = "0.31.13", features = ["libwayland_1_23"] }
-# Preserve libwayland-server diagnostics (including internal protocol and
-# client I/O errors) in ShojiWM's tracing log when using Smithay's system-lib
-# backend.
-wayland-backend = { version = "0.3.15", features = ["log"] }
+shojiwm_lib = { path = "../shojiwm_lib" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-rustc-hash = "2.1.1"
-bumpalo = { version = "3.20.2", features = ["allocator-api2"] }
-hashbrown = { version = "0.15.5", features = ["allocator-api2"] }
-input = "0.10.0"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-# Moves log writes off the compositor thread; see `init_logging` for why a
-# synchronous writer is a hazard here.
-tracing-appender = "0.2.3"
-xkbcommon = "0.9.0"
-xcursor = "0.3.10"
-cgmath = "0.18.0"
-fontdb = "0.16.2"
-fontdue = "0.9.3"
-cosmic-text = "0.17.2"
-png = "0.17.16"
-resvg = "0.45.1"
-mimalloc = "0.1.52"
-# Direct calloop dep with the `signals` feature so the embedded TypeScript
-# runtime can wake the compositor after IPC-driven state changes.
-calloop = { version = "0.14.0", features = ["signals"] }
-# Used at the very top of main() to block SIGUSR1 process-wide so the signalfd
-# source in calloop receives it deterministically (without random threads
-# catching it before we can read).
-libc = "0.2"
 timescope = "0.1.3"
 # web_stub, not web: `web` is one of rustyscript's network_extensions and pulls
 # deno_net/deno_fetch/deno_tls, so rustls, ring, reqwest and quinn end up in a
@@ -86,9 +42,4 @@ icu_properties = "=2.1.2"
 idna_adapter = "=1.2.1"
 
 [features]
-# Hardened allocator for chasing heap corruption:
-# `secure` adds guard pages and encoded free lists so a
-# use-after-free write aborts at the faulting site instead of corrupting
-# state that detonates later; `debug` adds mimalloc's internal assertions.
-# Build with `cargo build --release --features heap-debug` and reproduce.
-heap-debug = ["mimalloc/secure", "mimalloc/debug"]
+heap-debug = ["shojiwm_lib/heap-debug"]

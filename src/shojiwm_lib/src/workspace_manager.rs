@@ -29,7 +29,6 @@ use crate::{
         RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate,
         RuntimeWorkspaceEntry, RuntimeWorkspaceGroupConfig,
     },
-    ssd::DecorationEvaluator,
     state::ShojiWM,
 };
 
@@ -872,13 +871,13 @@ impl ExtWorkspaceManagerHandler for ShojiWM {
         };
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
-        match self.decoration_evaluator.workspace_activate(&event, now_ms) {
+        match self.config_runtime.workspace_activate(&event, now_ms) {
             Ok(invocation) => {
                 let dirty_window_ids = invocation.dirty_window_ids.clone();
                 let dirty_managed_window_ids = invocation.dirty_managed_window_ids.clone();
                 let actions = invocation.actions.clone();
                 let next_poll_in_ms = invocation.next_poll_in_ms;
-                self.consume_runtime_lifecycle_invocation(invocation);
+                self.drain_runtime_host_messages();
 
                 if !dirty_window_ids.is_empty() || !dirty_managed_window_ids.is_empty() {
                     self.runtime_poll_dirty = true;

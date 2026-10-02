@@ -9,12 +9,11 @@
 //!
 //! Rendering, hit-testing and TS bridging are implemented in later milestones.
 
-mod bridge;
-mod embedded_runtime;
+pub mod bridge;
 mod evaluator;
 mod integration;
 mod interaction;
-mod window_model;
+pub mod window_model;
 
 use smithay::utils::Logical;
 
@@ -28,14 +27,15 @@ pub use evaluator::{
     DecorationCachedEvaluationResult, DecorationEvaluationError, DecorationEvaluationResult,
     DecorationEvaluator, DecorationGestureSwipeAsyncInvocation, DecorationHandlerInvocation,
     DecorationKeyBindingInvocation, DecorationPointerMoveAsyncInvocation,
-    DecorationRuntimeAsyncInvocation, DecorationSchedulerTick, DecorationWindowMoveInvocation,
+    DecorationSchedulerTick, DecorationWindowMoveInvocation,
     DecorationWindowResizeInvocation, DecorationWindowStateRequestInvocation,
-    EmbeddedDecorationEvaluator, LayerEffectEvaluationResult, PopupEffectEvaluationResult,
+    LayerEffectEvaluationResult, PopupEffectEvaluationResult,
     RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment, RuntimePopupEffectAssignment,
     RuntimeWindowAction, StaticDecorationEvaluator, evaluate_dynamic_decoration,
+    validate_layer_effect_config, validate_popup_effect_config,
 };
 pub use integration::{
-    CachedDecorationBuffer, ContentClip, DecorationRuntimeEvaluator, EffectEvaluationCacheEntry,
+    CachedDecorationBuffer, ContentClip, EffectEvaluationCacheEntry,
     WindowDecorationState,
 };
 pub use interaction::DecorationInteractionSnapshot;
@@ -766,7 +766,7 @@ pub enum ShaderUniformValue {
 }
 
 impl ShaderUniformValue {
-    pub(crate) fn shape_matches(&self, other: &Self) -> bool {
+    pub fn shape_matches(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Float(_), Self::Float(_))
             | (Self::Vec2(_), Self::Vec2(_))

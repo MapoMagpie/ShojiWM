@@ -32,7 +32,7 @@ use crate::{
         resize_grab::{ResizeEdge, ResizeSurfaceGrab},
     },
     ssd::{
-        DecorationEvaluator, DecorationHitTestResult, GestureSwipeEventSnapshot,
+        DecorationHitTestResult, GestureSwipeEventSnapshot,
         GestureSwipePhaseSnapshot, LogicalPoint, PointerModifierStateSnapshot,
         PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
         WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
@@ -325,21 +325,11 @@ impl ShojiWM {
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
         match self
-            .decoration_evaluator
+            .config_runtime
             .invoke_key_binding(binding_id, now_ms)
         {
             Ok(invocation) => {
-                self.consume_runtime_display_config(invocation.display_config);
-                self.consume_runtime_workspace_config(invocation.workspace_config);
-                self.consume_runtime_key_binding_config(invocation.key_binding_config);
-                self.consume_runtime_pointer_config(invocation.pointer_config);
-                self.consume_runtime_input_config(invocation.input_config);
-                self.consume_runtime_event_config(invocation.event_config);
-                self.consume_runtime_process_config(invocation.process_config);
-                self.consume_runtime_debug_config(invocation.debug_config);
-                if !invocation.process_actions.is_empty() {
-                    self.apply_runtime_process_actions(invocation.process_actions);
-                }
+                self.drain_runtime_host_messages();
                 if invocation.dirty {
                     self.runtime_poll_dirty = true;
                     self.mark_runtime_dirty_windows(
@@ -399,7 +389,7 @@ impl ShojiWM {
         };
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         if self.runtime_pointer_move_enabled {
-            match self.decoration_evaluator.pointer_move(&event, now_ms) {
+            match self.config_runtime.pointer_move(&event, now_ms) {
                 Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
                 Err(error) => {
                     tracing::warn!(?error, "runtime pointer move event failed");
@@ -407,7 +397,7 @@ impl ShojiWM {
             }
         }
         if self.runtime_pointer_move_async_enabled {
-            self.decoration_evaluator.pointer_move_async(event, now_ms);
+            self.config_runtime.pointer_move_async(event, now_ms);
         }
     }
 
@@ -459,7 +449,7 @@ impl ShojiWM {
             );
         }
         if self.runtime_gesture_swipe_enabled {
-            match self.decoration_evaluator.gesture_swipe(&event, now_ms) {
+            match self.config_runtime.gesture_swipe(&event, now_ms) {
                 Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
                 Err(error) => {
                     tracing::warn!(?error, "runtime gesture swipe event failed");
@@ -467,7 +457,7 @@ impl ShojiWM {
             }
         }
         if self.runtime_gesture_swipe_async_enabled {
-            self.decoration_evaluator.gesture_swipe_async(event, now_ms);
+            self.config_runtime.gesture_swipe_async(event, now_ms);
         }
     }
 
@@ -1329,37 +1319,12 @@ impl ShojiWM {
                                 let now_ms =
                                     std::time::Duration::from(self.clock.now()).as_millis() as u64;
                                 self.sync_runtime_display_state();
-                                if let Ok(invocation) = self.decoration_evaluator.invoke_handler(
+                                if let Ok(invocation) = self.config_runtime.invoke_handler(
                                     &window_id,
                                     &handler_id,
                                     now_ms,
                                 ) {
-                                    self.consume_runtime_display_config(
-                                        invocation.display_config.clone(),
-                                    );
-                                    self.consume_runtime_workspace_config(
-                                        invocation.workspace_config.clone(),
-                                    );
-                                    self.consume_runtime_key_binding_config(
-                                        invocation.key_binding_config.clone(),
-                                    );
-                                    self.consume_runtime_pointer_config(
-                                        invocation.pointer_config.clone(),
-                                    );
-                                    self.consume_runtime_input_config(
-                                        invocation.input_config.clone(),
-                                    );
-                                    self.consume_runtime_event_config(
-                                        invocation.event_config.clone(),
-                                    );
-                                    self.consume_runtime_process_config(
-                                        invocation.process_config.clone(),
-                                    );
-                                    if !invocation.process_actions.is_empty() {
-                                        self.apply_runtime_process_actions(
-                                            invocation.process_actions.clone(),
-                                        );
-                                    }
+                                    self.drain_runtime_host_messages();
                                     self.apply_runtime_handler_invocation(&window, &invocation);
 
                                     if invocation.invoked {
@@ -1830,7 +1795,7 @@ impl ShojiWM {
                 self.snapshot_dirty_window_ids
                     .remove(&runtime_action.window_id);
                 let _ = self
-                    .decoration_evaluator
+                    .config_runtime
                     .window_closed(&runtime_action.window_id);
                 self.runtime_dirty_window_ids
                     .remove(&runtime_action.window_id);
@@ -2734,22 +2699,13 @@ impl ShojiWM {
         let now_ms = std::time::Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
         let Ok(invocation) = self
-            .decoration_evaluator
+            .config_runtime
             .invoke_handler(window_id, handler_id, now_ms)
         else {
             return false;
         };
 
-        self.consume_runtime_display_config(invocation.display_config.clone());
-        self.consume_runtime_workspace_config(invocation.workspace_config.clone());
-        self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
-        self.consume_runtime_pointer_config(invocation.pointer_config.clone());
-        self.consume_runtime_input_config(invocation.input_config.clone());
-        self.consume_runtime_event_config(invocation.event_config.clone());
-        self.consume_runtime_process_config(invocation.process_config.clone());
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions.clone());
-        }
+        self.drain_runtime_host_messages();
         self.apply_runtime_handler_invocation(window, &invocation);
 
         let invoked = invocation.invoked;

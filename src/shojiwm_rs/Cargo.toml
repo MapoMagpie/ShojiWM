@@ -1,0 +1,10 @@
+# !tyml @cargo/Cargo
+[package]
+name = "shojiwm_rs"
+version = "0.1.0"
+edition = "2024"
+
+# Config runtime for ShojiWM configs written in Rust. Library only: a config
+# crate depends on this and builds its own binary.
+[dependencies]
+shojiwm_lib = { path = "../shojiwm_lib" }

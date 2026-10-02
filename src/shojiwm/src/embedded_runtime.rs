@@ -31,7 +31,7 @@ use rustyscript::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{
+use shojiwm_lib::ssd::{
     BackgroundEffectConfig, CompiledEffect, DecorationNode, EffectInput, EffectStage,
     OpaqueRegionPolicy, ShaderStage, SurfacePolicy, WindowEffectConfig,
     bridge::{WireCompiledEffect, WireDecorationNode, WireWindowEffectConfig},
@@ -42,7 +42,7 @@ use super::{
         WindowResizeEventSnapshot, WindowTransform,
     },
 };
-use crate::runtime_input::RuntimeInputDeviceSnapshot;
+use shojiwm_lib::runtime_input::RuntimeInputDeviceSnapshot;
 
 /// Composition requests cross the CppGC bridge as V8 values instead of JSON
 /// frames. Ownership moves into the request envelope, so large snapshots are
@@ -224,7 +224,7 @@ pub struct NativeSchedulerRequest {
     pub display_state: std::collections::BTreeMap<String, WaylandOutputSnapshot>,
     pub input_state: std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub keyboard_layout: Option<crate::keyboard_layout::KeyboardLayoutSnapshot>,
+    pub keyboard_layout: Option<shojiwm_lib::keyboard_layout::KeyboardLayoutSnapshot>,
 }
 
 enum BridgeRequest {
@@ -245,44 +245,9 @@ enum BridgeRequest {
     },
 }
 
-// boxing left as a follow-up (touches all construction/match sites)
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum NativeCompositionPatch {
-    /// A structural or otherwise generic node change. This remains the
-    /// compatibility fallback and performs one serde_v8 conversion.
-    ReplaceNode {
-        node_id: String,
-        node: DecorationNode,
-    },
-    /// The steady animation fast path. Mutate one uniform in the compositor's
-    /// persistent tree without decoding or rebuilding the shader pipeline.
-    ShaderUniform {
-        node_id: String,
-        stage_index: usize,
-        name: String,
-        value: super::ShaderUniformValue,
-    },
-}
+pub use shojiwm_lib::runtime_api::CompositionPatch as NativeCompositionPatch;
 
-pub const SHADER_INPUT_STAGE_INDEX: usize = u32::MAX as usize;
-
-impl NativeCompositionPatch {
-    pub fn node_id(&self) -> &str {
-        match self {
-            Self::ReplaceNode { node_id, .. } | Self::ShaderUniform { node_id, .. } => node_id,
-        }
-    }
-
-    pub fn replacement_node(&self) -> Option<&DecorationNode> {
-        match self {
-            Self::ReplaceNode { node, .. } => Some(node),
-            Self::ShaderUniform { .. } => None,
-        }
-    }
-}
-
-// boxing left as a follow-up (see NativeCompositionPatch above)
+// boxing left as a follow-up (see CompositionPatch)
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum NativeCompositionUpdate {
@@ -351,7 +316,7 @@ struct NativeEffectUniformPatch {
     effect_slot: NativeEffectSlotKind,
     shader_path: Vec<NativeEffectShaderPathSegment>,
     name: String,
-    value: super::ShaderUniformValue,
+    value: shojiwm_lib::ssd::ShaderUniformValue,
 }
 
 #[derive(Debug, Clone)]
@@ -361,7 +326,7 @@ pub(super) struct NativeEffectUniformPatchBatch {
     patches: Vec<NativeEffectUniformPatch>,
 }
 
-// boxing left as a follow-up (see NativeCompositionPatch above)
+// boxing left as a follow-up (see CompositionPatch)
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum NativeEffectUpdate {
@@ -437,7 +402,7 @@ pub struct NativeInteractionResponse {
     pub dirty_managed_window_ids: Vec<String>,
     pub dirty_window_node_ids: HashMap<String, Vec<String>>,
     pub dirty_layer_node_ids: HashMap<String, Vec<String>>,
-    pub actions: Vec<super::evaluator::RuntimeWindowAction>,
+    pub actions: Vec<shojiwm_lib::ssd::RuntimeWindowAction>,
     pub next_poll_in_ms: Option<u64>,
 }
 
@@ -463,7 +428,7 @@ struct WireNativeInteractionResponse {
     dirty_window_node_ids: HashMap<String, Vec<String>>,
     #[serde(default)]
     dirty_layer_node_ids: HashMap<String, Vec<String>>,
-    actions: Vec<super::evaluator::RuntimeWindowAction>,
+    actions: Vec<shojiwm_lib::ssd::RuntimeWindowAction>,
     next_poll_in_ms: Option<u64>,
 }
 
@@ -599,13 +564,23 @@ fn op_shoji_ipc_listen(#[string] path: &str) -> Result<ShojiIpcListener, std::io
     Ok(ShojiIpcListener { inner })
 }
 
+/// Host the TS side wakes when it changed state on its own (IPC requests).
+/// Process-wide because the op has no other way to reach it; every isolate of
+/// a session talks to the same compositor.
+static WAKE_HOST: Mutex<Option<shojiwm_lib::runtime_api::RuntimeHost>> = Mutex::new(None);
+
+pub fn set_wake_host(host: shojiwm_lib::runtime_api::RuntimeHost) {
+    if let Ok(mut slot) = WAKE_HOST.lock() {
+        *slot = Some(host);
+    }
+}
+
 #[op2(fast)]
 fn op_shoji_wake_compositor() {
-    #[cfg(not(test))]
-    // SAFETY: SIGUSR1 is blocked process-wide before compositor threads start
-    // and consumed by calloop's signalfd source.
-    unsafe {
-        libc::kill(std::process::id() as libc::pid_t, libc::SIGUSR1);
+    if let Ok(slot) = WAKE_HOST.lock()
+        && let Some(host) = slot.as_ref()
+    {
+        host.wake();
     }
 }
 
@@ -1215,8 +1190,8 @@ impl ShojiRuntimeBridge {
                 tiled: flags & (1 << 6) != 0,
                 allow_tearing,
                 z_index: (flags & (1 << 11) != 0).then_some(fields[14] as i32),
-                surface_policy: (flags & (1 << 12) != 0).then_some(crate::ssd::SurfacePolicy {
-                    opaque_region: crate::ssd::OpaqueRegionPolicy::Ignore,
+                surface_policy: (flags & (1 << 12) != 0).then_some(shojiwm_lib::ssd::SurfacePolicy {
+                    opaque_region: shojiwm_lib::ssd::OpaqueRegionPolicy::Ignore,
                 }),
                 transform: WindowTransform {
                     origin: TransformOrigin {
@@ -1338,7 +1313,7 @@ impl ShojiRuntimeBridge {
                     window_id,
                     node: tree
                         .try_into()
-                        .map_err(|error: super::DecorationBridgeError| {
+                        .map_err(|error: shojiwm_lib::ssd::DecorationBridgeError| {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
                         })?,
                 }
@@ -1348,7 +1323,7 @@ impl ShojiRuntimeBridge {
                     .into_iter()
                     .map(|patch| {
                         let node: DecorationNode = patch.node.try_into().map_err(
-                            |error: super::DecorationBridgeError| {
+                            |error: shojiwm_lib::ssd::DecorationBridgeError| {
                                 std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     error.to_string(),
@@ -1398,7 +1373,7 @@ impl ShojiRuntimeBridge {
     ) -> Result<(), std::io::Error> {
         timescope::scope!("runtime native effect decode");
         let request_id = checked_request_id(request_id)?;
-        let bridge_error = |error: super::DecorationBridgeError| {
+        let bridge_error = |error: shojiwm_lib::ssd::DecorationBridgeError| {
             // `ErrorKind::Other`, not `InvalidData`: deno maps the kind to a JS error class,
             // and this embedded runtime has no `InvalidData` class registered, so the throw
             // surfaced as a bare `undefined` and the message below never reached the config
@@ -1770,10 +1745,10 @@ impl ShojiRuntimeBridge {
             ));
         }
         let value = match value_len {
-            1 => super::ShaderUniformValue::Float(values[0]),
-            2 => super::ShaderUniformValue::Vec2([values[0], values[1]]),
-            3 => super::ShaderUniformValue::Vec3([values[0], values[1], values[2]]),
-            4 => super::ShaderUniformValue::Vec4(values),
+            1 => shojiwm_lib::ssd::ShaderUniformValue::Float(values[0]),
+            2 => shojiwm_lib::ssd::ShaderUniformValue::Vec2([values[0], values[1]]),
+            3 => shojiwm_lib::ssd::ShaderUniformValue::Vec3([values[0], values[1], values[2]]),
+            4 => shojiwm_lib::ssd::ShaderUniformValue::Vec4(values),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1894,10 +1869,10 @@ impl ShojiRuntimeBridge {
             ));
         }
         let value = match value_len {
-            1 => super::ShaderUniformValue::Float(values[0]),
-            2 => super::ShaderUniformValue::Vec2([values[0], values[1]]),
-            3 => super::ShaderUniformValue::Vec3([values[0], values[1], values[2]]),
-            4 => super::ShaderUniformValue::Vec4(values),
+            1 => shojiwm_lib::ssd::ShaderUniformValue::Float(values[0]),
+            2 => shojiwm_lib::ssd::ShaderUniformValue::Vec2([values[0], values[1]]),
+            3 => shojiwm_lib::ssd::ShaderUniformValue::Vec3([values[0], values[1], values[2]]),
+            4 => shojiwm_lib::ssd::ShaderUniformValue::Vec4(values),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -2115,7 +2090,7 @@ fn native_shader_uniform_value(
     y: f64,
     z: f64,
     w: f64,
-) -> Result<super::ShaderUniformValue, std::io::Error> {
+) -> Result<shojiwm_lib::ssd::ShaderUniformValue, std::io::Error> {
     let values = [x, y, z, w].map(|value| value as f32);
     if values
         .iter()
@@ -2128,12 +2103,12 @@ fn native_shader_uniform_value(
         ));
     }
     match value_len {
-        1 => Ok(super::ShaderUniformValue::Float(values[0])),
-        2 => Ok(super::ShaderUniformValue::Vec2([values[0], values[1]])),
-        3 => Ok(super::ShaderUniformValue::Vec3([
+        1 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Float(values[0])),
+        2 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec2([values[0], values[1]])),
+        3 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec3([
             values[0], values[1], values[2],
         ])),
-        4 => Ok(super::ShaderUniformValue::Vec4(values)),
+        4 => Ok(shojiwm_lib::ssd::ShaderUniformValue::Vec4(values)),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "shader uniform length must be between 1 and 4",
@@ -2144,7 +2119,7 @@ fn native_shader_uniform_value(
 fn native_shader_uniform_array_value(
     element_width: u32,
     values: &[f32],
-) -> Result<super::ShaderUniformValue, std::io::Error> {
+) -> Result<shojiwm_lib::ssd::ShaderUniformValue, std::io::Error> {
     let width = element_width as usize;
     if !(1..=4).contains(&width) || values.is_empty() || !values.len().is_multiple_of(width) {
         return Err(std::io::Error::new(
@@ -2159,14 +2134,14 @@ fn native_shader_uniform_array_value(
         ));
     }
     Ok(match width {
-        1 => super::ShaderUniformValue::FloatArray(values.to_vec()),
-        2 => super::ShaderUniformValue::Vec2Array(
+        1 => shojiwm_lib::ssd::ShaderUniformValue::FloatArray(values.to_vec()),
+        2 => shojiwm_lib::ssd::ShaderUniformValue::Vec2Array(
             values.chunks_exact(2).map(|v| [v[0], v[1]]).collect(),
         ),
-        3 => super::ShaderUniformValue::Vec3Array(
+        3 => shojiwm_lib::ssd::ShaderUniformValue::Vec3Array(
             values.chunks_exact(3).map(|v| [v[0], v[1], v[2]]).collect(),
         ),
-        4 => super::ShaderUniformValue::Vec4Array(
+        4 => shojiwm_lib::ssd::ShaderUniformValue::Vec4Array(
             values
                 .chunks_exact(4)
                 .map(|v| [v[0], v[1], v[2], v[3]])
@@ -2212,7 +2187,7 @@ extension!(
     ],
     esm_entry_point = "ext:shoji_runtime_bridge/native.js",
     esm = [
-        dir "src/ssd",
+        dir "src",
         "ext:shoji_runtime_bridge/native.js" = "embedded_runtime.js",
     ],
 );

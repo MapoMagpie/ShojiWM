@@ -1,0 +1,179 @@
+//! Runtime → compositor channel.
+//!
+//! Everything a config runtime wants the compositor to *do* (as opposed to the
+//! direct answer of a request) travels through [`RuntimeHost`] as a
+//! [`HostMessage`]. The compositor drains the queue right after every
+//! `ConfigRuntime::request`, which keeps the ordering the old in-band
+//! piggyback had (a key binding update lands before the actions of the same
+//! reply), and from a calloop ping when a runtime thread sends something on
+//! its own (IPC, async pointer hooks).
+
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use smithay::reexports::calloop::ping::Ping;
+
+use crate::{
+    activation_environment::RuntimeEnvUpdates,
+    config::RuntimeDisplayConfigUpdate,
+    cursor::RuntimeCursorConfigUpdate,
+    runtime_debug::RuntimeDebugConfigUpdate,
+    runtime_input::RuntimeInputConfigUpdate,
+    runtime_key_binding::RuntimeKeyBindingConfigUpdate,
+    runtime_pointer::RuntimePointerConfigUpdate,
+    runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
+    runtime_workspace::RuntimeWorkspaceConfigUpdate,
+    ssd::{DecorationPointerMoveAsyncInvocation, RuntimeEventConfigUpdate},
+};
+
+/// A side effect requested by the config runtime.
+#[derive(Debug, Clone)]
+pub enum HostMessage {
+    /// Environment changes for spawned processes (`COMPOSITOR.env`).
+    Env(RuntimeEnvUpdates),
+    Display(RuntimeDisplayConfigUpdate),
+    Workspace(RuntimeWorkspaceConfigUpdate),
+    KeyBindings(RuntimeKeyBindingConfigUpdate),
+    Pointer(RuntimePointerConfigUpdate),
+    Input(RuntimeInputConfigUpdate),
+    /// Which optional input hooks the runtime wants to receive.
+    EventFilter(RuntimeEventConfigUpdate),
+    Process(RuntimeProcessConfigUpdate),
+    ProcessActions(Vec<RuntimeProcessAction>),
+    Debug(RuntimeDebugConfigUpdate),
+    Cursor(RuntimeCursorConfigUpdate),
+    /// Result of a posted (fire-and-forget) pointer or gesture hook.
+    PointerHookResult(DecorationPointerMoveAsyncInvocation),
+}
+
+/// Config deltas that every runtime reply may carry. A runtime implementation
+/// can collect them here and [`publish`](Self::publish) them in one go; the
+/// order matches the order the compositor has always applied them in.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeConfigDelta {
+    pub display_config: Option<RuntimeDisplayConfigUpdate>,
+    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
+    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
+    pub pointer_config: Option<RuntimePointerConfigUpdate>,
+    pub input_config: Option<RuntimeInputConfigUpdate>,
+    pub event_config: Option<RuntimeEventConfigUpdate>,
+    pub process_config: Option<RuntimeProcessConfigUpdate>,
+    pub debug_config: Option<RuntimeDebugConfigUpdate>,
+    pub process_actions: Vec<RuntimeProcessAction>,
+}
+
+impl RuntimeConfigDelta {
+    pub fn is_empty(&self) -> bool {
+        self.display_config.is_none()
+            && self.workspace_config.is_none()
+            && self.key_binding_config.is_none()
+            && self.pointer_config.is_none()
+            && self.input_config.is_none()
+            && self.event_config.is_none()
+            && self.process_config.is_none()
+            && self.debug_config.is_none()
+            && self.process_actions.is_empty()
+    }
+
+    pub fn publish(self, host: &RuntimeHost) {
+        if self.is_empty() {
+            return;
+        }
+        let mut messages = Vec::new();
+        messages.extend(self.display_config.map(HostMessage::Display));
+        messages.extend(self.workspace_config.map(HostMessage::Workspace));
+        messages.extend(self.key_binding_config.map(HostMessage::KeyBindings));
+        messages.extend(self.pointer_config.map(HostMessage::Pointer));
+        messages.extend(self.input_config.map(HostMessage::Input));
+        messages.extend(self.event_config.map(HostMessage::EventFilter));
+        messages.extend(self.process_config.map(HostMessage::Process));
+        messages.extend(self.debug_config.map(HostMessage::Debug));
+        if !self.process_actions.is_empty() {
+            messages.push(HostMessage::ProcessActions(self.process_actions));
+        }
+        host.send_all(messages);
+    }
+}
+
+/// Handle a runtime uses to talk back to the compositor. Cheap to clone and
+/// usable from any thread.
+#[derive(Clone, Default)]
+pub struct RuntimeHost {
+    inner: Arc<HostInner>,
+}
+
+#[derive(Default)]
+struct HostInner {
+    queue: Mutex<VecDeque<HostMessage>>,
+    wake_requested: AtomicBool,
+    ping: Mutex<Option<Ping>>,
+}
+
+impl std::fmt::Debug for RuntimeHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeHost").finish_non_exhaustive()
+    }
+}
+
+impl RuntimeHost {
+    /// A host that is not wired to an event loop yet. Messages queue up until
+    /// someone drains them; tests use it as is.
+    pub fn detached() -> Self {
+        Self::default()
+    }
+
+    /// Wake `ping` whenever a message arrives or the runtime asks for a tick.
+    pub fn attach_ping(&self, ping: Ping) {
+        if let Ok(mut slot) = self.inner.ping.lock() {
+            *slot = Some(ping);
+        }
+    }
+
+    pub fn send(&self, message: HostMessage) {
+        self.send_all([message]);
+    }
+
+    pub fn send_all(&self, messages: impl IntoIterator<Item = HostMessage>) {
+        let mut sent = false;
+        if let Ok(mut queue) = self.inner.queue.lock() {
+            for message in messages {
+                queue.push_back(message);
+                sent = true;
+            }
+        }
+        if sent {
+            self.ping();
+        }
+    }
+
+    /// Ask the compositor to run a scheduler tick soon, e.g. after the runtime
+    /// changed state on its own (IPC request, timer on its thread).
+    pub fn wake(&self) {
+        self.inner.wake_requested.store(true, Ordering::Release);
+        self.ping();
+    }
+
+    /// Next queued message, oldest first. Compositor side.
+    pub fn pop(&self) -> Option<HostMessage> {
+        self.inner.queue.lock().ok()?.pop_front()
+    }
+
+    /// Whether [`wake`](Self::wake) was called since the last check.
+    /// Compositor side.
+    pub fn take_wake_request(&self) -> bool {
+        self.inner.wake_requested.swap(false, Ordering::AcqRel)
+    }
+
+    fn ping(&self) {
+        if let Ok(slot) = self.inner.ping.lock()
+            && let Some(ping) = slot.as_ref()
+        {
+            ping.ping();
+        }
+    }
+}

@@ -952,7 +952,7 @@ const FULLSCREEN_REJECT_DETAIL_INTERVAL: Duration = Duration::from_secs(1);
 /// engaged/disengaged log only says that the path dropped; this says which
 /// precondition failed, which is what distinguishes "a bar popped over the
 /// game" from "the client committed an undersized buffer" from "the config
-/// left the window on an animation". Enable with `RUST_LOG=shoji_wm=debug`.
+/// left the window on an animation". Enable with `RUST_LOG=shojiwm_lib=debug`.
 fn note_fullscreen_fast_path_reject(output_name: &str, reason: Option<(&'static str, String)>) {
     let Ok(mut guard) = fullscreen_fast_path_reject_map().lock() else {
         return;

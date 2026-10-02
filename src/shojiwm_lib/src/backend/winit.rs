@@ -26,7 +26,7 @@ use smithay::{
 use tracing::{info, trace, warn};
 
 use crate::{
-    ShojiWM,
+    state::ShojiWM,
     backend::visual::{
         WindowVisualState, is_identity_visual_geometry, requires_full_window_snapshot,
         root_physical_origin, root_physical_origin_precise, transformed_root_rect,

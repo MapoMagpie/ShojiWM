@@ -112,11 +112,10 @@ use crate::runtime_process::{
     kill_runtime_service, should_restart_service, spawn_runtime_process,
 };
 use crate::runtime_workspace::RuntimeWorkspaceConfigUpdate;
+use crate::runtime_api::{HostMessage, RuntimeBoot, RuntimeHandle, RuntimeHost};
 use crate::ssd::{
-    BackgroundEffectConfig, DecorationEvaluator, DecorationHandlerInvocation,
-    DecorationInteractionSnapshot, DecorationInteractionTarget,
-    DecorationPointerMoveAsyncInvocation, DecorationRuntimeAsyncInvocation,
-    DecorationRuntimeEvaluator, EmbeddedDecorationEvaluator, LogicalPoint, LogicalRect,
+    BackgroundEffectConfig, DecorationInteractionSnapshot, DecorationInteractionTarget,
+    DecorationPointerMoveAsyncInvocation, LogicalPoint, LogicalRect,
     ManagedWindowAnimationSnapshot, OutputModeSnapshot, OutputPositionSnapshot,
     RuntimeEventConfigUpdate, WaylandOutputSnapshot, WaylandWindowSnapshot, WindowDecorationState,
     WindowPositionSnapshot,
@@ -354,7 +353,7 @@ pub struct ShojiWM {
     /// rects instead of just what the client damaged.
     pub layer_source_rects: HashMap<String, LogicalRect>,
     pub pending_decoration_damage: Vec<LogicalRect>,
-    pub decoration_evaluator: DecorationRuntimeEvaluator,
+    pub config_runtime: RuntimeHandle,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     /// `linux-drm-syncobj-v1` (explicit sync). `None` when the primary GPU cannot wait on
@@ -1423,7 +1422,11 @@ impl ShojiWM {
         keyboard.set_focus(self, Some(focus), SERIAL_COUNTER.next_serial());
     }
 
-    pub fn new(event_loop: &mut EventLoop<'static, Self>, display: Display<Self>) -> Self {
+    pub fn new(
+        event_loop: &mut EventLoop<'static, Self>,
+        display: Display<Self>,
+        runtime: &RuntimeBoot,
+    ) -> Self {
         let start_time = std::time::Instant::now();
 
         let dh = display.handle();
@@ -1528,45 +1531,14 @@ impl ShojiWM {
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
         let loop_handle = event_loop.handle();
-        let runtime_paths = crate::install_paths::decoration_runtime_paths();
-        let evaluator = EmbeddedDecorationEvaluator::for_paths(
-            runtime_paths.script_path,
-            runtime_paths.config_path,
-        )
-        .with_working_dir(runtime_paths.working_dir);
-        let config_error_report = match evaluator.preload() {
+        let mut config_runtime = Self::launch_config_runtime(event_loop, runtime);
+        let config_error_report = match config_runtime.preload() {
             Ok(()) => None,
             Err(error) => {
-                warn!(?error, "failed to preload TypeScript config");
+                warn!(?error, runtime = config_runtime.name(), "failed to preload config");
                 Some(crate::config_error::ConfigErrorReport::initial_load(error))
             }
         };
-        let decoration_evaluator = DecorationRuntimeEvaluator::Embedded(evaluator);
-        let (runtime_async_event_tx, runtime_async_event_rx) = channel();
-        decoration_evaluator.set_async_event_sender(runtime_async_event_tx);
-        let runtime_async_loop_handle = event_loop.handle();
-        let runtime_scheduler_kick_loop_handle = runtime_async_loop_handle.clone();
-        runtime_async_loop_handle
-            .insert_source(runtime_async_event_rx, move |event, _, state| match event {
-                ChannelEvent::Msg(invocation) => match invocation {
-                    DecorationRuntimeAsyncInvocation::PointerMove(invocation)
-                    | DecorationRuntimeAsyncInvocation::GestureSwipe(invocation) => {
-                        state.handle_runtime_pointer_move_async_invocation(
-                            invocation,
-                            &runtime_scheduler_kick_loop_handle,
-                        );
-                    }
-                    DecorationRuntimeAsyncInvocation::CursorConfig(update) => {
-                        state.apply_runtime_cursor_config_update(update);
-                    }
-                },
-                ChannelEvent::Closed => {}
-            })
-            .expect("Failed to init runtime async event source.");
-
-        // Register a SIGUSR1 source so the embedded runtime can wake the event
-        // loop after handling an IPC request.
-        Self::register_runtime_wake_signal(event_loop);
 
         let damage_blink_enabled = std::env::args().any(|arg| arg == "--damage-blink")
             || std::env::var_os("SHOJI_DAMAGE_BLINK")
@@ -1704,7 +1676,7 @@ impl ShojiWM {
             upper_layer_source_damage: Vec::new(),
             layer_source_rects: HashMap::new(),
             pending_decoration_damage: Vec::new(),
-            decoration_evaluator,
+            config_runtime,
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             drm_syncobj_state: None,
@@ -2508,7 +2480,7 @@ impl ShojiWM {
         let now_ms = frame_time_ms
             .unwrap_or_else(|| Duration::from(self.clock.now()).as_secs_f64() * 1000.0);
         self.sync_runtime_display_state();
-        let tick = match self.decoration_evaluator.scheduler_tick(now_ms) {
+        let tick = match self.config_runtime.scheduler_tick(now_ms) {
             Ok(tick) => tick,
             Err(error) => {
                 debug!(?error, "failed to tick decoration runtime scheduler");
@@ -2555,17 +2527,7 @@ impl ShojiWM {
             self.schedule_redraw();
         }
 
-        self.consume_runtime_display_config(tick.display_config);
-        self.consume_runtime_workspace_config(tick.workspace_config);
-        self.consume_runtime_key_binding_config(tick.key_binding_config);
-        self.consume_runtime_pointer_config(tick.pointer_config);
-        self.consume_runtime_input_config(tick.input_config);
-        self.consume_runtime_event_config(tick.event_config);
-        self.consume_runtime_process_config(tick.process_config);
-        self.consume_runtime_debug_config(tick.debug_config);
-        if !tick.process_actions.is_empty() {
-            self.apply_runtime_process_actions(tick.process_actions);
-        }
+        self.drain_runtime_host_messages();
 
         if !tick.actions.is_empty() {
             self.request_tty_maintenance("runtime-scheduler-actions");
@@ -2667,24 +2629,65 @@ impl ShojiWM {
         self.schedule_runtime_scheduler_kick(&loop_handle, next_poll_in_ms);
     }
 
-    fn register_runtime_wake_signal(event_loop: &mut EventLoop<'static, Self>) {
-        use calloop::signals::{Signal, Signals};
-
-        let signals = match Signals::new(&[Signal::SIGUSR1]) {
-            Ok(s) => s,
-            Err(error) => {
-                warn!(?error, "failed to create SIGUSR1 source");
-                return;
-            }
-        };
-        let insert = event_loop
+    /// Start the config runtime and wire its host to the event loop: the
+    /// runtime may send messages or ask for a tick from its own thread.
+    fn launch_config_runtime(
+        event_loop: &mut EventLoop<'static, Self>,
+        runtime: &RuntimeBoot,
+    ) -> RuntimeHandle {
+        let host = RuntimeHost::detached();
+        let (ping, ping_source) =
+            calloop::ping::make_ping().expect("Failed to create runtime host ping.");
+        host.attach_ping(ping);
+        event_loop
             .handle()
-            .insert_source(signals, |_event, _, state| {
-                state.record_event_source_wake("runtime-wake-signal");
-                let _ = state.tick_runtime_scheduler_with(true);
-            });
-        if let Err(error) = insert {
-            warn!(?error, "failed to register runtime wake signal source");
+            .insert_source(ping_source, |_, _, state| {
+                state.record_event_source_wake("runtime-host");
+                state.drain_runtime_host_messages();
+                if state.config_runtime.host().take_wake_request() {
+                    let _ = state.tick_runtime_scheduler_with(true);
+                }
+            })
+            .expect("Failed to init runtime host source.");
+        runtime.launch(host)
+    }
+
+    /// Apply everything the config runtime sent through its host, oldest
+    /// first. Called right after each runtime request, so a reply's side
+    /// effects land before the caller acts on the reply itself, and from the
+    /// host ping for messages sent from the runtime's own thread.
+    pub fn drain_runtime_host_messages(&mut self) {
+        while let Some(message) = self.config_runtime.host().pop() {
+            match message {
+                HostMessage::Env(updates) => {
+                    crate::activation_environment::apply_runtime_env_updates(
+                        updates,
+                        "config-runtime",
+                    );
+                }
+                HostMessage::Display(update) => self.apply_runtime_display_config_update(update),
+                HostMessage::Workspace(update) => {
+                    self.consume_runtime_workspace_config(Some(update));
+                }
+                HostMessage::KeyBindings(update) => {
+                    self.apply_runtime_key_binding_config_update(update);
+                }
+                HostMessage::Pointer(update) => self.apply_runtime_pointer_config_update(update),
+                HostMessage::Input(update) => self.apply_runtime_input_config_update(update),
+                HostMessage::EventFilter(update) => self.apply_runtime_event_config_update(update),
+                HostMessage::Process(update) => self.apply_runtime_process_config_update(update),
+                HostMessage::ProcessActions(actions) => {
+                    if !actions.is_empty() {
+                        self.apply_runtime_process_actions(actions);
+                    }
+                }
+                HostMessage::Debug(update) => self.consume_runtime_debug_config(Some(update)),
+                HostMessage::Cursor(update) => self.apply_runtime_cursor_config_update(update),
+                HostMessage::PointerHookResult(invocation) => {
+                    let loop_handle = self.loop_handle.clone();
+                    self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
+                }
+            }
         }
     }
 
@@ -2732,73 +2735,40 @@ impl ShojiWM {
 
         let now_ms = Duration::from(self.clock.now()).as_millis() as u64;
         self.sync_runtime_display_state();
-        match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
-            Ok(result) => {
-                self.consume_runtime_display_config(result.display_config);
-                self.consume_runtime_workspace_config(result.workspace_config);
-                self.consume_runtime_key_binding_config(result.key_binding_config);
-                self.consume_runtime_pointer_config(result.pointer_config);
-                self.consume_runtime_input_config(result.input_config);
-                self.consume_runtime_event_config(result.event_config);
-                self.consume_runtime_process_config(result.process_config);
-                if !result.process_actions.is_empty() {
-                    self.apply_runtime_process_actions(result.process_actions);
-                }
-            }
+        let result = self.config_runtime.evaluate_window(&snapshot, now_ms);
+        self.drain_runtime_host_messages();
+        match result {
+            Ok(_) => {}
             Err(error) => {
                 warn!(?error, "failed to warm up decoration runtime");
                 return;
             }
         }
 
-        let _ = self.decoration_evaluator.window_closed(&snapshot.id);
+        let _ = self.config_runtime.window_closed(&snapshot.id);
         debug!(window_id = snapshot.id, "warmed up decoration runtime");
     }
 
     pub fn reload_decoration_runtime(&mut self) {
-        if self.decoration_evaluator.as_embedded().is_none() {
-            self.config_error_report = Some(crate::config_error::ConfigErrorReport::hot_reload(
-                "hot reload is only available for the TypeScript runtime",
-            ));
-            self.schedule_redraw();
-            return;
-        }
-
         // Windows that are mid-close hold GPU snapshots whose release depends
-        // on the current isolate's close handshake (`closePoll` →
-        // `finalizeClose`). The fresh isolate knows nothing about them, so
+        // on the current config's close handshake (`closePoll` →
+        // `finalizeClose`). The reloaded config knows nothing about them, so
         // finalize deterministically at the reload boundary instead of
         // leaving the textures to the watchdog deadline.
         self.finalize_all_closing_snapshots("config-hot-reload");
 
-        let Some(current) = self.decoration_evaluator.as_embedded() else {
-            return;
-        };
-
         self.sync_runtime_display_state();
-        let persisted = match current.lifecycle_disable("reload") {
-            Ok(state) => state,
-            Err(error) => {
-                warn!(?error, "failed to collect runtime reload state");
-                serde_json::Value::Object(Default::default())
-            }
-        };
-
-        let next = current.fresh_like();
-        if let Err(error) =
-            next.lifecycle_enable("reload", Some(&persisted))
-                .map(|invocation| {
-                    self.consume_runtime_lifecycle_invocation(invocation);
-                })
-        {
-            warn!(?error, "failed to hot reload TypeScript config");
+        let reload_result = self.config_runtime.reload();
+        self.drain_runtime_host_messages();
+        if let Err(error) = reload_result {
+            warn!(?error, runtime = self.config_runtime.name(), "failed to hot reload config");
             self.config_error_report =
                 Some(crate::config_error::ConfigErrorReport::hot_reload(error));
             self.schedule_redraw();
             return;
         }
 
-        match next.background_effect_config() {
+        match self.config_runtime.background_effect_config() {
             Ok(config) => {
                 self.configured_background_effect = config;
             }
@@ -2814,7 +2784,6 @@ impl ShojiWM {
             }
         }
 
-        self.decoration_evaluator = DecorationRuntimeEvaluator::Embedded(next);
         self.runtime_scheduler_enabled = true;
         self.mark_all_window_decoration_policies_reloaded();
         self.config_error_report = None;
@@ -2838,32 +2807,22 @@ impl ShojiWM {
         self.request_full_damage();
         self.request_tty_maintenance("config-hot-reload");
         self.schedule_redraw();
-        info!("hot reloaded TypeScript config");
+        info!(runtime = self.config_runtime.name(), "hot reloaded config");
     }
 
     pub fn enable_initial_decoration_runtime(&mut self) {
         self.sync_runtime_display_state();
-        let lifecycle_result = match self.decoration_evaluator.as_embedded() {
-            Some(evaluator) => evaluator.lifecycle_enable("initial", None),
-            None => return,
-        };
-        match lifecycle_result {
-            Ok(invocation) => {
-                self.consume_runtime_lifecycle_invocation(invocation);
-            }
-            Err(error) => {
-                warn!(?error, "failed to run initial config lifecycle");
-                self.config_error_report =
-                    Some(crate::config_error::ConfigErrorReport::initial_load(error));
-                self.schedule_redraw();
-                return;
-            }
+        let lifecycle_result = self.config_runtime.enable();
+        self.drain_runtime_host_messages();
+        if let Err(error) = lifecycle_result {
+            warn!(?error, "failed to run initial config lifecycle");
+            self.config_error_report =
+                Some(crate::config_error::ConfigErrorReport::initial_load(error));
+            self.schedule_redraw();
+            return;
         }
 
-        let background_effect_result = match self.decoration_evaluator.as_embedded() {
-            Some(evaluator) => evaluator.background_effect_config(),
-            None => return,
-        };
+        let background_effect_result = self.config_runtime.background_effect_config();
         match background_effect_result {
             Ok(config) => {
                 self.configured_background_effect = config;
@@ -3322,11 +3281,11 @@ impl ShojiWM {
         self.schedule_redraw();
     }
 
-    pub fn sync_runtime_display_state(&self) {
-        self.decoration_evaluator
-            .sync_display_state(self.snapshot_outputs());
-        self.decoration_evaluator
-            .sync_input_state(self.runtime_input_device_state().clone());
+    pub fn sync_runtime_display_state(&mut self) {
+        let outputs = self.snapshot_outputs();
+        self.config_runtime.sync_display_state(outputs);
+        let input_state = self.runtime_input_device_state().clone();
+        self.config_runtime.sync_input_state(input_state);
     }
 
     pub fn notify_runtime_outputs_changed(&mut self) {
@@ -3411,8 +3370,8 @@ impl ShojiWM {
         }
         self.runtime_input_devices.insert(key.clone(), snapshot);
         self.runtime_libinput_devices.insert(key, device);
-        self.decoration_evaluator
-            .sync_input_state(self.runtime_input_device_state().clone());
+        let input_state = self.runtime_input_device_state().clone();
+        self.config_runtime.sync_input_state(input_state);
         self.apply_runtime_input_config_to_devices();
     }
 
@@ -3425,8 +3384,8 @@ impl ShojiWM {
         }
         self.runtime_input_devices.remove(&key);
         self.runtime_libinput_devices.remove(&key);
-        self.decoration_evaluator
-            .sync_input_state(self.runtime_input_device_state().clone());
+        let input_state = self.runtime_input_device_state().clone();
+        self.config_runtime.sync_input_state(input_state);
         self.apply_runtime_input_config_to_devices();
     }
 
@@ -3465,22 +3424,6 @@ impl ShojiWM {
     pub fn consume_runtime_event_config(&mut self, update: Option<RuntimeEventConfigUpdate>) {
         if let Some(update) = update {
             self.apply_runtime_event_config_update(update);
-        }
-    }
-
-    pub fn consume_runtime_lifecycle_invocation(
-        &mut self,
-        invocation: DecorationHandlerInvocation,
-    ) {
-        self.consume_runtime_display_config(invocation.display_config);
-        self.consume_runtime_workspace_config(invocation.workspace_config);
-        self.consume_runtime_key_binding_config(invocation.key_binding_config);
-        self.consume_runtime_pointer_config(invocation.pointer_config);
-        self.consume_runtime_input_config(invocation.input_config);
-        self.consume_runtime_event_config(invocation.event_config);
-        self.consume_runtime_process_config(invocation.process_config);
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions);
         }
     }
 
@@ -3583,16 +3526,7 @@ impl ShojiWM {
             self.schedule_redraw();
         }
 
-        self.consume_runtime_display_config(invocation.display_config);
-        self.consume_runtime_workspace_config(invocation.workspace_config);
-        self.consume_runtime_key_binding_config(invocation.key_binding_config);
-        self.consume_runtime_pointer_config(invocation.pointer_config);
-        self.consume_runtime_input_config(invocation.input_config);
-        self.consume_runtime_event_config(invocation.event_config);
-        self.consume_runtime_process_config(invocation.process_config);
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions);
-        }
+        self.drain_runtime_host_messages();
 
         if !invocation.actions.is_empty() {
             self.request_tty_maintenance(match dispatch_mode {

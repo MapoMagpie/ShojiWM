@@ -34,13 +34,11 @@ use crate::backend::{
 };
 use crate::state::{ActiveManagedWindowAnimation, ShojiWM};
 
-use super::embedded_runtime::{NativeCompositionPatch, SHADER_INPUT_STAGE_INDEX};
+use crate::runtime_api::{CompositionPatch, SHADER_INPUT_STAGE_INDEX};
 use super::{
-    ComputedDecorationTree, DecorationCachedEvaluationResult, DecorationEvaluationError,
-    DecorationEvaluationResult, DecorationEvaluator, DecorationHandlerInvocation,
-    DecorationHitTestResult, DecorationNode, DecorationSchedulerTick, DecorationTree,
-    LayerEffectEvaluationResult, LogicalPoint, LogicalRect, PopupEffectEvaluationResult,
-    StaticDecorationEvaluator, WaylandLayerSnapshot, WaylandPopupSnapshot, WaylandWindowAction,
+    ComputedDecorationTree, DecorationEvaluationError, DecorationEvaluator,
+    DecorationHandlerInvocation, DecorationHitTestResult, DecorationNode, DecorationTree,
+    LogicalPoint, LogicalRect, StaticDecorationEvaluator, WaylandLayerSnapshot, WaylandPopupSnapshot, WaylandWindowAction,
     WaylandWindowSnapshot, WindowEffectConfig, WindowPositionSnapshot, WindowTransform,
     reapply_tree_preserving_layout,
     window_model::{
@@ -66,23 +64,23 @@ struct ShaderUniformFastUpdate {
 
 fn is_shader_uniform_only_update(
     full: &Option<DecorationNode>,
-    patches: &[NativeCompositionPatch],
+    patches: &[CompositionPatch],
 ) -> bool {
     full.is_none()
         && !patches.is_empty()
         && patches
             .iter()
-            .all(|patch| matches!(patch, NativeCompositionPatch::ShaderUniform { .. }))
+            .all(|patch| matches!(patch, CompositionPatch::ShaderUniform { .. }))
 }
 
 fn apply_shader_uniform_fast_update(
     tree: &mut DecorationTree,
     layout: &mut ComputedDecorationTree,
     shader_buffers: &mut [CachedShaderEffect],
-    patches: &[NativeCompositionPatch],
+    patches: &[CompositionPatch],
 ) -> Result<ShaderUniformFastUpdate, DecorationEvaluationError> {
     for patch in patches {
-        let NativeCompositionPatch::ShaderUniform {
+        let CompositionPatch::ShaderUniform {
             node_id,
             stage_index,
             name,
@@ -128,7 +126,7 @@ fn apply_shader_uniform_fast_update(
 
     let mut update = ShaderUniformFastUpdate::default();
     for patch in patches {
-        let NativeCompositionPatch::ShaderUniform {
+        let CompositionPatch::ShaderUniform {
             node_id,
             stage_index,
             name,
@@ -250,7 +248,7 @@ fn set_shader_uniform(
 fn apply_cached_tree_update(
     tree: &mut DecorationTree,
     full: Option<DecorationNode>,
-    patches: Vec<NativeCompositionPatch>,
+    patches: Vec<CompositionPatch>,
 ) -> Result<CachedTreeUpdate, DecorationEvaluationError> {
     match (full, patches.is_empty()) {
         (Some(next_root), true) => {
@@ -282,7 +280,7 @@ fn apply_cached_tree_update(
                     )));
                 };
                 match patch {
-                    NativeCompositionPatch::ReplaceNode { node, .. } => {
+                    CompositionPatch::ReplaceNode { node, .. } => {
                         if *target == node {
                             continue;
                         }
@@ -290,7 +288,7 @@ fn apply_cached_tree_update(
                         *target = node;
                         changed = true;
                     }
-                    NativeCompositionPatch::ShaderUniform {
+                    CompositionPatch::ShaderUniform {
                         stage_index,
                         name,
                         value,
@@ -798,12 +796,6 @@ impl WindowDecorationState {
 }
 
 #[derive(Debug, Clone)]
-pub enum DecorationRuntimeEvaluator {
-    Static(super::StaticDecorationEvaluator),
-    Embedded(super::EmbeddedDecorationEvaluator),
-}
-
-#[derive(Debug, Clone)]
 pub struct CachedDecorationBuffer {
     pub owner_node_id: Option<String>,
     pub stable_key: String,
@@ -825,303 +817,6 @@ pub struct CachedDecorationBuffer {
     pub clip_rect_precise: Option<PreciseLogicalRect>,
     pub clip_radius_precise: Option<f32>,
     pub source_kind: &'static str,
-}
-
-impl Default for DecorationRuntimeEvaluator {
-    fn default() -> Self {
-        Self::Static(super::StaticDecorationEvaluator)
-    }
-}
-
-impl DecorationEvaluator for DecorationRuntimeEvaluator {
-    fn evaluate_window(
-        &self,
-        window: &WaylandWindowSnapshot,
-        now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(evaluator) => evaluator.evaluate_window(window, now_ms),
-            Self::Embedded(evaluator) => evaluator.evaluate_window(window, now_ms),
-        }
-    }
-
-    fn evaluate_window_preview(
-        &self,
-        window: &WaylandWindowSnapshot,
-        now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
-            Self::Embedded(evaluator) => evaluator.evaluate_window_preview(window, now_ms),
-        }
-    }
-
-    fn window_decoration_policy(
-        &self,
-        window: &WaylandWindowSnapshot,
-        context: &super::WindowDecorationPolicyContextSnapshot,
-    ) -> Result<super::WindowDecorationDecisionSnapshot, DecorationEvaluationError> {
-        match self {
-            Self::Static(evaluator) => evaluator.window_decoration_policy(window, context),
-            Self::Embedded(evaluator) => evaluator.window_decoration_policy(window, context),
-        }
-    }
-
-    fn scheduler_tick(
-        &self,
-        now_ms: f64,
-    ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(DecorationSchedulerTick::default()),
-            Self::Embedded(evaluator) => evaluator.scheduler_tick(now_ms),
-        }
-    }
-
-    fn evaluate_cached_window(
-        &self,
-        window_id: &str,
-        window: Option<&WaylandWindowSnapshot>,
-        now_ms: u64,
-        force_full_reevaluation: bool,
-    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Err(DecorationEvaluationError::RuntimeProtocol(
-                "cached window evaluation unsupported for static evaluator".into(),
-            )),
-            Self::Embedded(evaluator) => {
-                evaluator.evaluate_cached_window(window_id, window, now_ms, force_full_reevaluation)
-            }
-        }
-    }
-
-    fn window_closed(&self, window_id: &str) -> Result<(), DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(()),
-            Self::Embedded(evaluator) => evaluator.window_closed(window_id),
-        }
-    }
-
-    fn invoke_handler(
-        &self,
-        window_id: &str,
-        handler_id: &str,
-        now_ms: u64,
-    ) -> Result<super::DecorationHandlerInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.invoke_handler(window_id, handler_id, now_ms),
-        }
-    }
-
-    fn invoke_key_binding(
-        &self,
-        binding_id: &str,
-        now_ms: u64,
-    ) -> Result<super::DecorationKeyBindingInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationKeyBindingInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.invoke_key_binding(binding_id, now_ms),
-        }
-    }
-
-    fn workspace_activate(
-        &self,
-        event: &crate::runtime_workspace::RuntimeWorkspaceActivateRequestSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationHandlerInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.workspace_activate(event, now_ms),
-        }
-    }
-
-    fn window_resize(
-        &self,
-        window_id: &str,
-        event: &super::WindowResizeEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowResizeInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowResizeInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.window_resize(window_id, event, now_ms),
-        }
-    }
-
-    fn window_move(
-        &self,
-        window_id: &str,
-        event: &super::WindowMoveEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowMoveInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowMoveInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.window_move(window_id, event, now_ms),
-        }
-    }
-
-    fn window_maximize_request(
-        &self,
-        snapshot: &WaylandWindowSnapshot,
-        event: &super::WindowMaximizeRequestEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.window_maximize_request(snapshot, event, now_ms),
-        }
-    }
-
-    fn window_minimize_request(
-        &self,
-        snapshot: &WaylandWindowSnapshot,
-        event: &super::WindowMinimizeRequestEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.window_minimize_request(snapshot, event, now_ms),
-        }
-    }
-
-    fn window_fullscreen_request(
-        &self,
-        snapshot: &WaylandWindowSnapshot,
-        event: &super::WindowFullscreenRequestEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
-            Self::Embedded(evaluator) => {
-                evaluator.window_fullscreen_request(snapshot, event, now_ms)
-            }
-        }
-    }
-
-    fn window_activate_request(
-        &self,
-        snapshot: &WaylandWindowSnapshot,
-        event: &super::WindowActivateRequestEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationWindowStateRequestInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.window_activate_request(snapshot, event, now_ms),
-        }
-    }
-
-    fn pointer_move(
-        &self,
-        event: &super::PointerMoveEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationPointerMoveAsyncInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationPointerMoveAsyncInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.pointer_move(event, now_ms),
-        }
-    }
-
-    fn pointer_move_async(&self, event: super::PointerMoveEventSnapshot, now_ms: u64) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.pointer_move_async(event, now_ms);
-        }
-    }
-
-    fn gesture_swipe(
-        &self,
-        event: &super::GestureSwipeEventSnapshot,
-        now_ms: u64,
-    ) -> Result<super::DecorationGestureSwipeAsyncInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationGestureSwipeAsyncInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.gesture_swipe(event, now_ms),
-        }
-    }
-
-    fn gesture_swipe_async(&self, event: super::GestureSwipeEventSnapshot, now_ms: u64) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.gesture_swipe_async(event, now_ms);
-        }
-    }
-
-    fn start_close(
-        &self,
-        window_id: &str,
-        now_ms: u64,
-    ) -> Result<super::DecorationHandlerInvocation, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(super::DecorationHandlerInvocation::default()),
-            Self::Embedded(evaluator) => evaluator.start_close(window_id, now_ms),
-        }
-    }
-
-    fn evaluate_layer_effects(
-        &self,
-        output_name: &str,
-        layers: &[WaylandLayerSnapshot],
-        now_ms: u64,
-    ) -> Result<LayerEffectEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(LayerEffectEvaluationResult::default()),
-            Self::Embedded(evaluator) => {
-                evaluator.evaluate_layer_effects(output_name, layers, now_ms)
-            }
-        }
-    }
-
-    fn evaluate_popup_effects(
-        &self,
-        output_name: &str,
-        popups: &[crate::ssd::WaylandPopupSnapshot],
-        now_ms: u64,
-    ) -> Result<PopupEffectEvaluationResult, DecorationEvaluationError> {
-        match self {
-            Self::Static(_) => Ok(PopupEffectEvaluationResult::default()),
-            Self::Embedded(evaluator) => {
-                evaluator.evaluate_popup_effects(output_name, popups, now_ms)
-            }
-        }
-    }
-}
-
-impl DecorationRuntimeEvaluator {
-    pub fn sync_display_state(
-        &self,
-        display_state: std::collections::BTreeMap<String, super::WaylandOutputSnapshot>,
-    ) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.set_display_state(display_state);
-        }
-    }
-
-    pub fn sync_input_state(
-        &self,
-        input_state: std::collections::BTreeMap<
-            String,
-            crate::runtime_input::RuntimeInputDeviceSnapshot,
-        >,
-    ) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.set_input_state(input_state);
-        }
-    }
-
-    pub fn set_async_event_sender(
-        &self,
-        sender: smithay::reexports::calloop::channel::Sender<
-            super::DecorationRuntimeAsyncInvocation,
-        >,
-    ) {
-        if let Self::Embedded(evaluator) = self {
-            evaluator.set_async_event_sender(sender);
-        }
-    }
-
-    pub fn as_embedded(&self) -> Option<&super::EmbeddedDecorationEvaluator> {
-        match self {
-            Self::Embedded(evaluator) => Some(evaluator),
-            Self::Static(_) => None,
-        }
-    }
 }
 
 impl ShojiWM {
@@ -1371,7 +1066,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_resize(window_id, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1381,16 +1076,7 @@ impl ShojiWM {
             }
         };
 
-        self.consume_runtime_display_config(invocation.display_config);
-        self.consume_runtime_workspace_config(invocation.workspace_config);
-        self.consume_runtime_key_binding_config(invocation.key_binding_config);
-        self.consume_runtime_pointer_config(invocation.pointer_config);
-        self.consume_runtime_input_config(invocation.input_config);
-        self.consume_runtime_event_config(invocation.event_config);
-        self.consume_runtime_process_config(invocation.process_config);
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions);
-        }
+        self.drain_runtime_host_messages();
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
@@ -1423,7 +1109,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_move(window_id, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1433,16 +1119,7 @@ impl ShojiWM {
             }
         };
 
-        self.consume_runtime_display_config(invocation.display_config);
-        self.consume_runtime_workspace_config(invocation.workspace_config);
-        self.consume_runtime_key_binding_config(invocation.key_binding_config);
-        self.consume_runtime_pointer_config(invocation.pointer_config);
-        self.consume_runtime_input_config(invocation.input_config);
-        self.consume_runtime_event_config(invocation.event_config);
-        self.consume_runtime_process_config(invocation.process_config);
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions);
-        }
+        self.drain_runtime_host_messages();
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
@@ -1475,7 +1152,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_maximize_request(snapshot, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1499,7 +1176,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_minimize_request(snapshot, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1523,7 +1200,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_fullscreen_request(snapshot, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1547,7 +1224,7 @@ impl ShojiWM {
     ) -> bool {
         self.sync_runtime_display_state();
         let invocation = match self
-            .decoration_evaluator
+            .config_runtime
             .window_activate_request(snapshot, event, now_ms)
         {
             Ok(invocation) => invocation,
@@ -1568,16 +1245,7 @@ impl ShojiWM {
         reason: &'static str,
         invocation: super::evaluator::DecorationWindowStateRequestInvocation,
     ) -> bool {
-        self.consume_runtime_display_config(invocation.display_config);
-        self.consume_runtime_workspace_config(invocation.workspace_config);
-        self.consume_runtime_key_binding_config(invocation.key_binding_config);
-        self.consume_runtime_pointer_config(invocation.pointer_config);
-        self.consume_runtime_input_config(invocation.input_config);
-        self.consume_runtime_event_config(invocation.event_config);
-        self.consume_runtime_process_config(invocation.process_config);
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions);
-        }
+        self.drain_runtime_host_messages();
 
         if invocation.dirty {
             self.runtime_poll_dirty = true;
@@ -1733,17 +1401,8 @@ impl ShojiWM {
         );
 
         self.sync_runtime_display_state();
-        let invocation = self.decoration_evaluator.start_close(window_id, now_ms)?;
-        self.consume_runtime_display_config(invocation.display_config.clone());
-        self.consume_runtime_workspace_config(invocation.workspace_config.clone());
-        self.consume_runtime_key_binding_config(invocation.key_binding_config.clone());
-        self.consume_runtime_pointer_config(invocation.pointer_config.clone());
-        self.consume_runtime_input_config(invocation.input_config.clone());
-        self.consume_runtime_event_config(invocation.event_config.clone());
-        self.consume_runtime_process_config(invocation.process_config.clone());
-        if !invocation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(invocation.process_actions.clone());
-        }
+        let invocation = self.config_runtime.start_close(window_id, now_ms)?;
+        self.drain_runtime_host_messages();
         if !invocation.invoked {
             self.live_window_snapshots
                 .insert(window_id.to_string(), live_snapshot);
@@ -1893,19 +1552,10 @@ impl ShojiWM {
         // This uses a preconfigure runtime evaluation; the runtime keeps onOpen-created
         // window state but reanchors animations when the first real evaluation arrives.
         let mut evaluation = self
-            .decoration_evaluator
+            .config_runtime
             .evaluate_window_preview(snapshot, now_ms)?;
 
-        self.consume_runtime_display_config(evaluation.display_config.clone());
-        self.consume_runtime_workspace_config(evaluation.workspace_config.clone());
-        self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
-        self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
-        self.consume_runtime_input_config(evaluation.input_config.clone());
-        self.consume_runtime_event_config(evaluation.event_config.clone());
-        self.consume_runtime_process_config(evaluation.process_config.clone());
-        if !evaluation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(evaluation.process_actions.clone());
-        }
+        self.drain_runtime_host_messages();
         // Apply window actions queued during onOpen (e.g. window.focus(),
         // scheduleAnimation). Without this, anything onOpen pushes — most
         // notably `window.focus()` — gets dropped on the floor, since the
@@ -2671,21 +2321,12 @@ impl ShojiWM {
         let evaluate_started_at = Instant::now();
         let evaluation = {
             timescope::scope!("ssd layer effect evaluate");
-            self.decoration_evaluator
+            self.config_runtime
                 .evaluate_layer_effects(output_name, &snapshots, now_ms)?
         };
         let evaluate_elapsed_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
         let apply_started_at = Instant::now();
-        self.consume_runtime_display_config(evaluation.display_config.clone());
-        self.consume_runtime_workspace_config(evaluation.workspace_config.clone());
-        self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
-        self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
-        self.consume_runtime_input_config(evaluation.input_config.clone());
-        self.consume_runtime_event_config(evaluation.event_config.clone());
-        self.consume_runtime_process_config(evaluation.process_config.clone());
-        if !evaluation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(evaluation.process_actions.clone());
-        }
+        self.drain_runtime_host_messages();
 
         self.runtime_scheduler_enabled = evaluation.next_poll_in_ms.is_some();
         if evaluation.next_poll_in_ms == Some(0) {
@@ -2793,18 +2434,9 @@ impl ShojiWM {
         }
         self.sync_runtime_display_state();
         let evaluation =
-            self.decoration_evaluator
+            self.config_runtime
                 .evaluate_popup_effects(output_name, &snapshots, now_ms)?;
-        self.consume_runtime_display_config(evaluation.display_config.clone());
-        self.consume_runtime_workspace_config(evaluation.workspace_config.clone());
-        self.consume_runtime_key_binding_config(evaluation.key_binding_config.clone());
-        self.consume_runtime_pointer_config(evaluation.pointer_config.clone());
-        self.consume_runtime_input_config(evaluation.input_config.clone());
-        self.consume_runtime_event_config(evaluation.event_config.clone());
-        self.consume_runtime_process_config(evaluation.process_config.clone());
-        if !evaluation.process_actions.is_empty() {
-            self.apply_runtime_process_actions(evaluation.process_actions.clone());
-        }
+        self.drain_runtime_host_messages();
 
         for popup_id in &output_popup_ids {
             self.configured_popup_effects.remove(popup_id);
@@ -2886,7 +2518,7 @@ impl ShojiWM {
         if let Some(rect) = damage {
             self.pending_decoration_damage.push(rect);
         }
-        self.decoration_evaluator.window_closed(window_id)
+        self.config_runtime.window_closed(window_id)
     }
 
     pub fn refresh_window_decorations_for_output(
@@ -2910,13 +2542,6 @@ impl ShojiWM {
         // inline. We drain this list after the windows pass, before `advance`.
         let mut pre_advance_actions: Vec<crate::ssd::RuntimeWindowAction> = Vec::new();
         let mut pending_finalize_close_damage = Vec::new();
-        let mut pending_display_config_updates = Vec::new();
-        let mut pending_key_binding_config_updates = Vec::new();
-        let mut pending_pointer_config_updates = Vec::new();
-        let mut pending_input_config_updates = Vec::new();
-        let mut pending_event_config_updates = Vec::new();
-        let mut pending_process_config_updates = Vec::new();
-        let mut pending_process_actions = Vec::new();
         {
             timescope::scope!("ssd sync runtime display state");
             self.sync_runtime_display_state();
@@ -3225,7 +2850,7 @@ impl ShojiWM {
                     let evaluate_started_at = Instant::now();
                     let mut evaluation = {
                         timescope::scope!("ssd window evaluate");
-                        match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
+                        match self.config_runtime.evaluate_window(&snapshot, now_ms) {
                             Ok(evaluation) => evaluation,
                             Err(error) => {
                                 warn!(
@@ -3240,13 +2865,6 @@ impl ShojiWM {
                         }
                     };
                     let evaluate_ms = evaluate_started_at.elapsed().as_secs_f64() * 1000.0;
-                    pending_display_config_updates.push(evaluation.display_config.clone());
-                    pending_key_binding_config_updates.push(evaluation.key_binding_config.clone());
-                    pending_pointer_config_updates.push(evaluation.pointer_config.clone());
-                    pending_input_config_updates.push(evaluation.input_config.clone());
-                    pending_event_config_updates.push(evaluation.event_config.clone());
-                    pending_process_config_updates.push(evaluation.process_config.clone());
-                    pending_process_actions.extend(evaluation.process_actions.clone());
                     pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                     let tree = DecorationTree::new(evaluation.node);
                     let previous_animation_state =
@@ -3637,7 +3255,7 @@ impl ShojiWM {
                         let mut evaluation = {
                             timescope::scope!("ssd window runtime evaluate");
                             if runtime_state_changed && !force_full_cached_reevaluation {
-                                match self.decoration_evaluator.evaluate_window(&snapshot, now_ms) {
+                                match self.config_runtime.evaluate_window(&snapshot, now_ms) {
                                     Ok(evaluation) => evaluation.into(),
                                     Err(error) => {
                                         warn!(
@@ -3653,7 +3271,7 @@ impl ShojiWM {
                                     }
                                 }
                             } else {
-                                match self.decoration_evaluator.evaluate_cached_window(
+                                match self.config_runtime.evaluate_cached_window(
                                     &snapshot.id,
                                     (runtime_state_changed || force_full_cached_reevaluation)
                                         .then_some(&snapshot),
@@ -3684,7 +3302,7 @@ impl ShojiWM {
                                         // snapshot takes the runtime's recreate branch,
                                         // which rebuilds the entry and re-emits focus and
                                         // first-commit, so the next frame is cached again.
-                                        match self.decoration_evaluator.evaluate_cached_window(
+                                        match self.config_runtime.evaluate_cached_window(
                                             &snapshot.id,
                                             Some(&snapshot),
                                             now_ms,
@@ -3729,14 +3347,6 @@ impl ShojiWM {
                                 "runtime dirty debug: cached evaluation result"
                             );
                         }
-                        pending_display_config_updates.push(evaluation.display_config.clone());
-                        pending_key_binding_config_updates
-                            .push(evaluation.key_binding_config.clone());
-                        pending_pointer_config_updates.push(evaluation.pointer_config.clone());
-                        pending_input_config_updates.push(evaluation.input_config.clone());
-                        pending_event_config_updates.push(evaluation.event_config.clone());
-                        pending_process_config_updates.push(evaluation.process_config.clone());
-                        pending_process_actions.extend(evaluation.process_actions.clone());
                         pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                         if evaluation.managed_window_only {
                             if runtime_dirty_debug_enabled() {
@@ -4413,16 +4023,13 @@ impl ShojiWM {
                     let previous_icon_buffers = closing.decoration.icon_buffers.clone();
                     let mut evaluation = {
                         timescope::scope!("ssd closing runtime evaluate");
-                        self.decoration_evaluator.evaluate_cached_window(
+                        self.config_runtime.evaluate_cached_window(
                             &window_id,
                             None,
                             now_ms,
                             force_full_cached_reevaluation,
                         )?
                     };
-                    pending_display_config_updates.push(evaluation.display_config.clone());
-                    pending_process_config_updates.push(evaluation.process_config.clone());
-                    pending_process_actions.extend(evaluation.process_actions.clone());
                     pre_advance_actions.extend(std::mem::take(&mut evaluation.actions));
                     if evaluation.managed_window_only {
                         // Once a native close animation has completed, its
@@ -4918,33 +4525,13 @@ impl ShojiWM {
         }
 
         let apply_updates_started_at = Instant::now();
-        for update in pending_display_config_updates {
-            self.consume_runtime_display_config(update);
-        }
-        for update in pending_key_binding_config_updates {
-            self.consume_runtime_key_binding_config(update);
-        }
-        for update in pending_pointer_config_updates {
-            self.consume_runtime_pointer_config(update);
-        }
-        for update in pending_input_config_updates {
-            self.consume_runtime_input_config(update);
-        }
-        for update in pending_event_config_updates {
-            self.consume_runtime_event_config(update);
-        }
-        for update in pending_process_config_updates {
-            self.consume_runtime_process_config(update);
-        }
+        self.drain_runtime_host_messages();
         if !pending_finalize_close_damage.is_empty() {
             self.pending_decoration_damage
                 .extend(pending_finalize_close_damage);
         }
         if !pending_window_actions.is_empty() {
             self.apply_runtime_window_actions(pending_window_actions);
-        }
-        if !pending_process_actions.is_empty() {
-            self.apply_runtime_process_actions(pending_process_actions);
         }
         // Minimize/restore land as `managed_window.idle` transitions during the
         // evaluations above, not as focus changes — re-derive each toplevel's
@@ -9109,7 +8696,7 @@ mod tests {
         let update = apply_cached_tree_update(
             &mut tree,
             None,
-            vec![NativeCompositionPatch::ReplaceNode {
+            vec![CompositionPatch::ReplaceNode {
                 node_id: "root.Label[0]".into(),
                 node: replacement,
             }],
@@ -9159,7 +8746,7 @@ mod tests {
         let update = apply_cached_tree_update(
             &mut tree,
             None,
-            vec![NativeCompositionPatch::ShaderUniform {
+            vec![CompositionPatch::ShaderUniform {
                 node_id: "root".into(),
                 stage_index: 0,
                 name: "phase_01".into(),
@@ -9214,7 +8801,7 @@ mod tests {
         let update = apply_cached_tree_update(
             &mut tree,
             None,
-            vec![NativeCompositionPatch::ShaderUniform {
+            vec![CompositionPatch::ShaderUniform {
                 node_id: "root".into(),
                 stage_index: SHADER_INPUT_STAGE_INDEX,
                 name: "phase_01".into(),
@@ -9288,7 +8875,7 @@ mod tests {
             &mut tree,
             &mut layout,
             &mut shader_buffers,
-            &[NativeCompositionPatch::ShaderUniform {
+            &[CompositionPatch::ShaderUniform {
                 node_id: "root.ShaderEffect[0]".into(),
                 stage_index: 0,
                 name: "phase_01".into(),

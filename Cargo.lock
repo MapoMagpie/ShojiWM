@@ -692,7 +692,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
 dependencies = [
  "bitflags 2.11.0",
- "nix 0.31.2",
  "polling",
  "rustix 1.1.4",
  "slab",
@@ -3189,7 +3188,7 @@ dependencies = [
  "cookie-factory",
  "libc",
  "libspa-sys",
- "nix 0.30.1",
+ "nix",
  "nom 8.0.0",
  "system-deps",
 ]
@@ -3520,18 +3519,6 @@ name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
-dependencies = [
- "bitflags 2.11.0",
- "cfg-if",
- "cfg_aliases",
- "libc",
-]
-
-[[package]]
-name = "nix"
-version = "0.31.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
 dependencies = [
  "bitflags 2.11.0",
  "cfg-if",
@@ -4278,7 +4265,7 @@ dependencies = [
  "libc",
  "libspa",
  "libspa-sys",
- "nix 0.30.1",
+ "nix",
  "once_cell",
  "pipewire-sys",
  "thiserror 2.0.18",
@@ -5102,33 +5089,47 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 name = "shoji_wm"
 version = "0.1.0"
 dependencies = [
+ "deno_core",
+ "icu_calendar",
+ "icu_normalizer",
+ "icu_properties",
+ "idna_adapter",
+ "rustyscript",
+ "serde",
+ "serde_json",
+ "shojiwm_lib",
+ "timescope",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "shojiwm_ipc"
+version = "0.1.0"
+
+[[package]]
+name = "shojiwm_lib"
+version = "0.1.0"
+dependencies = [
  "bitflags 2.11.0",
  "bumpalo",
  "calloop 0.14.4",
  "cgmath",
  "cosmic-text 0.17.2",
- "deno_core",
  "fontdb 0.16.2",
  "fontdue",
  "hashbrown 0.15.5",
- "icu_calendar",
- "icu_normalizer",
- "icu_properties",
- "idna_adapter",
  "input",
- "libc",
  "mimalloc",
  "png 0.17.16",
  "resvg",
  "rustc-hash 2.1.1",
- "rustyscript",
  "serde",
  "serde_json",
  "smithay",
  "smithay-drm-extras",
  "thiserror 2.0.18",
  "timescope",
- "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5142,12 +5143,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "shojiwm_ipc"
+name = "shojiwm_protocol"
 version = "0.1.0"
 
 [[package]]
-name = "shojiwm_protocol"
+name = "shojiwm_rs"
 version = "0.1.0"
+dependencies = [
+ "shojiwm_lib",
+]
 
 [[package]]
 name = "signal-hook-registry"

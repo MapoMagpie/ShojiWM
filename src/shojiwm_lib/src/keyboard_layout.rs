@@ -1,4 +1,4 @@
-//! Active seat layout for TypeScript shell integration; never records keys.
+//! Active seat layout for config runtime shell integration; never records keys.
 use crate::state::ShojiWM;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -20,9 +20,7 @@ impl ShojiWM {
                 name: xkb.layout_name(layout).to_owned(),
             }
         });
-        if let Some(evaluator) = self.decoration_evaluator.as_embedded()
-            && evaluator.set_keyboard_layout(layout)
-        {
+        if self.config_runtime.sync_keyboard_layout(layout) {
             // Wake even an idle runtime so panels receive the new layout.
             self.runtime_scheduler_enabled = true;
         }

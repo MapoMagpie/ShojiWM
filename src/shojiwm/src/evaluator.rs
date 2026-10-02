@@ -1,3 +1,6 @@
+//! The TypeScript runtime's evaluator: owns the embedded isolate, speaks the
+//! JSON / native bridge protocol, and publishes config deltas to the host.
+
 use std::{
     path::PathBuf,
     sync::{
@@ -8,27 +11,27 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
-use super::embedded_runtime::{
-    EmbeddedRuntime, EmbeddedRuntimeResponse, NativeCachedResponse, NativeCompositionPatch,
+use crate::embedded_runtime::{
+    EmbeddedRuntime, EmbeddedRuntimeResponse, NativeCachedResponse,
     NativeCompositionRequest, NativeCompositionUpdate, NativeEffectRequest, NativeEffectUpdate,
     NativeInteractionRequest, NativeInteractionResponse, NativeSchedulerRequest,
     NativeSchedulerResponse,
 };
-use super::window_model::{
-    GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowAnimationSnapshot,
-    ManagedWindowState, PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot,
-    WaylandPopupSnapshot, WaylandWindowAction, WaylandWindowSnapshot,
+use shojiwm_lib::ssd::window_model::{
+    GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, ManagedWindowState,
+    PointerMoveEventSnapshot, WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot,
+    WaylandWindowSnapshot,
     WindowActivateRequestEventSnapshot, WindowDecorationDecisionSnapshot,
-    WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
+    WindowDecorationPolicyContextSnapshot,
     WindowFullscreenRequestEventSnapshot, WindowMaximizeRequestEventSnapshot,
     WindowMinimizeRequestEventSnapshot, WindowMoveEventSnapshot, WindowResizeEventSnapshot,
 };
-use super::{
-    BackgroundEffectConfig, DecorationBridgeError, DecorationLayoutError, DecorationNode,
-    DecorationTree, EffectInput, EffectRegion, WindowEffectConfig, WindowTransform, decode_tree_json,
+use shojiwm_lib::ssd::{
+    BackgroundEffectConfig, DecorationBridgeError, WindowEffectConfig, WindowTransform,
+    decode_tree_json,
 };
-use crate::{
-    activation_environment::{RuntimeEnvUpdates, apply_runtime_env_updates},
+use shojiwm_lib::{
+    activation_environment::RuntimeEnvUpdates,
     config::RuntimeDisplayConfigUpdate,
     keyboard_layout::KeyboardLayoutSnapshot,
     runtime_debug::RuntimeDebugConfigUpdate,
@@ -38,704 +41,21 @@ use crate::{
     runtime_process::{RuntimeProcessAction, RuntimeProcessConfigUpdate},
     runtime_workspace::{RuntimeWorkspaceActivateRequestSnapshot, RuntimeWorkspaceConfigUpdate},
 };
-use smithay::reexports::calloop::channel::Sender as CalloopSender;
+use shojiwm_lib::runtime_api::{HostMessage, RuntimeConfigDelta, RuntimeHost};
+use shojiwm_lib::ssd::{
+    DecorationCachedEvaluationResult, DecorationEvaluationError, DecorationEvaluationResult,
+    DecorationEvaluator, DecorationGestureSwipeAsyncInvocation, DecorationHandlerInvocation,
+    DecorationKeyBindingInvocation, DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick,
+    DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
+    DecorationWindowStateRequestInvocation, LayerEffectEvaluationResult,
+    PopupEffectEvaluationResult, RuntimeEventConfigUpdate, RuntimeLayerEffectAssignment,
+    RuntimePopupEffectAssignment, RuntimeWindowAction, validate_layer_effect_config,
+    validate_popup_effect_config,
+};
 
 fn managed_rect_debug_enabled() -> bool {
     std::env::var_os("SHOJI_MANAGED_RECT_DEBUG")
         .is_some_and(|value| value != "0" && !value.is_empty())
-}
-
-/// Dynamic decoration evaluation boundary.
-///
-/// This trait represents the hand-off point to the embedded TypeScript runtime. It allows
-/// ShojiWM to build and validate window-aware decoration trees while keeping the dynamic
-/// evaluation contract explicit.
-pub trait DecorationEvaluator {
-    fn evaluate_window(
-        &self,
-        window: &WaylandWindowSnapshot,
-        now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError>;
-
-    fn evaluate_window_preview(
-        &self,
-        window: &WaylandWindowSnapshot,
-        now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        self.evaluate_window(window, now_ms)
-    }
-
-    fn window_decoration_policy(
-        &self,
-        _window: &WaylandWindowSnapshot,
-        _context: &WindowDecorationPolicyContextSnapshot,
-    ) -> Result<WindowDecorationDecisionSnapshot, DecorationEvaluationError> {
-        Ok(WindowDecorationDecisionSnapshot {
-            mode: WindowDecorationModeSnapshot::Server,
-        })
-    }
-
-    fn evaluate_cached_window(
-        &self,
-        _window_id: &str,
-        _window: Option<&WaylandWindowSnapshot>,
-        _now_ms: u64,
-        _force_full_reevaluation: bool,
-    ) -> Result<DecorationCachedEvaluationResult, DecorationEvaluationError> {
-        Err(DecorationEvaluationError::RuntimeProtocol(
-            "cached window evaluation unsupported".into(),
-        ))
-    }
-
-    fn scheduler_tick(
-        &self,
-        _now_ms: f64,
-    ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
-        Ok(DecorationSchedulerTick::default())
-    }
-
-    fn window_closed(&self, _window_id: &str) -> Result<(), DecorationEvaluationError> {
-        Ok(())
-    }
-
-    fn invoke_handler(
-        &self,
-        _window_id: &str,
-        _handler_id: &str,
-        _now_ms: u64,
-    ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
-        Ok(DecorationHandlerInvocation::default())
-    }
-
-    fn start_close(
-        &self,
-        _window_id: &str,
-        _now_ms: u64,
-    ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
-        Ok(DecorationHandlerInvocation::default())
-    }
-
-    fn invoke_key_binding(
-        &self,
-        _binding_id: &str,
-        _now_ms: u64,
-    ) -> Result<DecorationKeyBindingInvocation, DecorationEvaluationError> {
-        Ok(DecorationKeyBindingInvocation::default())
-    }
-
-    fn workspace_activate(
-        &self,
-        _event: &RuntimeWorkspaceActivateRequestSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationHandlerInvocation, DecorationEvaluationError> {
-        Ok(DecorationHandlerInvocation::default())
-    }
-
-    fn window_resize(
-        &self,
-        _window_id: &str,
-        _event: &WindowResizeEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowResizeInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowResizeInvocation::default())
-    }
-
-    fn window_move(
-        &self,
-        _window_id: &str,
-        _event: &WindowMoveEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowMoveInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowMoveInvocation::default())
-    }
-
-    fn window_maximize_request(
-        &self,
-        _snapshot: &WaylandWindowSnapshot,
-        _event: &WindowMaximizeRequestEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowStateRequestInvocation::default())
-    }
-
-    fn window_minimize_request(
-        &self,
-        _snapshot: &WaylandWindowSnapshot,
-        _event: &WindowMinimizeRequestEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowStateRequestInvocation::default())
-    }
-
-    fn window_fullscreen_request(
-        &self,
-        _snapshot: &WaylandWindowSnapshot,
-        _event: &WindowFullscreenRequestEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowStateRequestInvocation::default())
-    }
-
-    fn window_activate_request(
-        &self,
-        _snapshot: &WaylandWindowSnapshot,
-        _event: &WindowActivateRequestEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationWindowStateRequestInvocation, DecorationEvaluationError> {
-        Ok(DecorationWindowStateRequestInvocation::default())
-    }
-
-    fn pointer_move(
-        &self,
-        _event: &PointerMoveEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationPointerMoveAsyncInvocation, DecorationEvaluationError> {
-        Ok(DecorationPointerMoveAsyncInvocation::default())
-    }
-
-    fn pointer_move_async(&self, _event: PointerMoveEventSnapshot, _now_ms: u64) {}
-
-    fn gesture_swipe(
-        &self,
-        _event: &GestureSwipeEventSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationGestureSwipeAsyncInvocation, DecorationEvaluationError> {
-        Ok(DecorationGestureSwipeAsyncInvocation::default())
-    }
-
-    fn gesture_swipe_async(&self, _event: GestureSwipeEventSnapshot, _now_ms: u64) {}
-
-    fn evaluate_layer_effects(
-        &self,
-        _output_name: &str,
-        _layers: &[WaylandLayerSnapshot],
-        _now_ms: u64,
-    ) -> Result<LayerEffectEvaluationResult, DecorationEvaluationError> {
-        Ok(LayerEffectEvaluationResult::default())
-    }
-
-    fn evaluate_popup_effects(
-        &self,
-        _output_name: &str,
-        _popups: &[WaylandPopupSnapshot],
-        _now_ms: u64,
-    ) -> Result<PopupEffectEvaluationResult, DecorationEvaluationError> {
-        Ok(PopupEffectEvaluationResult::default())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DecorationEvaluationResult {
-    pub node: DecorationNode,
-    pub transform: WindowTransform,
-    pub managed_window: ManagedWindowState,
-    pub window_effects: Option<WindowEffectConfig>,
-    pub dirty_node_ids: Vec<String>,
-    pub next_poll_in_ms: Option<u64>,
-    /// Window actions (typically scheduleAnimation / cancelAnimation) queued
-    /// by user handlers during this evaluation. Returned in-band so the
-    /// compositor can apply them *before* sampling animations for the same
-    /// refresh — fixing the one-frame flash at the static target position
-    /// before open / first-commit animations kick in.
-    pub actions: Vec<RuntimeWindowAction>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DecorationCachedEvaluationResult {
-    pub node: Option<DecorationNode>,
-    pub node_patches: Vec<NativeCompositionPatch>,
-    pub transform: WindowTransform,
-    pub managed_window: ManagedWindowState,
-    pub window_effects: Option<WindowEffectConfig>,
-    pub window_effect_uniform_only: bool,
-    pub dirty_node_ids: Vec<String>,
-    pub managed_window_only: bool,
-    pub next_poll_in_ms: Option<u64>,
-    /// See `DecorationEvaluationResult::actions`. Same role on the cached path.
-    pub actions: Vec<RuntimeWindowAction>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-impl From<DecorationEvaluationResult> for DecorationCachedEvaluationResult {
-    fn from(result: DecorationEvaluationResult) -> Self {
-        Self {
-            node: Some(result.node),
-            node_patches: Vec::new(),
-            transform: result.transform,
-            managed_window: result.managed_window,
-            window_effects: result.window_effects,
-            window_effect_uniform_only: false,
-            dirty_node_ids: result.dirty_node_ids,
-            managed_window_only: false,
-            next_poll_in_ms: result.next_poll_in_ms,
-            actions: result.actions,
-            display_config: result.display_config,
-            workspace_config: result.workspace_config,
-            key_binding_config: result.key_binding_config,
-            pointer_config: result.pointer_config,
-            input_config: result.input_config,
-            event_config: result.event_config,
-            process_config: result.process_config,
-            process_actions: result.process_actions,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationSchedulerTick {
-    pub dirty: bool,
-    pub runtime_dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_ids: Vec<String>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-    pub debug_config: Option<RuntimeDebugConfigUpdate>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationHandlerInvocation {
-    pub invoked: bool,
-    /// Close-animation duration the config declared via
-    /// `window.setCloseAnimationDuration(...)`. Only populated by
-    /// `start_close` responses; the closing-snapshot watchdog derives its
-    /// per-window finalize deadline from this.
-    pub close_animation_duration_ms: Option<u64>,
-    pub node: Option<DecorationNode>,
-    pub transform: Option<WindowTransform>,
-    pub managed_window: Option<ManagedWindowState>,
-    pub window_effects: Option<WindowEffectConfig>,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationKeyBindingInvocation {
-    pub invoked: bool,
-    pub dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-    pub debug_config: Option<RuntimeDebugConfigUpdate>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationWindowResizeInvocation {
-    pub invoked: bool,
-    pub dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationWindowMoveInvocation {
-    pub invoked: bool,
-    pub dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationWindowStateRequestInvocation {
-    pub invoked: bool,
-    pub dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DecorationPointerMoveAsyncInvocation {
-    pub invoked: bool,
-    pub dirty: bool,
-    pub dirty_window_ids: Vec<String>,
-    pub dirty_managed_window_ids: Vec<String>,
-    pub dirty_window_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub dirty_layer_node_ids: std::collections::HashMap<String, Vec<String>>,
-    pub actions: Vec<RuntimeWindowAction>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-pub type DecorationGestureSwipeAsyncInvocation = DecorationPointerMoveAsyncInvocation;
-
-#[derive(Debug, Clone)]
-pub enum DecorationRuntimeAsyncInvocation {
-    PointerMove(DecorationPointerMoveAsyncInvocation),
-    GestureSwipe(DecorationGestureSwipeAsyncInvocation),
-    CursorConfig(crate::cursor::RuntimeCursorConfigUpdate),
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeEventConfigUpdate {
-    #[serde(default)]
-    pub pointer_move: bool,
-    #[serde(default)]
-    pub pointer_move_async: bool,
-    #[serde(default)]
-    pub gesture_swipe: bool,
-    #[serde(default)]
-    pub gesture_swipe_async: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LayerEffectEvaluationResult {
-    pub effects: Vec<RuntimeLayerEffectAssignment>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeLayerEffectAssignment {
-    pub layer_id: String,
-    pub effects: Option<WindowEffectConfig>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct PopupEffectEvaluationResult {
-    pub effects: Vec<RuntimePopupEffectAssignment>,
-    pub next_poll_in_ms: Option<u64>,
-    pub display_config: Option<RuntimeDisplayConfigUpdate>,
-    pub workspace_config: Option<RuntimeWorkspaceConfigUpdate>,
-    pub key_binding_config: Option<RuntimeKeyBindingConfigUpdate>,
-    pub pointer_config: Option<RuntimePointerConfigUpdate>,
-    pub input_config: Option<RuntimeInputConfigUpdate>,
-    pub event_config: Option<RuntimeEventConfigUpdate>,
-    pub process_config: Option<RuntimeProcessConfigUpdate>,
-    pub process_actions: Vec<RuntimeProcessAction>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimePopupEffectAssignment {
-    pub popup_id: String,
-    pub effects: Option<WindowEffectConfig>,
-    /// `COMPOSITOR.rendering.surfacePolicy` result for this popup's surface.
-    pub surface_policy: Option<super::SurfacePolicy>,
-}
-
-fn validate_popup_effect_config(
-    effects: WindowEffectConfig,
-) -> Result<WindowEffectConfig, DecorationBridgeError> {
-    let is_popup_source =
-        |slot: &super::WindowEffectSlot| matches!(slot.effect.input, EffectInput::PopupSource(_));
-    // `behind` additionally accepts backdrop inputs that can be resolved from
-    // the framebuffer at draw time. They may sample a pre-captured popup
-    // source, but not xray/window/layer sources: popups render inline with
-    // their parent's element stream, so there is no offline scene capture.
-    if effects.behind.as_ref().is_some_and(|slot| {
-        !is_popup_source(slot) && !slot.effect.supports_popup_framebuffer_backdrop()
-    }) || effects
-        .behind_root_surface
-        .as_ref()
-        .is_some_and(|slot| !is_popup_source(slot))
-        || effects
-            .in_front
-            .as_ref()
-            .is_some_and(|slot| !is_popup_source(slot))
-        || effects
-            .replace
-            .as_ref()
-            .is_some_and(|slot| !is_popup_source(slot))
-        // Subsurfaces are split out of toplevel windows only.
-        || effects.replace_subsurfaces.is_some()
-        || effects.behind_subsurfaces.is_some()
-        // Regions narrow layer backdrops only.
-        || [
-            &effects.behind,
-            &effects.behind_root_surface,
-            &effects.in_front,
-            &effects.replace,
-        ]
-        .into_iter()
-        .any(slot_narrowed_to_region)
-    {
-        return Err(DecorationBridgeError::InvalidEffectInput);
-    }
-    Ok(effects)
-}
-
-fn validate_layer_effect_config(
-    effects: WindowEffectConfig,
-) -> Result<WindowEffectConfig, DecorationBridgeError> {
-    let is_layer_source =
-        |slot: &super::WindowEffectSlot| matches!(slot.effect.input, EffectInput::LayerSource(_));
-    if effects
-        .behind
-        .as_ref()
-        .is_some_and(|slot| !is_layer_source(slot) && !slot.effect.is_backdrop())
-        || effects
-            .behind_root_surface
-            .as_ref()
-            .is_some_and(|slot| !is_layer_source(slot))
-        || effects
-            .in_front
-            .as_ref()
-            .is_some_and(|slot| !is_layer_source(slot))
-        || effects
-            .replace
-            .as_ref()
-            .is_some_and(|slot| !is_layer_source(slot))
-        || effects.replace_subsurfaces.is_some()
-        || effects.behind_subsurfaces.is_some()
-        // Only a backdrop `behind` can be narrowed to a region: the layer itself is
-        // still drawn whole, so every other slot has to cover the whole surface.
-        || effects
-            .behind
-            .as_ref()
-            .is_some_and(|slot| slot.region != EffectRegion::Surface && !slot.effect.is_backdrop())
-        || [&effects.behind_root_surface, &effects.in_front, &effects.replace]
-            .into_iter()
-            .any(slot_narrowed_to_region)
-    {
-        return Err(DecorationBridgeError::InvalidEffectInput);
-    }
-    Ok(effects)
-}
-
-fn slot_narrowed_to_region(slot: &Option<super::WindowEffectSlot>) -> bool {
-    slot.as_ref()
-        .is_some_and(|slot| slot.region != EffectRegion::Surface)
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-pub struct RuntimeWindowAction {
-    #[serde(rename = "windowId")]
-    pub window_id: String,
-    pub action: WaylandWindowAction,
-    #[serde(default)]
-    pub animation: Option<ManagedWindowAnimationSnapshot>,
-    #[serde(default)]
-    pub channel: Option<String>,
-}
-
-/// Temporary Rust-side evaluator that mirrors the intended TS-level behavior:
-///
-/// - focused windows get a yellow border
-/// - unfocused windows get a white border
-/// - title is reflected into a label node
-///
-/// This exists only to establish the per-window reevaluation flow for milestone 3.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StaticDecorationEvaluator;
-
-impl DecorationEvaluator for StaticDecorationEvaluator {
-    fn evaluate_window(
-        &self,
-        window: &WaylandWindowSnapshot,
-        _now_ms: u64,
-    ) -> Result<DecorationEvaluationResult, DecorationEvaluationError> {
-        let border_color = if window.is_focused {
-            "#ffff00"
-        } else {
-            "#ffffff"
-        };
-
-        let json = format!(
-            r##"{{
-                "kind": "WindowBorder",
-                "props": {{
-                    "style": {{
-                        "border": {{ "px": 1, "color": "{border_color}" }}
-                    }}
-                }},
-                "children": [
-                    {{
-                        "kind": "Box",
-                        "props": {{
-                            "direction": "column"
-                        }},
-                        "children": [
-                            {{
-                                "kind": "Box",
-                                "props": {{
-                                    "direction": "row",
-                                    "style": {{
-                                        "height": 28,
-                                        "paddingX": 8,
-                                        "gap": 8
-                                    }}
-                                }},
-                                "children": [
-                                    {{
-                                        "kind": "Label",
-                                        "props": {{
-                                            "text": {title:?}
-                                        }},
-                                        "children": []
-                                    }},
-                                    {{
-                                        "kind": "Box",
-                                        "props": {{
-                                            "style": {{ "flexGrow": 1 }}
-                                        }},
-                                        "children": []
-                                    }},
-                                    {{
-                                        "kind": "Button",
-                                        "props": {{
-                                            "onClick": "close"
-                                        }},
-                                        "children": []
-                                    }}
-                                ]
-                            }},
-                            {{
-                                "kind": "Window",
-                                "props": {{}},
-                                "children": []
-                            }}
-                        ]
-                    }}
-                ]
-            }}"##,
-            title = window.title,
-        );
-
-        Ok(DecorationEvaluationResult {
-            node: decode_tree_json(&json)?,
-            transform: WindowTransform::default(),
-            managed_window: ManagedWindowState::default(),
-            window_effects: None,
-            dirty_node_ids: Vec::new(),
-            next_poll_in_ms: None,
-            actions: Vec::new(),
-            display_config: None,
-            workspace_config: None,
-            key_binding_config: None,
-            pointer_config: None,
-            input_config: None,
-            event_config: None,
-            process_config: None,
-            process_actions: Vec::new(),
-        })
-    }
-}
-
-pub fn evaluate_dynamic_decoration<E: DecorationEvaluator>(
-    evaluator: &E,
-    window: &WaylandWindowSnapshot,
-    now_ms: u64,
-) -> Result<DecorationTree, DecorationEvaluationError> {
-    evaluator
-        .evaluate_window(window, now_ms)
-        .map(|result| DecorationTree::new(result.node))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DecorationEvaluationError {
-    #[error(transparent)]
-    Bridge(#[from] DecorationBridgeError),
-    #[error("failed to compute decoration layout: {0:?}")]
-    Layout(DecorationLayoutError),
-    #[error("failed to serialize window snapshot for evaluation: {0}")]
-    SnapshotSerialization(String),
-    #[error("failed to execute decoration runtime: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("decoration runtime exited with status {status}: {stderr}")]
-    RuntimeFailed { status: i32, stderr: String },
-    #[error("decoration runtime returned invalid utf-8 output")]
-    InvalidUtf8,
-    #[error("decoration runtime returned invalid json: {0}")]
-    InvalidResponse(String),
-    #[error("decoration runtime protocol error: {0}")]
-    RuntimeProtocol(String),
 }
 
 pub struct EmbeddedDecorationEvaluator {
@@ -748,8 +68,12 @@ pub struct EmbeddedDecorationEvaluator {
     keyboard_layout: Arc<Mutex<Option<KeyboardLayoutSnapshot>>>,
     runtime_state_generation: Arc<AtomicU64>,
     pointer_move_async: Arc<PointerMoveAsyncDispatcher>,
-    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
+    host: RuntimeHost,
 }
+
+/// An async hook's answer plus the config deltas it carried, published only
+/// once the result is known to come from the current isolate.
+type AsyncHookResult = (DecorationPointerMoveAsyncInvocation, RuntimeConfigDelta);
 
 #[derive(Debug)]
 enum RuntimeAsyncWork {
@@ -782,7 +106,7 @@ struct EmbeddedDecorationRuntime {
     child: EmbeddedRuntime,
     next_request_id: u64,
     stderr_log: Arc<Mutex<String>>,
-    async_event_sender: Arc<Mutex<Option<CalloopSender<DecorationRuntimeAsyncInvocation>>>>,
+    host: RuntimeHost,
     last_sent_runtime_state_generation: u64,
     last_sent_keyboard_layout: Option<KeyboardLayoutSnapshot>,
 }
@@ -1491,8 +815,21 @@ fn validate_interaction_response(
 }
 
 fn interaction_invocation_from_response(
+    host: &RuntimeHost,
     response: RuntimePointerMoveAsyncResponse,
 ) -> DecorationPointerMoveAsyncInvocation {
+    RuntimeConfigDelta {
+        display_config: response.display_config,
+        workspace_config: response.workspace_config,
+        key_binding_config: response.key_binding_config,
+        pointer_config: response.pointer_config,
+        input_config: response.input_config,
+        event_config: response.event_config,
+        process_config: response.process_config,
+        process_actions: response.process_actions.unwrap_or_default(),
+        ..RuntimeConfigDelta::default()
+    }
+    .publish(host);
     DecorationPointerMoveAsyncInvocation {
         invoked: response.invoked.unwrap_or(false),
         dirty: response.dirty.unwrap_or(false),
@@ -1502,14 +839,6 @@ fn interaction_invocation_from_response(
         dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
         actions: response.actions.unwrap_or_default(),
         next_poll_in_ms: response.next_poll_in_ms,
-        display_config: response.display_config,
-        workspace_config: response.workspace_config,
-        key_binding_config: response.key_binding_config,
-        pointer_config: response.pointer_config,
-        input_config: response.input_config,
-        event_config: response.event_config,
-        process_config: response.process_config,
-        process_actions: response.process_actions.unwrap_or_default(),
     }
 }
 
@@ -1551,7 +880,7 @@ impl EmbeddedDecorationEvaluator {
             keyboard_layout: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
-            async_event_sender: Arc::new(Mutex::new(None)),
+            host: RuntimeHost::detached(),
         }
     }
 
@@ -1566,7 +895,7 @@ impl EmbeddedDecorationEvaluator {
             keyboard_layout: Arc::new(Mutex::new(None)),
             runtime_state_generation: Arc::new(AtomicU64::new(1)),
             pointer_move_async: Arc::new(PointerMoveAsyncDispatcher::default()),
-            async_event_sender: Arc::new(Mutex::new(None)),
+            host: RuntimeHost::detached(),
         }
     }
 
@@ -1575,10 +904,15 @@ impl EmbeddedDecorationEvaluator {
         self
     }
 
-    pub fn set_async_event_sender(&self, sender: CalloopSender<DecorationRuntimeAsyncInvocation>) {
-        if let Ok(mut guard) = self.async_event_sender.lock() {
-            *guard = Some(sender);
-        }
+    /// Route config deltas and async results to `host`. Set before the first
+    /// request; clones made afterwards share it.
+    pub fn with_host(mut self, host: RuntimeHost) -> Self {
+        self.host = host;
+        self
+    }
+
+    fn publish_config(&self, delta: RuntimeConfigDelta) {
+        delta.publish(&self.host);
     }
 
     pub fn set_display_state(
@@ -1794,8 +1128,7 @@ impl EmbeddedDecorationEvaluator {
             .runtime_dispatchable
             .store(true, Ordering::Release);
 
-        Ok(DecorationHandlerInvocation {
-            invoked: true,
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -1804,6 +1137,10 @@ impl EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
+        Ok(DecorationHandlerInvocation {
+            invoked: true,
             ..DecorationHandlerInvocation::default()
         })
     }
@@ -1902,6 +1239,7 @@ impl EmbeddedDecorationEvaluator {
         &self,
     ) -> Result<EmbeddedDecorationRuntime, DecorationEvaluationError> {
         debug!("spawning embedded RustyScript decoration runtime");
+        crate::embedded_runtime::set_wake_host(self.host.clone());
         let child = EmbeddedRuntime::start(
             self.script_path.clone(),
             self.config_path.clone(),
@@ -1912,7 +1250,7 @@ impl EmbeddedDecorationEvaluator {
             child,
             next_request_id: 1,
             stderr_log: Arc::new(Mutex::new(String::new())),
-            async_event_sender: Arc::clone(&self.async_event_sender),
+            host: self.host.clone(),
             last_sent_runtime_state_generation: 0,
             last_sent_keyboard_layout: None,
         })
@@ -2080,16 +1418,12 @@ impl EmbeddedDecorationEvaluator {
 
             let epoch = self.pointer_move_async.epoch.load(Ordering::Acquire);
             let result = match work {
-                RuntimeAsyncWork::PointerMove { event, now_ms } => self
-                    .dispatch_pointer_move_async(&event, now_ms)
-                    .map(|invocation| {
-                        invocation.map(DecorationRuntimeAsyncInvocation::PointerMove)
-                    }),
-                RuntimeAsyncWork::GestureSwipe { event, now_ms } => self
-                    .dispatch_gesture_swipe_async(&event, now_ms)
-                    .map(|invocation| {
-                        invocation.map(DecorationRuntimeAsyncInvocation::GestureSwipe)
-                    }),
+                RuntimeAsyncWork::PointerMove { event, now_ms } => {
+                    self.dispatch_pointer_move_async(&event, now_ms)
+                }
+                RuntimeAsyncWork::GestureSwipe { event, now_ms } => {
+                    self.dispatch_gesture_swipe_async(&event, now_ms)
+                }
             };
 
             // A reload can land while the round trip is in flight. The result then
@@ -2100,12 +1434,9 @@ impl EmbeddedDecorationEvaluator {
             }
 
             match result {
-                Ok(Some(invocation)) => {
-                    if let Ok(sender_guard) = self.async_event_sender.lock()
-                        && let Some(sender) = sender_guard.as_ref()
-                    {
-                        let _ = sender.send(invocation);
-                    }
+                Ok(Some((invocation, config))) => {
+                    config.publish(&self.host);
+                    self.host.send(HostMessage::PointerHookResult(invocation));
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -2172,7 +1503,7 @@ impl EmbeddedDecorationEvaluator {
             return Err(runtime_failed_error(runtime));
         };
         validate_interaction_response(&response, request_id, "pointerMove")?;
-        Ok(interaction_invocation_from_response(response))
+        Ok(interaction_invocation_from_response(&self.host, response))
     }
 
     fn dispatch_gesture_swipe(
@@ -2203,14 +1534,14 @@ impl EmbeddedDecorationEvaluator {
             return Err(runtime_failed_error(runtime));
         };
         validate_interaction_response(&response, request_id, "gestureSwipe")?;
-        Ok(interaction_invocation_from_response(response))
+        Ok(interaction_invocation_from_response(&self.host, response))
     }
 
     fn dispatch_pointer_move_async(
         &self,
         event: &PointerMoveEventSnapshot,
         now_ms: u64,
-    ) -> Result<Option<DecorationPointerMoveAsyncInvocation>, DecorationEvaluationError> {
+    ) -> Result<Option<AsyncHookResult>, DecorationEvaluationError> {
         if !self
             .pointer_move_async
             .runtime_dispatchable
@@ -2283,15 +1614,7 @@ impl EmbeddedDecorationEvaluator {
             ));
         }
 
-        Ok(Some(DecorationPointerMoveAsyncInvocation {
-            invoked: response.invoked.unwrap_or(false),
-            dirty: response.dirty.unwrap_or(false),
-            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
-            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
-            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
-            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
-            actions: response.actions.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
+        let config = RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -2300,14 +1623,25 @@ impl EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
-        }))
+            ..RuntimeConfigDelta::default()
+        };
+        Ok(Some((DecorationPointerMoveAsyncInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+        }, config)))
     }
 
     fn dispatch_gesture_swipe_async(
         &self,
         event: &GestureSwipeEventSnapshot,
         now_ms: u64,
-    ) -> Result<Option<DecorationGestureSwipeAsyncInvocation>, DecorationEvaluationError> {
+    ) -> Result<Option<AsyncHookResult>, DecorationEvaluationError> {
         if !self
             .pointer_move_async
             .runtime_dispatchable
@@ -2376,15 +1710,7 @@ impl EmbeddedDecorationEvaluator {
             ));
         }
 
-        Ok(Some(DecorationGestureSwipeAsyncInvocation {
-            invoked: response.invoked.unwrap_or(false),
-            dirty: response.dirty.unwrap_or(false),
-            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
-            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
-            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
-            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
-            actions: response.actions.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
+        let config = RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -2393,7 +1719,18 @@ impl EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
-        }))
+            ..RuntimeConfigDelta::default()
+        };
+        Ok(Some((DecorationGestureSwipeAsyncInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+        }, config)))
     }
 }
 
@@ -2409,7 +1746,7 @@ impl Clone for EmbeddedDecorationEvaluator {
             keyboard_layout: Arc::clone(&self.keyboard_layout),
             runtime_state_generation: Arc::clone(&self.runtime_state_generation),
             pointer_move_async: Arc::clone(&self.pointer_move_async),
-            async_event_sender: Arc::clone(&self.async_event_sender),
+            host: self.host.clone(),
         }
     }
 }
@@ -2505,7 +1842,7 @@ impl EmbeddedDecorationRuntime {
         &self,
         request_id: u64,
     ) -> Result<
-        Option<super::embedded_runtime::ResolvedNativeEffectUpdate>,
+        Option<crate::embedded_runtime::ResolvedNativeEffectUpdate>,
         DecorationEvaluationError,
     > {
         timescope::scope!("runtime take effect update");
@@ -2626,31 +1963,19 @@ impl EmbeddedDecorationRuntime {
                         String::from_utf8_lossy(&payload)
                     ))
                 })?;
-            apply_runtime_env_updates(env_updates, "typescript-runtime");
+            self.host.send(HostMessage::Env(env_updates));
         }
 
         if let Some(cursor_config) = value.get("cursorConfig") {
             timescope::scope!("runtime cursor config");
-            let cursor_config: crate::cursor::RuntimeCursorConfigUpdate =
+            let cursor_config: shojiwm_lib::cursor::RuntimeCursorConfigUpdate =
                 serde_json::from_value(cursor_config.clone()).map_err(|error| {
                     DecorationEvaluationError::InvalidResponse(format!(
                         "invalid cursorConfig: {error}; payload={}",
                         String::from_utf8_lossy(&payload)
                     ))
                 })?;
-            if let Ok(sender) = self.async_event_sender.lock()
-                && let Some(sender) = sender.as_ref()
-            {
-                sender
-                    .send(DecorationRuntimeAsyncInvocation::CursorConfig(
-                        cursor_config,
-                    ))
-                    .map_err(|error| {
-                        DecorationEvaluationError::RuntimeProtocol(format!(
-                            "failed to dispatch runtime cursor config: {error}"
-                        ))
-                    })?;
-            }
+            self.host.send(HostMessage::Cursor(cursor_config));
         }
 
         {
@@ -2975,14 +2300,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             }
         };
         let window_effects = take_native_window_effects(runtime, request_id, &window.id)?;
-        Ok(DecorationEvaluationResult {
-            node,
-            transform: response.transform.unwrap_or_default(),
-            managed_window: response.managed_window.unwrap_or_default(),
-            window_effects,
-            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
-            actions: response.actions.unwrap_or_default(),
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -2991,6 +2309,16 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
+        Ok(DecorationEvaluationResult {
+            node,
+            transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
+            window_effects,
+            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            actions: response.actions.unwrap_or_default(),
         })
     }
 
@@ -3101,14 +2429,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
                 ));
             }
         };
-        Ok(DecorationEvaluationResult {
-            node,
-            transform: response.transform.unwrap_or_default(),
-            managed_window: response.managed_window.unwrap_or_default(),
-            window_effects: take_native_window_effects(runtime, request_id, &window.id)?,
-            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
-            actions: response.actions.unwrap_or_default(),
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -3117,6 +2438,16 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
+        Ok(DecorationEvaluationResult {
+            node,
+            transform: response.transform.unwrap_or_default(),
+            managed_window: response.managed_window.unwrap_or_default(),
+            window_effects: take_native_window_effects(runtime, request_id, &window.id)?,
+            dirty_node_ids: response.dirty_node_ids.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
+            actions: response.actions.unwrap_or_default(),
         })
     }
 
@@ -3332,6 +2663,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
         };
         let (window_effects, window_effect_uniform_only) =
             take_native_window_effect_update(runtime, request_id, window_id)?;
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationCachedEvaluationResult {
             node,
             node_patches,
@@ -3343,14 +2685,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             managed_window_only,
             next_poll_in_ms: response.next_poll_in_ms,
             actions: response.actions.unwrap_or_default(),
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -3459,6 +2793,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             );
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            debug_config: response.debug_config,
+        });
         Ok(DecorationSchedulerTick {
             dirty: response.dirty.unwrap_or(false),
             runtime_dirty: response.runtime_dirty.unwrap_or(false),
@@ -3469,15 +2814,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
-            debug_config: response.debug_config,
         })
     }
 
@@ -3642,6 +2978,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             None
         };
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationHandlerInvocation {
             close_animation_duration_ms: None,
             invoked: response.invoked.unwrap_or(false),
@@ -3654,14 +3001,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -3742,15 +3081,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
-        Ok(DecorationKeyBindingInvocation {
-            invoked: response.invoked.unwrap_or(false),
-            dirty: response.dirty.unwrap_or(false),
-            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
-            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
-            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
-            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
-            actions: response.actions.unwrap_or_default(),
-            next_poll_in_ms: response.next_poll_in_ms,
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -3760,6 +3091,16 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
             debug_config: response.debug_config,
+        });
+        Ok(DecorationKeyBindingInvocation {
+            invoked: response.invoked.unwrap_or(false),
+            dirty: response.dirty.unwrap_or(false),
+            dirty_window_ids: response.dirty_window_ids.unwrap_or_default(),
+            dirty_managed_window_ids: response.dirty_managed_window_ids.unwrap_or_default(),
+            dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
+            dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
+            actions: response.actions.unwrap_or_default(),
+            next_poll_in_ms: response.next_poll_in_ms,
         })
     }
 
@@ -3849,6 +3190,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             None
         };
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationHandlerInvocation {
             close_animation_duration_ms: None,
             invoked: response.invoked.unwrap_or(false),
@@ -3861,14 +3213,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -3942,6 +3286,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowResizeInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -3951,14 +3306,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4032,6 +3379,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowMoveInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -4041,14 +3399,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4128,6 +3478,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -4137,14 +3498,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4224,6 +3577,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -4233,14 +3597,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4320,6 +3676,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -4329,14 +3696,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4416,6 +3775,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             ));
         }
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationWindowStateRequestInvocation {
             invoked: response.invoked.unwrap_or(false),
             dirty: response.dirty.unwrap_or(false),
@@ -4425,14 +3795,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_layer_node_ids: response.dirty_layer_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4544,6 +3906,17 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             None
         };
 
+        self.publish_config(RuntimeConfigDelta {
+            display_config: response.display_config,
+            workspace_config: response.workspace_config,
+            key_binding_config: response.key_binding_config,
+            pointer_config: response.pointer_config,
+            input_config: response.input_config,
+            event_config: response.event_config,
+            process_config: response.process_config,
+            process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
         Ok(DecorationHandlerInvocation {
             close_animation_duration_ms: response.close_animation_duration_ms,
             invoked: response.invoked.unwrap_or(false),
@@ -4556,14 +3929,6 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             dirty_window_node_ids: response.dirty_window_node_ids.unwrap_or_default(),
             actions: response.actions.unwrap_or_default(),
             next_poll_in_ms: response.next_poll_in_ms,
-            display_config: response.display_config,
-            workspace_config: response.workspace_config,
-            key_binding_config: response.key_binding_config,
-            pointer_config: response.pointer_config,
-            input_config: response.input_config,
-            event_config: response.event_config,
-            process_config: response.process_config,
-            process_actions: response.process_actions.unwrap_or_default(),
         })
     }
 
@@ -4668,9 +4033,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             }
         };
 
-        Ok(LayerEffectEvaluationResult {
-            effects,
-            next_poll_in_ms: response.next_poll_in_ms,
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -4679,6 +4042,11 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
+        Ok(LayerEffectEvaluationResult {
+            effects,
+            next_poll_in_ms: response.next_poll_in_ms,
         })
     }
 
@@ -4784,9 +4152,7 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             }
         };
 
-        Ok(PopupEffectEvaluationResult {
-            effects,
-            next_poll_in_ms: response.next_poll_in_ms,
+        self.publish_config(RuntimeConfigDelta {
             display_config: response.display_config,
             workspace_config: response.workspace_config,
             key_binding_config: response.key_binding_config,
@@ -4795,6 +4161,11 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
             event_config: response.event_config,
             process_config: response.process_config,
             process_actions: response.process_actions.unwrap_or_default(),
+            ..RuntimeConfigDelta::default()
+        });
+        Ok(PopupEffectEvaluationResult {
+            effects,
+            next_poll_in_ms: response.next_poll_in_ms,
         })
     }
 }
@@ -4802,7 +4173,11 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssd::{
+    use shojiwm_lib::ssd::{
+        EffectInput, EffectRegion, StaticDecorationEvaluator, WindowDecorationModeSnapshot,
+        evaluate_dynamic_decoration,
+    };
+    use shojiwm_lib::ssd::{
         BackdropBlur, CompiledEffect, DecorationNodeKind, EffectAlphaMode,
         EffectInvalidationPolicy, EffectOutsets, EffectStage, ShaderModule, ShaderStage,
         WindowEffectSlot, WindowSourceInclude,
@@ -4841,7 +4216,7 @@ mod tests {
             is_transient: false,
             parent_id: None,
             icon: None,
-            interaction: crate::ssd::DecorationInteractionSnapshot::default(),
+            interaction: shojiwm_lib::ssd::DecorationInteractionSnapshot::default(),
         }
     }
 
@@ -4902,7 +4277,7 @@ COMPOSITOR.window.composition = () => <Box />;
 
     #[test]
     fn embedded_runtime_dispatches_interactions_through_native_bridge() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, PointerHitTargetSnapshot,
             PointerModifierStateSnapshot, PointerMoveEventSnapshot, PointerMovePointSnapshot,
             WindowMoveEventSnapshot, WindowMovePhaseSnapshot, WindowMoveSourceSnapshot,
@@ -4941,12 +4316,14 @@ COMPOSITOR.event.onWindowResize(() => {});
             &config_path,
         )
         .with_working_dir(&repository_root);
-        let lifecycle = evaluator
+        evaluator
             .lifecycle_enable("test", None)
             .expect("runtime should load interaction listeners");
-        let event_config = lifecycle
-            .event_config
-            .expect("runtime should publish interaction listener configuration");
+        let event_config = published(&evaluator, |message| match message {
+            HostMessage::EventFilter(config) => Some(config),
+            _ => None,
+        })
+        .expect("runtime should publish interaction listener configuration");
         assert!(event_config.pointer_move);
         assert!(event_config.pointer_move_async);
         assert!(event_config.gesture_swipe);
@@ -4976,6 +4353,7 @@ COMPOSITOR.event.onWindowResize(() => {});
                 .dispatch_pointer_move_async(&pointer, 1)
                 .expect("native async pointer event should complete")
                 .expect("runtime should be available")
+                .0
                 .invoked
         );
 
@@ -5004,6 +4382,7 @@ COMPOSITOR.event.onWindowResize(() => {});
                 .dispatch_gesture_swipe_async(&gesture, 2)
                 .expect("native async gesture event should complete")
                 .expect("runtime should be available")
+                .0
                 .invoked
         );
 
@@ -5154,27 +4533,27 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         let layer = WaylandLayerSnapshot {
             id: "layer-1".into(),
             namespace: Some("test".into()),
-            layer: crate::ssd::window_model::LayerKindSnapshot::Top,
+            layer: shojiwm_lib::ssd::window_model::LayerKindSnapshot::Top,
             output_name: "output-1".into(),
-            position: crate::ssd::window_model::LayerPositionSnapshot {
+            position: shojiwm_lib::ssd::window_model::LayerPositionSnapshot {
                 x: 0,
                 y: 0,
                 width: 800,
                 height: 32,
             },
-            anchor: crate::ssd::window_model::LayerAnchorSnapshot {
+            anchor: shojiwm_lib::ssd::window_model::LayerAnchorSnapshot {
                 top: true,
                 bottom: false,
                 left: true,
                 right: true,
             },
-            exclusive_zone: crate::ssd::window_model::LayerExclusiveZoneSnapshot::Exclusive {
+            exclusive_zone: shojiwm_lib::ssd::window_model::LayerExclusiveZoneSnapshot::Exclusive {
                 size: 32,
             },
-            exclusive_edge: Some(crate::ssd::window_model::LayerEdgeSnapshot::Top),
-            margin: crate::ssd::window_model::LayerMarginSnapshot::default(),
-            keyboard_interactivity: crate::ssd::window_model::KeyboardInteractivitySnapshot::None,
-            desired_size: crate::ssd::window_model::LayerDesiredSizeSnapshot {
+            exclusive_edge: Some(shojiwm_lib::ssd::window_model::LayerEdgeSnapshot::Top),
+            margin: shojiwm_lib::ssd::window_model::LayerMarginSnapshot::default(),
+            keyboard_interactivity: shojiwm_lib::ssd::window_model::KeyboardInteractivitySnapshot::None,
+            desired_size: shojiwm_lib::ssd::window_model::LayerDesiredSizeSnapshot {
                 width: 800,
                 height: 32,
             },
@@ -5194,9 +4573,9 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         let popup = WaylandPopupSnapshot {
             id: "popup-1".into(),
             parent_id: "layer-1".into(),
-            parent_kind: crate::ssd::window_model::PopupParentKindSnapshot::Layer,
+            parent_kind: shojiwm_lib::ssd::window_model::PopupParentKindSnapshot::Layer,
             output_name: "output-1".into(),
-            position: crate::ssd::window_model::LayerPositionSnapshot {
+            position: shojiwm_lib::ssd::window_model::LayerPositionSnapshot {
                 x: 10,
                 y: 10,
                 width: 200,
@@ -5213,7 +4592,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
                     .as_ref()
                     .is_some_and(|slot| matches!(slot.effect.input, EffectInput::PopupSource(_)))
             }) && assignment.surface_policy.is_some_and(|policy| {
-                policy.opaque_region == crate::ssd::OpaqueRegionPolicy::Ignore
+                policy.opaque_region == shojiwm_lib::ssd::OpaqueRegionPolicy::Ignore
             })
         }));
 
@@ -5250,6 +4629,25 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         snapshot.app_id = Some(app_id.to_string());
         snapshot.is_maximized = is_maximized;
         snapshot
+    }
+
+    /// Last message `pick` accepts among those the evaluator published so far.
+    fn published<T>(
+        evaluator: &EmbeddedDecorationEvaluator,
+        pick: impl Fn(HostMessage) -> Option<T>,
+    ) -> Option<T> {
+        std::iter::from_fn(|| evaluator.host.pop())
+            .filter_map(pick)
+            .last()
+    }
+
+    fn published_key_bindings(
+        evaluator: &EmbeddedDecorationEvaluator,
+    ) -> Option<RuntimeKeyBindingConfigUpdate> {
+        published(evaluator, |message| match message {
+            HostMessage::KeyBindings(config) => Some(config),
+            _ => None,
+        })
     }
 
     fn real_config_evaluator() -> EmbeddedDecorationEvaluator {
@@ -5314,9 +4712,9 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             evaluator
                 .window_maximize_request(
                     &chrome,
-                    &crate::ssd::WindowMaximizeRequestEventSnapshot {
+                    &shojiwm_lib::ssd::WindowMaximizeRequestEventSnapshot {
                         maximized: true,
-                        source: crate::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
+                        source: shojiwm_lib::ssd::WindowStateRequestSourceSnapshot::ClientCsd,
                         timestamp: 150,
                     },
                     150,
@@ -5368,7 +4766,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
 
     fn activate_toggle_fixture(
         focused_at_activate: bool,
-        source: crate::ssd::WindowActivateRequestSourceSnapshot,
+        source: shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot,
     ) -> Vec<RuntimeWindowAction> {
         let evaluator = real_config_evaluator();
         let mut display_state = std::collections::BTreeMap::new();
@@ -5396,7 +4794,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         let invocation = evaluator
             .window_activate_request(
                 &at_activate,
-                &crate::ssd::WindowActivateRequestEventSnapshot {
+                &shojiwm_lib::ssd::WindowActivateRequestEventSnapshot {
                     source,
                     timestamp: 200,
                 },
@@ -5409,7 +4807,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     fn has_action(
         actions: &[RuntimeWindowAction],
         window_id: &str,
-        expected: crate::ssd::WaylandWindowAction,
+        expected: shojiwm_lib::ssd::WaylandWindowAction,
     ) -> bool {
         actions
             .iter()
@@ -5420,10 +4818,10 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     fn reactivating_focused_floating_window_requests_minimize() {
         let actions = activate_toggle_fixture(
             true,
-            crate::ssd::WindowActivateRequestSourceSnapshot::Api,
+            shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::Api,
         );
         assert!(
-            has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            has_action(&actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "dock activation of the focused floating window should minimize it: {actions:?}"
         );
     }
@@ -5461,8 +4859,8 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         let actions = evaluator
             .window_activate_request(
                 &opening_focused,
-                &crate::ssd::WindowActivateRequestEventSnapshot {
-                    source: crate::ssd::WindowActivateRequestSourceSnapshot::Api,
+                &shojiwm_lib::ssd::WindowActivateRequestEventSnapshot {
+                    source: shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::Api,
                     timestamp: 150,
                 },
                 150,
@@ -5471,7 +4869,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .actions;
 
         assert!(
-            !has_action(&actions, "0xb", crate::ssd::WaylandWindowAction::Minimize),
+            !has_action(&actions, "0xb", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "a dock focusing the window it just launched must not minimize it: {actions:?}"
         );
     }
@@ -5480,14 +4878,14 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     fn activating_unfocused_floating_window_focuses_it() {
         let actions = activate_toggle_fixture(
             false,
-            crate::ssd::WindowActivateRequestSourceSnapshot::Api,
+            shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::Api,
         );
         assert!(
-            !has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            !has_action(&actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "activating an unfocused window must not minimize it: {actions:?}"
         );
         assert!(
-            has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "activating an unfocused window should focus it: {actions:?}"
         );
     }
@@ -5515,15 +4913,15 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .evaluate_window(&focused, 100)
             .expect("evaluation should succeed");
 
-        let event = crate::ssd::WindowActivateRequestEventSnapshot {
-            source: crate::ssd::WindowActivateRequestSourceSnapshot::Api,
+        let event = shojiwm_lib::ssd::WindowActivateRequestEventSnapshot {
+            source: shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::Api,
             timestamp: 200,
         };
         let first = evaluator
             .window_activate_request(&focused, &event, 200)
             .expect("first activate should evaluate");
         assert!(
-            has_action(&first.actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            has_action(&first.actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "first activation should toggle the focused window into minimize: {:?}",
             first.actions
         );
@@ -5534,9 +4932,9 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         evaluator
             .window_minimize_request(
                 &focused,
-                &crate::ssd::WindowMinimizeRequestEventSnapshot {
+                &shojiwm_lib::ssd::WindowMinimizeRequestEventSnapshot {
                     minimized: true,
-                    source: crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    source: shojiwm_lib::ssd::WindowStateRequestSourceSnapshot::Api,
                     timestamp: 250,
                 },
                 250,
@@ -5549,12 +4947,12 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .window_activate_request(&focused, &event, 300)
             .expect("second activate should evaluate");
         assert!(
-            !has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            !has_action(&second.actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "re-activating the minimized window must not re-minimize it: {:?}",
             second.actions
         );
         assert!(
-            has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&second.actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "re-activating the minimized window should restore and focus it: {:?}",
             second.actions
         );
@@ -5591,9 +4989,9 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         evaluator
             .window_minimize_request(
                 &focused,
-                &crate::ssd::WindowMinimizeRequestEventSnapshot {
+                &shojiwm_lib::ssd::WindowMinimizeRequestEventSnapshot {
                     minimized: true,
-                    source: crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                    source: shojiwm_lib::ssd::WindowStateRequestSourceSnapshot::Api,
                     timestamp: 200,
                 },
                 200,
@@ -5605,9 +5003,9 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             evaluator
                 .window_minimize_request(
                     &focused,
-                    &crate::ssd::WindowMinimizeRequestEventSnapshot {
+                    &shojiwm_lib::ssd::WindowMinimizeRequestEventSnapshot {
                         minimized: false,
-                        source: crate::ssd::WindowStateRequestSourceSnapshot::Api,
+                        source: shojiwm_lib::ssd::WindowStateRequestSourceSnapshot::Api,
                         timestamp,
                     },
                     timestamp,
@@ -5617,8 +5015,8 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         let activate = evaluator
             .window_activate_request(
                 &focused,
-                &crate::ssd::WindowActivateRequestEventSnapshot {
-                    source: crate::ssd::WindowActivateRequestSourceSnapshot::Api,
+                &shojiwm_lib::ssd::WindowActivateRequestEventSnapshot {
+                    source: shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::Api,
                     timestamp: 302,
                 },
                 302,
@@ -5629,7 +5027,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             !has_action(
                 &activate.actions,
                 "0xa",
-                crate::ssd::WaylandWindowAction::Minimize
+                shojiwm_lib::ssd::WaylandWindowAction::Minimize
             ),
             "a restore+activate taskbar click must not re-minimize the window: {:?}",
             activate.actions
@@ -5638,7 +5036,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             has_action(
                 &activate.actions,
                 "0xa",
-                crate::ssd::WaylandWindowAction::Focus
+                shojiwm_lib::ssd::WaylandWindowAction::Focus
             ),
             "the restored window should be focused: {:?}",
             activate.actions
@@ -5654,7 +5052,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// then press right: the old behavior jumped straight to the neighbor.
     #[test]
     fn focus_key_pans_overflowing_tile_into_view_before_advancing() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             WindowResizeEdgesSnapshot, WindowResizeEventSnapshot, WindowResizePhaseSnapshot,
             WindowResizePointSnapshot, WindowResizeSourceSnapshot,
         };
@@ -5704,7 +5102,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         // Interactively resize the middle tile wider than the 1920px viewport.
         // `resizeTile` right-aligns the tile afterwards, so it overflows the
         // viewport on the left.
-        let rect = |width: f64| crate::ssd::window_model::WindowPositionSnapshot {
+        let rect = |width: f64| shojiwm_lib::ssd::window_model::WindowPositionSnapshot {
             x: 0.0,
             y: 0.0,
             width,
@@ -5754,12 +5152,12 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             "tile-focus-right-quick should be a known binding"
         );
         assert!(
-            !has_action(&first.actions, "0xc", crate::ssd::WaylandWindowAction::Focus),
+            !has_action(&first.actions, "0xc", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "an overflowing tile must be panned into view, not skipped: {:?}",
             first.actions
         );
         assert!(
-            has_action(&first.actions, "0xb", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&first.actions, "0xb", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "the overflowing tile should keep focus while panning: {:?}",
             first.actions
         );
@@ -5770,7 +5168,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-right-quick", now + 100)
             .expect("second focus-right should evaluate");
         assert!(
-            has_action(&second.actions, "0xc", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&second.actions, "0xc", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "a fully-visible tile should advance focus to the neighbor: {:?}",
             second.actions
         );
@@ -5820,7 +5218,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-left-quick", now)
             .expect("first focus-left should evaluate");
         assert!(
-            has_action(&first.actions, "0xb", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&first.actions, "0xb", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "a fully-visible maximized tile must advance on the first press: {:?}",
             first.actions
         );
@@ -5829,7 +5227,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             .invoke_key_binding("tile-focus-left-quick", now + 100)
             .expect("second focus-left should evaluate");
         assert!(
-            has_action(&second.actions, "0xa", crate::ssd::WaylandWindowAction::Focus),
+            has_action(&second.actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Focus),
             "every subsequent press must advance one tile as well: {:?}",
             second.actions
         );
@@ -5843,7 +5241,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// straight through.
     #[test]
     fn workspace_scroll_gesture_snaps_to_tile_edges_at_low_speed() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6036,7 +5434,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// ms and the timer landed them anywhere between two frames.
     #[test]
     fn workspace_kinetic_scroll_steps_once_per_fractional_frame_tick() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6145,7 +5543,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// the screen center.
     #[test]
     fn workspace_kinetic_scroll_snaps_center_window_flush_to_leaning_left_edge() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6251,7 +5649,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// leaning-edge position is exactly where the scroll already rests.
     #[test]
     fn workspace_kinetic_scroll_never_yanks_fully_visible_tile_for_maximized_neighbor() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6357,7 +5755,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// the snap threshold.
     #[test]
     fn workspace_kinetic_scroll_settles_maximized_tile_at_center() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6478,7 +5876,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     /// screen edge on the side it leans toward — here the right edge.
     #[test]
     fn workspace_kinetic_scroll_snaps_center_window_flush_to_leaning_right_edge() {
-        use crate::ssd::window_model::{
+        use shojiwm_lib::ssd::window_model::{
             GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot,
         };
 
@@ -6583,10 +5981,10 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
     fn xdg_activation_of_focused_window_does_not_minimize() {
         let actions = activate_toggle_fixture(
             true,
-            crate::ssd::WindowActivateRequestSourceSnapshot::XdgActivation,
+            shojiwm_lib::ssd::WindowActivateRequestSourceSnapshot::XdgActivation,
         );
         assert!(
-            !has_action(&actions, "0xa", crate::ssd::WaylandWindowAction::Minimize),
+            !has_action(&actions, "0xa", shojiwm_lib::ssd::WaylandWindowAction::Minimize),
             "xdg-activation must never trigger the minimize toggle: {actions:?}"
         );
     }
@@ -6662,11 +6060,11 @@ COMPOSITOR.key.bind("first", "Super+T", () => {{}});
             &config_path,
         )
         .with_working_dir(&repository_root);
-        let invocation = evaluator
+        evaluator
             .lifecycle_enable("initial", None)
             .expect("initial lifecycle enable should succeed");
         assert_eq!(
-            binding_ids(&invocation.key_binding_config),
+            binding_ids(&published_key_bindings(&evaluator)),
             vec!["first".to_string()],
         );
 
@@ -6675,11 +6073,11 @@ COMPOSITOR.key.bind("first", "Super+T", () => {{}});
             .lifecycle_disable("reload")
             .expect("lifecycle disable should succeed");
         let reloaded = evaluator.fresh_like();
-        let invocation = reloaded
+        reloaded
             .lifecycle_enable("reload", Some(&persisted))
             .expect("reload lifecycle enable should succeed");
         assert_eq!(
-            binding_ids(&invocation.key_binding_config),
+            binding_ids(&published_key_bindings(&reloaded)),
             vec!["first".to_string(), "second".to_string()],
             "hot reload should pick up key bindings added in imported submodules"
         );
@@ -6733,11 +6131,11 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             &config_path,
         )
         .with_working_dir(&repository_root);
-        let invocation = evaluator
+        evaluator
             .lifecycle_enable("initial", None)
             .expect("initial lifecycle enable should succeed");
         assert_eq!(
-            binding_ids(&invocation.key_binding_config),
+            binding_ids(&published_key_bindings(&evaluator)),
             vec!["first".to_string()],
             "initial lifecycle should deliver the initial key bindings"
         );
@@ -6747,11 +6145,11 @@ COMPOSITOR.window.composition = () => <Label text="x" />;
             .lifecycle_disable("reload")
             .expect("lifecycle disable should succeed");
         let reloaded = evaluator.fresh_like();
-        let invocation = reloaded
+        reloaded
             .lifecycle_enable("reload", Some(&persisted))
             .expect("reload lifecycle enable should succeed");
         assert_eq!(
-            binding_ids(&invocation.key_binding_config),
+            binding_ids(&published_key_bindings(&reloaded)),
             vec!["first".to_string(), "second".to_string()],
             "hot reload should deliver the updated key binding set"
         );
@@ -7105,7 +6503,7 @@ COMPOSITOR.window.composition = (window) => {
         assert!(!cached.node_patches.is_empty());
         assert!(cached.node_patches.iter().any(|patch| matches!(
             patch,
-            NativeCompositionPatch::ShaderUniform {
+            shojiwm_lib::runtime_api::CompositionPatch::ShaderUniform {
                 name,
                 stage_index: 0,
                 ..
@@ -7113,9 +6511,9 @@ COMPOSITOR.window.composition = (window) => {
         )));
         assert!(cached.node_patches.iter().any(|patch| matches!(
             patch,
-            NativeCompositionPatch::ShaderUniform {
+            shojiwm_lib::runtime_api::CompositionPatch::ShaderUniform {
                 name,
-                value: super::super::ShaderUniformValue::Vec2Array(values),
+                value: shojiwm_lib::ssd::ShaderUniformValue::Vec2Array(values),
                 ..
             } if name == "control_points"
                 && values.len() == 2
@@ -7238,7 +6636,7 @@ COMPOSITOR.effect.window = (window) => ({
             });
         assert!(matches!(
             phase,
-            Some(super::super::ShaderUniformValue::FloatArray(values))
+            Some(shojiwm_lib::ssd::ShaderUniformValue::FloatArray(values))
                 if values.len() == 2 && values[0] > 0.0 && values[1] == 0.5
         ));
 
@@ -7559,7 +6957,7 @@ COMPOSITOR.window.composition = () => <Box />;
     }
 
     fn test_output_snapshot(name: &str) -> WaylandOutputSnapshot {
-        use crate::ssd::window_model::{OutputModeSnapshot, OutputPositionSnapshot};
+        use shojiwm_lib::ssd::window_model::{OutputModeSnapshot, OutputPositionSnapshot};
         WaylandOutputSnapshot {
             name: name.to_owned(),
             description: None,
@@ -7635,7 +7033,7 @@ COMPOSITOR.window.composition = () => <Box />;
     // wipe the cached outputs instead of reusing them.
     #[test]
     fn elided_interaction_state_keeps_the_runtime_outputs_cached() {
-        use crate::ssd::{
+        use shojiwm_lib::ssd::{
             PointerHitTargetSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
             PointerMovePointSnapshot,
         };
@@ -7767,7 +7165,7 @@ COMPOSITOR.event.onPointerMove(() => {{}});
     // worker armed, which is the case the keyboard-only reload burst never hits.
     #[test]
     fn embedded_runtime_reload_reuses_the_pointer_move_worker() {
-        use crate::ssd::{
+        use shojiwm_lib::ssd::{
             PointerHitTargetSnapshot, PointerModifierStateSnapshot, PointerMoveEventSnapshot,
             PointerMovePointSnapshot,
         };
@@ -7895,10 +7293,10 @@ COMPOSITOR.event.onPointerMoveAsync(() => {});
     fn decoration_policy_request_uses_runtime_wire_names() {
         let window = make_window(false);
         let context = WindowDecorationPolicyContextSnapshot {
-            protocol: crate::ssd::WindowDecorationProtocolSnapshot::XdgDecorationV1,
+            protocol: shojiwm_lib::ssd::WindowDecorationProtocolSnapshot::XdgDecorationV1,
             client_preference: Some(WindowDecorationModeSnapshot::Client),
             can_negotiate: true,
-            reason: crate::ssd::WindowDecorationPolicyReasonSnapshot::ClientRequest,
+            reason: shojiwm_lib::ssd::WindowDecorationPolicyReasonSnapshot::ClientRequest,
         };
         let display_state = std::collections::BTreeMap::new();
         let input_state = std::collections::BTreeMap::new();
@@ -8005,8 +7403,8 @@ COMPOSITOR.event.onPointerMoveAsync(() => {});
     // which is what a settings UI reads.
     #[test]
     fn runtime_keeps_subpixel_through_output_state_and_config() {
-        use crate::config::RuntimeOutputSubpixel;
-        use crate::ssd::OutputSubpixelSnapshot;
+        use shojiwm_lib::config::RuntimeOutputSubpixel;
+        use shojiwm_lib::ssd::OutputSubpixelSnapshot;
 
         let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -8052,15 +7450,17 @@ COMPOSITOR.output.configure(() => ({{
             ("TEST-1".to_string(), first),
             ("TEST-2".to_string(), test_output_snapshot("TEST-2")),
         ]));
-        let invocation = evaluator
+        evaluator
             .lifecycle_enable("initial", None)
             .expect("embedded runtime should enable the config");
 
-        let mut outputs = invocation
-            .display_config
-            .expect("the output factory should produce a display config")
+        let mut outputs = published(&evaluator, |message| match message {
+            HostMessage::Display(config) => Some(config),
+            _ => None,
+        })
+        .expect("the output factory should produce a display config")
             .outputs;
-        let subpixel_of = |config: Option<Option<crate::config::RuntimeOutputConfig>>| {
+        let subpixel_of = |config: Option<Option<shojiwm_lib::config::RuntimeOutputConfig>>| {
             config.flatten().expect("output should be configured").subpixel
         };
         assert_eq!(

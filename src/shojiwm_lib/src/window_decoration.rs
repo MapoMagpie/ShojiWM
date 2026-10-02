@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::{
     ssd::{
-        DecorationEvaluator, WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
+        WindowDecorationModeSnapshot, WindowDecorationPolicyContextSnapshot,
         WindowDecorationPolicyReasonSnapshot, WindowDecorationProtocolSnapshot,
         WindowDecorationStateSnapshot,
     },
@@ -281,7 +281,7 @@ impl ShojiWM {
         };
         let snapshot = self.snapshot_window(window);
         let decision = match self
-            .decoration_evaluator
+            .config_runtime
             .window_decoration_policy(&snapshot, &context)
         {
             Ok(decision) => decision,

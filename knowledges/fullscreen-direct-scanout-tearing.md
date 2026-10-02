@@ -6,9 +6,9 @@
 
 関連ファイル:
 
-- Rust: `src/shojiwm/src/backend/tty.rs`（描画スケジューラ／scanout／tearing 判定）
-- Rust: `src/shojiwm/src/protocols/tearing_control.rs`（`wp_tearing_control_v1`）
-- Rust: `src/shojiwm/src/ssd/window_model.rs`（`ManagedWindowState`、`allow_tearing`）
+- Rust: `src/shojiwm_lib/src/backend/tty.rs`（描画スケジューラ／scanout／tearing 判定）
+- Rust: `src/shojiwm_lib/src/protocols/tearing_control.rs`（`wp_tearing_control_v1`）
+- Rust: `src/shojiwm_lib/src/ssd/window_model.rs`（`ManagedWindowState`、`allow_tearing`）
 - TS: `packages/shoji_wm/src/types.ts` / `reconcile.ts`、`packages/config/src/index.tsx`
 - Smithay 側パッチ: 別リポジトリ `smithay-tearing`（`backend/drm` の async flip サポート）
 

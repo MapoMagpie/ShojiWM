@@ -1,0 +1,208 @@
+//! Compositor → runtime messages.
+//!
+//! [`RuntimeRequest`] needs an answer within the current compositor turn (a
+//! decoration tree, a decision, the dirty set of a frame), so it is sent with
+//! `ConfigRuntime::request` and borrows its snapshots. [`RuntimeEvent`] is
+//! fire-and-forget and owned, so a runtime living on another thread can queue
+//! it as is.
+//!
+//! Messages are plain Rust values, never serialized on the way in: a Rust
+//! runtime matches on them directly, and a foreign runtime converts them into
+//! whatever its own fast path wants.
+
+use std::collections::BTreeMap;
+
+use crate::{
+    keyboard_layout::KeyboardLayoutSnapshot,
+    runtime_input::RuntimeInputDeviceSnapshot,
+    runtime_workspace::RuntimeWorkspaceActivateRequestSnapshot,
+    ssd::{
+        BackgroundEffectConfig, DecorationNode, ShaderUniformValue, DecorationCachedEvaluationResult, DecorationEvaluationResult,
+        DecorationHandlerInvocation, DecorationKeyBindingInvocation,
+        DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick,
+        DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
+        DecorationWindowStateRequestInvocation, GestureSwipeEventSnapshot,
+        LayerEffectEvaluationResult, PointerMoveEventSnapshot, PopupEffectEvaluationResult,
+        WaylandLayerSnapshot, WaylandOutputSnapshot, WaylandPopupSnapshot, WaylandWindowSnapshot,
+        WindowActivateRequestEventSnapshot, WindowDecorationDecisionSnapshot,
+        WindowDecorationPolicyContextSnapshot, WindowFullscreenRequestEventSnapshot,
+        WindowMaximizeRequestEventSnapshot, WindowMinimizeRequestEventSnapshot,
+        WindowMoveEventSnapshot, WindowResizeEventSnapshot,
+    },
+};
+
+/// A request that must be answered before the compositor continues.
+#[derive(Debug, Clone, Copy)]
+pub enum RuntimeRequest<'a> {
+    Decoration(DecorationRequest<'a>),
+    /// Advance timers and animations; answered with the frame's dirty set.
+    SchedulerTick,
+    Window(WindowRequest<'a>),
+    Input(InputRequest<'a>),
+    Effect(EffectRequest<'a>),
+    Workspace(WorkspaceRequest<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DecorationRequest<'a> {
+    /// Build the full decoration tree of a window.
+    Evaluate {
+        window: &'a WaylandWindowSnapshot,
+        /// Evaluate without committing runtime state (initial size probing).
+        preview: bool,
+    },
+    /// Re-evaluate a window the runtime already knows, reusing its cache.
+    /// `window` is `None` for closing windows, whose snapshot is frozen.
+    EvaluateCached {
+        window_id: &'a str,
+        window: Option<&'a WaylandWindowSnapshot>,
+        force_full: bool,
+    },
+    /// Server-side or client-side decorations for this window.
+    Policy {
+        window: &'a WaylandWindowSnapshot,
+        context: &'a WindowDecorationPolicyContextSnapshot,
+    },
+    /// A decoration node handler (button click, state change) fired.
+    InvokeHandler {
+        window_id: &'a str,
+        handler_id: &'a str,
+    },
+    /// The window starts closing; the runtime may run a close animation.
+    StartClose { window_id: &'a str },
+    /// The window is gone; drop its state.
+    Closed { window_id: &'a str },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WindowRequest<'a> {
+    Resize {
+        window_id: &'a str,
+        event: &'a WindowResizeEventSnapshot,
+    },
+    Move {
+        window_id: &'a str,
+        event: &'a WindowMoveEventSnapshot,
+    },
+    Maximize {
+        window: &'a WaylandWindowSnapshot,
+        event: &'a WindowMaximizeRequestEventSnapshot,
+    },
+    Minimize {
+        window: &'a WaylandWindowSnapshot,
+        event: &'a WindowMinimizeRequestEventSnapshot,
+    },
+    Fullscreen {
+        window: &'a WaylandWindowSnapshot,
+        event: &'a WindowFullscreenRequestEventSnapshot,
+    },
+    Activate {
+        window: &'a WaylandWindowSnapshot,
+        event: &'a WindowActivateRequestEventSnapshot,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum InputRequest<'a> {
+    KeyBinding { binding_id: &'a str },
+    PointerMove(&'a PointerMoveEventSnapshot),
+    GestureSwipe(&'a GestureSwipeEventSnapshot),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EffectRequest<'a> {
+    /// The output background effect; asked once after (re)loading.
+    Background,
+    Layers {
+        output_name: &'a str,
+        layers: &'a [WaylandLayerSnapshot],
+    },
+    Popups {
+        output_name: &'a str,
+        popups: &'a [WaylandPopupSnapshot],
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WorkspaceRequest<'a> {
+    Activate(&'a RuntimeWorkspaceActivateRequestSnapshot),
+}
+
+/// The direct answer to a [`RuntimeRequest`]. Side effects that are not part
+/// of the answer go through `RuntimeHost` instead.
+#[derive(Debug, Clone)]
+pub enum RuntimeReply {
+    Evaluation(Box<DecorationEvaluationResult>),
+    CachedEvaluation(Box<DecorationCachedEvaluationResult>),
+    DecorationPolicy(WindowDecorationDecisionSnapshot),
+    SchedulerTick(DecorationSchedulerTick),
+    Handler(Box<DecorationHandlerInvocation>),
+    KeyBinding(DecorationKeyBindingInvocation),
+    WindowResize(DecorationWindowResizeInvocation),
+    WindowMove(DecorationWindowMoveInvocation),
+    WindowStateRequest(DecorationWindowStateRequestInvocation),
+    PointerHook(DecorationPointerMoveAsyncInvocation),
+    BackgroundEffect(Option<BackgroundEffectConfig>),
+    LayerEffects(LayerEffectEvaluationResult),
+    PopupEffects(PopupEffectEvaluationResult),
+    /// Handled, nothing to report.
+    Done,
+    /// The runtime does not implement this request; the compositor falls back
+    /// to its built-in behavior.
+    Unhandled,
+}
+
+/// A notification that needs no answer.
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    /// Connected outputs changed (mode, scale, position, hotplug).
+    DisplayState(BTreeMap<String, WaylandOutputSnapshot>),
+    /// Input devices changed.
+    InputState(BTreeMap<String, RuntimeInputDeviceSnapshot>),
+    KeyboardLayout(KeyboardLayoutSnapshot),
+    /// Pointer hook the config asked to receive asynchronously. A result, if
+    /// any, comes back as `HostMessage::PointerHookResult`.
+    PointerMove(PointerMoveEventSnapshot),
+    /// Asynchronous gesture hook, same delivery as [`Self::PointerMove`].
+    GestureSwipe(GestureSwipeEventSnapshot),
+}
+
+/// One change to a decoration tree the compositor already holds, returned by
+/// a cached evaluation instead of a whole new tree.
+// boxing left as a follow-up (touches all construction/match sites)
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum CompositionPatch {
+    /// A structural or otherwise generic node change. This remains the
+    /// compatibility fallback and performs one serde_v8 conversion.
+    ReplaceNode {
+        node_id: String,
+        node: DecorationNode,
+    },
+    /// The steady animation fast path. Mutate one uniform in the compositor's
+    /// persistent tree without decoding or rebuilding the shader pipeline.
+    ShaderUniform {
+        node_id: String,
+        stage_index: usize,
+        name: String,
+        value: ShaderUniformValue,
+    },
+}
+
+pub const SHADER_INPUT_STAGE_INDEX: usize = u32::MAX as usize;
+
+impl CompositionPatch {
+    pub fn node_id(&self) -> &str {
+        match self {
+            Self::ReplaceNode { node_id, .. } | Self::ShaderUniform { node_id, .. } => node_id,
+        }
+    }
+
+    pub fn replacement_node(&self) -> Option<&DecorationNode> {
+        match self {
+            Self::ReplaceNode { node, .. } => Some(node),
+            Self::ShaderUniform { .. } => None,
+        }
+    }
+}
+

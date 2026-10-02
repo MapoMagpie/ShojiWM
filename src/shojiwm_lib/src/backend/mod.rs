@@ -54,10 +54,13 @@ pub enum ShojiWMBackend {
 }
 
 impl ShojiWMBackend {
-    pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn run(
+        &self,
+        runtime: crate::runtime_api::RuntimeBoot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            ShojiWMBackend::WInit => run_winit(),
-            ShojiWMBackend::TTY => run_tty_udev(),
+            ShojiWMBackend::WInit => run_winit(runtime),
+            ShojiWMBackend::TTY => run_tty_udev(runtime),
         }
     }
 }
@@ -67,10 +70,10 @@ fn tty_maintenance_debug_enabled() -> bool {
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 
-fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
+fn run_winit(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
-    let mut state = ShojiWM::new(&mut event_loop, display);
+    let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
     publish_activation_environment("winit-wayland-display-pre-init");
 
     info!("initializing winit backend");
@@ -88,10 +91,10 @@ fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn run_tty_udev() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tty_udev(runtime: crate::runtime_api::RuntimeBoot) -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<ShojiWM> = EventLoop::try_new()?;
     let display: Display<ShojiWM> = Display::new()?;
-    let mut state = ShojiWM::new(&mut event_loop, display);
+    let mut state = ShojiWM::new(&mut event_loop, display, &runtime);
     crate::process_env::set_var("WAYLAND_DISPLAY", &state.socket_name);
     publish_activation_environment("tty-wayland-display");
     state.start_xwayland(&event_loop);
