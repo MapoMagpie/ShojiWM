@@ -16,7 +16,7 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     desktop::{WindowSurface, layer_map_for_output},
-    output::{Mode, Output, PhysicalProperties, Subpixel},
+    output::{Mode, Output, OutputModeSource, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
     reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
     reexports::wayland_server::Resource,
@@ -53,6 +53,74 @@ fn animation_spike_threshold_ms() -> f64 {
         .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| *value > 0.0)
         .unwrap_or(12.0)
+}
+
+/// The winit backend draws into a GL window surface, whose origin is the
+/// bottom-left corner, so every frame needs a vertical flip on top of the
+/// output's own transform. Smithay's examples put this flip on the output
+/// itself, but here the output transform belongs to the user's display config
+/// (which is declarative: an omitted transform resets it to `Normal`), so the
+/// flip is applied only to the damage trackers that render the window.
+pub(crate) const WINIT_FRAMEBUFFER_FLIP: Transform = Transform::Flipped180;
+
+pub(crate) const ALL_TRANSFORMS: [Transform; 8] = [
+    Transform::Normal,
+    Transform::_90,
+    Transform::_180,
+    Transform::_270,
+    Transform::Flipped,
+    Transform::Flipped90,
+    Transform::Flipped180,
+    Transform::Flipped270,
+];
+
+/// The transform equivalent to applying `first` and then `then`.
+///
+/// `Transform`'s `Add` adds angles and xors the flip, which is only right when
+/// at most one side flips; rotation and reflection do not commute, so derive
+/// the composition from where both map the corners of a square.
+pub(crate) fn compose_transforms(first: Transform, then: Transform) -> Transform {
+    let area = smithay::utils::Size::<i32, Logical>::from((4, 4));
+    let probes = [(0, 0), (1, 0), (0, 1)].map(Point::<i32, Logical>::from);
+    ALL_TRANSFORMS
+        .into_iter()
+        .find(|candidate| {
+            probes.iter().all(|&point| {
+                candidate.transform_point_in(point, &area)
+                    == then.transform_point_in(first.transform_point_in(point, &area), &area)
+            })
+        })
+        .unwrap_or(first)
+}
+
+/// Transform to render a winit frame with so the window shows what a tty
+/// scanout of `output_transform` would. The renderer maps element positions
+/// through the transform the other way round from `transform_point_in`, so the
+/// flip goes first; `transform_probe_tests` pins this against the tty
+/// presentation for all eight transforms.
+pub(crate) fn winit_render_transform(output_transform: Transform) -> Transform {
+    compose_transforms(WINIT_FRAMEBUFFER_FLIP, output_transform)
+}
+
+/// What a winit damage tracker should render with: the output's mode, scale
+/// and transform, plus the framebuffer flip.
+fn winit_render_mode(output: &Output) -> Option<OutputModeSource> {
+    let mode = output.current_mode()?;
+    Some(OutputModeSource::Static {
+        size: mode.size,
+        scale: output.current_scale().fractional_scale().into(),
+        transform: winit_render_transform(output.current_transform()),
+    })
+}
+
+/// Rebuild `tracker` when the output's mode, scale or transform changed since
+/// it was made. A rebuilt tracker starts with full damage, as it must.
+fn sync_winit_damage_tracker(tracker: &mut OutputDamageTracker, output: &Output) {
+    if let Some(mode) = winit_render_mode(output)
+        && *tracker.mode() != mode
+    {
+        *tracker = OutputDamageTracker::from_mode_source(mode);
+    }
 }
 
 fn clipped_transform_debug_enabled() -> bool {
@@ -876,7 +944,7 @@ pub fn init_winit(
     );
     output.change_current_state(
         Some(mode),
-        Some(Transform::Flipped180),
+        Some(Transform::Normal),
         None,
         Some((0, 0).into()),
     );
@@ -886,8 +954,10 @@ pub fn init_winit(
 
     state.space.map_output(&output, (0, 0));
 
-    let mut damage_tracker = OutputDamageTracker::from_output(&output);
-    let mut blink_damage_tracker = OutputDamageTracker::from_output(&output);
+    let initial_render_mode =
+        winit_render_mode(&output).expect("winit output has a mode right after creation");
+    let mut damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode.clone());
+    let mut blink_damage_tracker = OutputDamageTracker::from_mode_source(initial_render_mode);
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| {
@@ -906,6 +976,8 @@ pub fn init_winit(
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Redraw => {
                     timescope::scope!("winit redraw");
+                    sync_winit_damage_tracker(&mut damage_tracker, &output);
+                    sync_winit_damage_tracker(&mut blink_damage_tracker, &output);
                     let redraw_started_at = Instant::now();
                     let spike_threshold_ms = animation_spike_threshold_ms();
                     let decorations_refresh_started_at = Instant::now();
@@ -5256,4 +5328,25 @@ fn closing_snapshot_elements(
             elements
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn framebuffer_flip_composes_with_the_configured_transform() {
+        // The common case: no user transform, only the GL flip.
+        assert_eq!(winit_render_transform(Transform::Normal), Transform::Flipped180);
+        // Flipping twice cancels out.
+        assert_eq!(winit_render_transform(Transform::Flipped180), Transform::Normal);
+        for transform in ALL_TRANSFORMS {
+            assert_eq!(compose_transforms(transform, Transform::Normal), transform);
+            assert_eq!(compose_transforms(Transform::Normal, transform), transform);
+            // Composing with the flip is a bijection, so every configured
+            // transform renders differently.
+            let flipped = winit_render_transform(transform);
+            assert_eq!(compose_transforms(WINIT_FRAMEBUFFER_FLIP, flipped), transform);
+        }
+    }
 }

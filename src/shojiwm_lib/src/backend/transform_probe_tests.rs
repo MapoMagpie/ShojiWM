@@ -384,3 +384,30 @@ fn backdrop_capture_unrotate_restores_element_orientation() {
         );
     }
 }
+
+/// The winit window shows its GL framebuffer bottom row first, so what the
+/// nested session displays is the readback with its rows reversed. Rendering
+/// with `winit_render_transform` must therefore show exactly what a tty
+/// scanout of the same transform shows.
+#[test]
+fn winit_framebuffer_flip_matches_tty_presentation_for_every_transform() {
+    use super::winit::{ALL_TRANSFORMS, winit_render_transform};
+
+    let flip_rows = |rect: Rectangle<i32, smithay::utils::Buffer>| {
+        Rectangle::new(
+            (rect.loc.x, OUT_H - rect.loc.y - rect.size.h).into(),
+            rect.size,
+        )
+    };
+    for transform in ALL_TRANSFORMS {
+        let Some((tty_red, tty_blue)) = texture_bounds_for_transform(transform) else {
+            eprintln!("skipping: no render node available");
+            return;
+        };
+        let (nested_red, nested_blue) =
+            texture_bounds_for_transform(winit_render_transform(transform))
+                .expect("render node vanished mid-test");
+        assert_eq!(flip_rows(nested_red), tty_red, "{transform:?}: red quadrant");
+        assert_eq!(flip_rows(nested_blue), tty_blue, "{transform:?}: blue body");
+    }
+}
