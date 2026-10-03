@@ -26,6 +26,8 @@ Every component accepts these (from `ComponentProps`):
 | `id` | `string` | Stable node id for targeted invalidation |
 | `onHoverChange` | `(hovered: boolean) => void` | Pointer enter/leave |
 | `onActiveChange` | `(active: boolean) => void` | Press/release |
+| `paint` | `PaintShaderHandle` | Replaces the built-in background/border — see [Paint shaders](./paint.md) |
+| `overlay` | `PaintShaderHandle` | Painted above the children — see [Paint shaders](./paint.md) |
 
 All `style` values (and most props) accept either a plain value or a signal, so
 they update reactively.
@@ -192,6 +194,14 @@ logical pixels unless noted.
 
 Borders: `border`, `borderTop`, `borderRight`, `borderBottom`, `borderLeft` —
 each a `{px, color}` value — plus `borderFit` (`"normal" | "fit-children"`).
+A side value overrides `border` for that side, both in width (the content box
+moves accordingly) and color. Any non-zero width covers at least one physical
+pixel.
+
+Shadows: `boxShadow` — one `{x, y, blur, spread, color, inset}` value or an
+array of them, CSS semantics. See [Paint shaders](./paint.md#shadows-boxshadow).
+
+Colors are `#RGB`, `#RGBA`, `#RRGGBB` or `#RRGGBBAA`.
 
 ### Text (for `<Label/>`)
 

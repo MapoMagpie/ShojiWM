@@ -198,8 +198,8 @@ For `dualKawaseBlur`, `radius` defaults to `8` and controls the sampling offset;
 handles bound by name).
 
 Uniform values may be numbers or 2/3/4-component arrays, and each component may
-be a signal. `tex`, `effect_texture_size_px`, `effect_content_rect_px`, and
-`effect_frame_rect_px` are reserved compositor bindings and cannot be used as custom uniform or texture
+be a signal. `tex`, `effect_texture_size_phy_px`, `effect_content_rect_phy_px`, and
+`effect_frame_rect_phy_px` (and their former `_px` spellings) are reserved compositor bindings and cannot be used as custom uniform or texture
 names.
 
 ```ts
@@ -429,10 +429,16 @@ The relevant contract is equivalent to:
 
 ```glsl
 struct EffectContext {
-    vec2 texture_uv;       // normalized coordinates over the full working texture
-    vec2 texture_size_px;  // full working-texture size in physical pixels
-    vec4 content_rect_px;  // visible content: x, y, width, height in that texture
-    vec4 frame_rect_px;    // the window the effect belongs to, in that texture
+    vec2 texture_uv;           // normalized coordinates over the full working texture
+    vec2 texture_size_phy_px;  // full working-texture size in physical pixels
+    vec4 content_rect_phy_px;  // visible content: x, y, width, height in that texture
+    vec4 frame_rect_phy_px;    // the window the effect belongs to, in that texture
+    vec4 frame_radius_phy_px;  // its corner radii: top-left, top-right, bottom-right, bottom-left
+    vec4 frame_border_phy_px;  // its border widths: top, right, bottom, left
+    vec4 clip_rect_phy_px;     // the clip ShojiWM applies to the effect, in that texture
+    vec4 clip_radius_phy_px;
+    bool has_clip;
+    float scale;               // physical pixels per logical pixel
 };
 ```
 
@@ -441,21 +447,59 @@ That gives you these built-ins for free inside `shader_main`:
 | Name | Type | Meaning |
 | --- | --- | --- |
 | `effect.texture_uv` | `vec2` | Normalized coordinates over the complete texture, including capture padding |
-| `effect.texture_size_px` | `vec2` | Complete working-texture size in physical pixels |
-| `effect.content_rect_px` | `vec4` | Visible content rectangle as `(x, y, width, height)` inside the texture |
-| `effect.frame_rect_px` | `vec4` | For window effects, the window's own rectangle (without `outsets`) inside the texture, even when the texture covers something else (`replaceSubsurfaces`). Otherwise the content rectangle |
+| `effect.texture_size_phy_px` | `vec2` | Complete working-texture size in physical pixels |
+| `effect.content_rect_phy_px` | `vec4` | Visible content rectangle as `(x, y, width, height)` inside the texture |
+| `effect.frame_rect_phy_px` | `vec4` | For window effects, the window's own rectangle (without `outsets`) inside the texture, even when the texture covers something else (`replaceSubsurfaces`). Otherwise the content rectangle |
+| `effect.frame_radius_phy_px` | `vec4` | Corner radii of the frame (top-left, top-right, bottom-right, bottom-left) |
+| `effect.frame_border_phy_px` | `vec4` | Border widths of the frame (top, right, bottom, left) |
+| `effect.clip_rect_phy_px` | `vec4` | The rounded clip ShojiWM applies to the effect, `(x, y, width, height)` inside the texture; only valid when `has_clip` |
+| `effect.clip_radius_phy_px` | `vec4` | Corner radii of that clip |
+| `effect.has_clip` | `bool` | Whether the effect is clipped (e.g. by a window's rounded corners) |
+| `effect.scale` | `float` | Physical pixels per logical pixel; multiply logical lengths by it to look the same at every scale |
 | `tex` | `sampler2D` | This stage's pipeline input; sample it with `texture2D(tex, effect.texture_uv)` |
 
-All `*_px` values are physical pixels. ShojiWM also provides:
+What the frame is depends on where the effect runs:
+
+| Placement | Frame (rect, radius, border) | Clip |
+| --- | --- | --- |
+| `<ShaderEffect/>` | The component itself (`borderRadius`, borders) | Rounded ancestors, e.g. the window's corners |
+| Window slots | The window (the `<WindowBorder>`, or the root); for `windowSource({include: 'root-surface'})` the client area inside the border | — |
+| Layer, popup, background | The covered area; radius and border are 0 (the client draws its own shape) | — |
+
+All `*_phy_px` values are physical pixels (logical pixels times the output
+scale). ShojiWM also provides:
 
 | Helper | Result |
 | --- | --- |
-| `effect_texture_px(effect)` | Current fragment position in the complete working texture |
-| `effect_content_px(effect)` | Current fragment position relative to the visible content's top-left |
+| `effect_texture_phy_px(effect)` | Current fragment position in the complete working texture |
+| `effect_content_phy_px(effect)` | Current fragment position relative to the visible content's top-left |
 | `effect_content_uv(effect)` | Content-relative normalized coordinates; `0.0`–`1.0` over visible content and outside that range in padding |
-| `effect_texture_uv_from_content_px(effect, px)` | Convert content-relative physical pixels back to texture UV for sampling |
-| `effect_frame_px(effect)` | Current fragment position relative to the frame's top-left |
+| `effect_texture_uv_from_content_phy_px(effect, px)` | Convert content-relative physical pixels back to texture UV for sampling |
+| `effect_frame_phy_px(effect)` | Current fragment position relative to the frame's top-left |
 | `effect_frame_uv(effect)` | Frame-relative normalized coordinates; `0.0`–`1.0` over the window, outside that range beyond it |
+| `effect_frame_sdf(effect)` | Signed distance to the frame's rounded rect (negative inside) |
+| `effect_frame_coverage(effect)` | Coverage of the frame's rounded rect, antialiased over one physical pixel |
+| `effect_frame_inner_sdf(effect)` | Signed distance to the inner edge of the frame's border |
+| `effect_clip_sdf(effect)` / `effect_clip_coverage(effect)` | The same for the clip (always inside without one) |
+| `shoji_rrect_sdf(p, rect, radius)` / `shoji_coverage(sdf)` | General rounded-rect distance and coverage, as in [paint shaders](./paint.md#helpers) |
+
+For example, an edge highlight that follows the window's corners:
+
+```glsl
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
+    float d = effect.has_clip ? effect_clip_sdf(effect) : effect_frame_sdf(effect);
+    float rim = 1.0 - smoothstep(0.0, 1.5 * effect.scale, abs(d + 0.75 * effect.scale));
+    return vec4(color.rgb + rim * 0.25, color.a);
+}
+```
+
+:::note[Former names]
+Before the `_phy_px` suffix these were called `texture_size_px`,
+`content_rect_px`, `frame_rect_px`, `effect_texture_px`, `effect_content_px`,
+`effect_texture_uv_from_content_px` and `effect_frame_px`. The old names still
+work and carry the same values; new shaders should use the `_phy_px` names.
+:::
 
 Use texture UV for sampling and content coordinates for geometry tied to the
 visible rectangle. The content rectangle can start at a non-zero offset because
@@ -471,9 +515,9 @@ doing so throws away the pixels supplied by `capturePadding`.
 uniform vec2 displacement_px;
 
 vec4 shader_main(EffectContext effect) {
-    vec2 sample_px = effect_content_px(effect) + displacement_px;
+    vec2 sample_px = effect_content_phy_px(effect) + displacement_px;
     vec2 sample_uv = clamp(
-        effect_texture_uv_from_content_px(effect, sample_px),
+        effect_texture_uv_from_content_phy_px(effect, sample_px),
         vec2(0.0),
         vec2(1.0)
     );

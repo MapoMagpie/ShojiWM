@@ -190,6 +190,10 @@ pub enum CompositionPatch {
 }
 
 pub const SHADER_INPUT_STAGE_INDEX: usize = u32::MAX as usize;
+/// `stage_index` of a uniform of a node's `paint` shader.
+pub const PAINT_STAGE_INDEX: usize = u32::MAX as usize - 1;
+/// `stage_index` of a uniform of a node's `overlay` shader.
+pub const OVERLAY_STAGE_INDEX: usize = u32::MAX as usize - 2;
 
 impl CompositionPatch {
     pub fn node_id(&self) -> &str {

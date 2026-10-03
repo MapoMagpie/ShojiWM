@@ -805,7 +805,8 @@ fn decorated_contents(window: Window, is_terminal: bool) -> Element {
             .stage(dual_kawase_blur(4, 2))
             .stage(
                 shader_stage("./src/effect/liquid-glass.frag")
-                    .uniform("glass_radius_px", 10.0)
+                    // Follow the window's rounded corners.
+                    .uniform("glass_radius_px", -1.0)
                     .uniform("distortion_depth", 0.2)
                     .uniform("distortion_strength", 0.15)
                     .uniform("chromatic_shift_px", 3.0)

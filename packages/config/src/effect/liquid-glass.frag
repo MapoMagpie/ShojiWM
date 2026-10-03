@@ -2,6 +2,8 @@
 
 uniform float glass_width_px;
 uniform float glass_height_px;
+// Negative: follow the shape ShojiWM reports (the frame's own corner
+// radius, or the rounded clip around it, e.g. the window's corners).
 uniform float glass_radius_px;
 uniform float distortion_depth;
 uniform float distortion_strength;
@@ -21,7 +23,7 @@ vec2 safeNormalize(vec2 value) {
 
 vec3 getTextureColorAt(EffectContext effect, vec2 content_coord) {
     vec2 sample_uv = clamp(
-        effect_texture_uv_from_content_px(effect, content_coord),
+        effect_texture_uv_from_content_phy_px(effect, content_coord),
         vec2(0.0),
         vec2(1.0)
     );
@@ -29,14 +31,21 @@ vec3 getTextureColorAt(EffectContext effect, vec2 content_coord) {
 }
 
 vec4 shader_main(EffectContext effect) {
-    vec2 rect_size = effect.content_rect_px.zw;
-    vec2 fragCoord = effect_content_px(effect);
+    vec2 rect_size = effect.content_rect_phy_px.zw;
+    vec2 fragCoord = effect_content_phy_px(effect);
     vec2 glassSize = vec2(
         glass_width_px > 0.0 ? glass_width_px : rect_size.x,
         glass_height_px > 0.0 ? glass_height_px : rect_size.y
     );
     vec2 glassCenter = rect_size * 0.5;
     vec2 glassCoord = fragCoord - glassCenter;
+
+    float glassRadius = glass_radius_px;
+    if (glassRadius < 0.0) {
+        glassRadius = effect.frame_radius_phy_px.x > 0.0
+            ? effect.frame_radius_phy_px.x
+            : (effect.has_clip ? effect.clip_radius_phy_px.x : 0.0);
+    }
 
     float size = max(min(glassSize.x, glassSize.y), 1.0);
     // Keep squared values inside mediump range. Some drivers evaluate length()
@@ -45,7 +54,7 @@ vec4 shader_main(EffectContext effect) {
     float inversedSDF = -sdf(
         glassCoord / sdfScale,
         glassSize * 0.5 / sdfScale,
-        glass_radius_px / sdfScale
+        glassRadius / sdfScale
     ) * sdfScale / size;
 
     if (inversedSDF < 0.0) {

@@ -12,6 +12,8 @@ import type {
   SaveStageHandle,
   ShaderModuleHandle,
   ShaderStageHandle,
+  PaintOutsets,
+  PaintShaderHandle,
   ShaderInputHandle,
   UnitStageHandle,
   ImageSourceHandle,
@@ -357,6 +359,42 @@ export function shaderStage(
     shader: typeof shader === "string" ? loadShader(shader) : shader,
     uniforms: options.uniforms,
     textures: options.textures,
+  };
+}
+
+/**
+ * Create a paint shader for a component's `paint` or `overlay` prop. The GLSL
+ * file defines `vec4 paint_main(PaintContext ctx)` and returns a
+ * premultiplied color. ShojiWM resolves the layout to whole physical pixels
+ * (`ctx.size_phy_px`, `ctx.border_phy_px`, `ctx.radius_phy_px`, ...), so the
+ * shader never deals with fractional scaling. Uniform values may be signals;
+ * changing one repaints without a relayout.
+ * コンポーネントの `paint` / `overlay` に渡すペイントシェーダーを作成します。
+ * GLSL には `vec4 paint_main(PaintContext ctx)` を定義し、乗算済みアルファの色を
+ * 返します。レイアウトは整数の物理ピクセルに解決済みで渡されるため、
+ * fractional scale を意識する必要はありません。
+ *
+ * @example
+ * ```tsx
+ * const glow = paintShader("./shaders/glow.frag", {
+ *   uniforms: { strength: hoverAmount },
+ *   outsets: 12,
+ * });
+ * <Box paint={glow} style={{ borderRadius: 8, background: "#202020" }} />
+ * ```
+ */
+export function paintShader(
+  shader: string | ShaderModuleHandle,
+  options: {
+    uniforms?: ShaderUniformMap;
+    outsets?: PaintOutsets;
+  } = {},
+): PaintShaderHandle {
+  return {
+    kind: "paint-shader",
+    shader: typeof shader === "string" ? loadShader(shader) : shader,
+    uniforms: options.uniforms,
+    outsets: options.outsets,
   };
 }
 

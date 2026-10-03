@@ -4,7 +4,7 @@ uniform highp sampler2D field_input;
 uniform float distance_limit_px;
 
 vec4 shader_main(EffectContext effect) {
-    vec2 size = effect.texture_size_px;
+    vec2 size = effect.texture_size_phy_px;
     vec2 uv = (floor(effect.texture_uv * size) + 0.5) / size;
     vec4 nearest = texture2D(field_input, uv);
     float distance = nearest.b < 0.5 ? distance_limit_px

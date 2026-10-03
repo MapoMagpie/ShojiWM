@@ -18,13 +18,13 @@
 //! ```
 
 use shojiwm_lib::ssd::{
-    AlignItems, BorderFit, BorderStyle, Color, DecorationStyle, Edges, JustifyContent,
+    AlignItems, BorderFit, BorderStyle, BoxShadow, Color, DecorationStyle, Edges, JustifyContent,
     NodeTransform, Overflow, PointerEvents, PositionOffsets, StylePosition,
 };
 
 use crate::reactive::Prop;
 
-/// Parse `#RRGGBB` or `#RRGGBBAA`. Usable in `const` items, where a typo is a
+/// Parse `#RRGGBB` or `#RRGGBBAA` (or the short `#RGB` / `#RGBA`). Usable in `const` items, where a typo is a
 /// compile error; at runtime an invalid string panics.
 pub const fn hex(input: &str) -> Color {
     const fn digit(byte: u8) -> u8 {
@@ -44,6 +44,13 @@ pub const fn hex(input: &str) -> Color {
         "color must start with '#'"
     );
     match bytes.len() {
+        4 => Color::rgba(digit(bytes[1]) * 17, digit(bytes[2]) * 17, digit(bytes[3]) * 17, 255),
+        5 => Color::rgba(
+            digit(bytes[1]) * 17,
+            digit(bytes[2]) * 17,
+            digit(bytes[3]) * 17,
+            digit(bytes[4]) * 17,
+        ),
         7 => Color::rgba(pair(bytes, 1), pair(bytes, 3), pair(bytes, 5), 255),
         9 => Color::rgba(
             pair(bytes, 1),
@@ -51,7 +58,7 @@ pub const fn hex(input: &str) -> Color {
             pair(bytes, 5),
             pair(bytes, 7),
         ),
-        _ => panic!("color must be #RRGGBB or #RRGGBBAA"),
+        _ => panic!("color must be #RGB, #RGBA, #RRGGBB or #RRGGBBAA"),
     }
 }
 
@@ -79,6 +86,28 @@ impl From<Border> for BorderStyle {
             width: border.width,
             color: border.color,
         }
+    }
+}
+
+/// A CSS `box-shadow` layer drawn around the node (`x`, `y`, `blur` in
+/// logical pixels). Adjust `spread` with struct update syntax:
+/// `BoxShadow { spread: 2.0, ..shadow(0.0, 4.0, 12.0, hex("#00000060")) }`.
+pub const fn shadow(x: f64, y: f64, blur: f64, color: Color) -> BoxShadow {
+    BoxShadow {
+        offset_x: x,
+        offset_y: y,
+        blur,
+        spread: 0.0,
+        color,
+        inset: false,
+    }
+}
+
+/// Like [`shadow`], drawn inside the padding box.
+pub const fn inset_shadow(x: f64, y: f64, blur: f64, color: Color) -> BoxShadow {
+    BoxShadow {
+        inset: true,
+        ..shadow(x, y, blur, color)
     }
 }
 
@@ -203,6 +232,8 @@ style_fields! {
     border_left: Border,
     border_fit: BorderFit,
     border_radius: f64,
+    /// CSS-like shadows; the first entry is painted on top.
+    box_shadow: Vec<BoxShadow>,
     visible: bool,
     cursor: String,
     font_size: f64,
@@ -333,6 +364,9 @@ impl Style {
             font_family: read(&self.font_family),
             text_align: read(&self.text_align),
             line_height: read(&self.line_height),
+            box_shadow: read(&self.box_shadow).unwrap_or_default(),
+            paint: None,
+            overlay: None,
         }
     }
 }
@@ -340,6 +374,18 @@ impl Style {
 impl From<&str> for Prop<Color> {
     fn from(value: &str) -> Self {
         Prop::Static(hex(value))
+    }
+}
+
+impl From<BoxShadow> for Prop<Vec<BoxShadow>> {
+    fn from(value: BoxShadow) -> Self {
+        Prop::Static(vec![value])
+    }
+}
+
+impl<const N: usize> From<[BoxShadow; N]> for Prop<Vec<BoxShadow>> {
+    fn from(value: [BoxShadow; N]) -> Self {
+        Prop::Static(value.to_vec())
     }
 }
 

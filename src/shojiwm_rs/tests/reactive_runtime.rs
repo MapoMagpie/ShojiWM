@@ -69,7 +69,12 @@ fn setup() {
             .rect(derive(move || Rect::new(0.0, 0.0, width.get(), 300.0)))
             .child(
                 WindowBorder::new()
-                    .style(Style::new().border(2.0, border))
+                    .style(
+                        Style::new()
+                            .border(2.0, border)
+                            .box_shadow(shadow(0.0, 4.0, 12.0, hex("#00000060"))),
+                    )
+                    .overlay(paint_shader("/ring.frag").uniform("glow", glow))
                     .child(
                         Flex::column()
                             .child(
@@ -134,6 +139,9 @@ fn reactive_config_round_trip() {
     assert_eq!(evaluation.managed_window.rect.unwrap().width, 400.0);
     let border = find(&evaluation.node, &|node| matches!(node.kind, DecorationNodeKind::WindowBorder)).unwrap();
     assert_eq!(border.style.border.unwrap().color, hex("#d7ba7d"));
+    assert_eq!(border.style.box_shadow, vec![shadow(0.0, 4.0, 12.0, hex("#00000060"))]);
+    let overlay = border.style.overlay.as_ref().expect("overlay paint shader");
+    assert!(overlay.shader.path.ends_with("ring.frag"));
     let button = find(&evaluation.node, &|node| matches!(node.kind, DecorationNodeKind::Button(_))).unwrap();
     let hover = button.interaction.hover_change.clone().unwrap();
     let DecorationNodeKind::Button(button_node) = &button.kind else {
@@ -189,11 +197,22 @@ fn reactive_config_round_trip() {
     let invocation = runtime.invoke_key_binding("glow", 9).unwrap();
     assert!(invocation.dirty_window_node_ids.contains_key("w1"));
     let cached = runtime.evaluate_cached_window("w1", None, 10, false).unwrap();
-    assert!(matches!(
-        cached.node_patches.as_slice(),
-        [CompositionPatch::ShaderUniform { name, value: shojiwm_rs::ssd::ShaderUniformValue::Float(value), .. }]
-            if name == "glow" && *value == 1.0
-    ));
+    assert_eq!(cached.node_patches.len(), 2, "{:?}", cached.node_patches);
+    for stage in [1, shojiwm_rs::runtime_api::OVERLAY_STAGE_INDEX] {
+        assert!(
+            cached.node_patches.iter().any(|patch| matches!(
+                patch,
+                CompositionPatch::ShaderUniform {
+                    name,
+                    stage_index,
+                    value: shojiwm_rs::ssd::ShaderUniformValue::Float(value),
+                    ..
+                } if name == "glow" && *value == 1.0 && *stage_index == stage
+            )),
+            "uniform patch of stage {stage}: {:?}",
+            cached.node_patches
+        );
+    }
 
     // Closing.
     let invocation = runtime.start_close("w1", 11).unwrap();

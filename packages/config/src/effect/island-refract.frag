@@ -45,7 +45,7 @@ vec3 backgroundAt(vec2 uv, vec2 size, float edgeBlur) {
 
 vec4 shader_main(EffectContext effect) {
     vec2 uv = effect.texture_uv;
-    vec2 size = effect.texture_size_px;
+    vec2 size = effect.texture_size_phy_px;
     vec2 sourceMask = texture2D(silhouette, uv).rg;
     float mask = sourceMask.r;
     if (mask <= 0.001)

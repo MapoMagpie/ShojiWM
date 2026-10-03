@@ -4980,303 +4980,6 @@ fn render_surface(
                     })
                     .unwrap_or_default()
                 } else if let Some(content_clip) = content_clip {
-                    if crate::env_flag!("SHOJI_GAP_DEBUG")
-                        && let Some(decoration) = window_decorations.get(window) {
-                            let border_buffer = decoration.buffers.iter().find(|buffer| {
-                                buffer.source_kind == "window-border" && buffer.border_width > 0.0
-                            });
-                            let border_fill = decoration.buffers.iter().find(|buffer| {
-                                buffer.source_kind == "fill" && buffer.hole_rect.is_some()
-                            });
-                            let snap_scale = Scale::from((
-                                scale.x * visual_state.scale.x.max(0.0),
-                                scale.y * visual_state.scale.y.max(0.0),
-                            ));
-                            let border_width = (decoration.layout.root.rect.x
-                                + decoration.layout.root.rect.width)
-                                - (content_clip.rect.loc.x + content_clip.rect.size.w);
-                            let border_rect = Some(crate::ssd::LogicalRect::new(
-                                content_clip.rect.loc.x - border_width,
-                                content_clip.rect.loc.y - border_width,
-                                content_clip.rect.size.w + border_width * 2,
-                                content_clip.rect.size.h + border_width * 2,
-                            ));
-                            let snapped_inner = Some(
-                                crate::backend::visual::snapped_logical_rect_relative_with_mode(
-                                    crate::ssd::LogicalRect::new(
-                                        content_clip.rect.loc.x,
-                                        content_clip.rect.loc.y,
-                                        content_clip.rect.size.w,
-                                        content_clip.rect.size.h,
-                                    ),
-                                    output_geo.loc,
-                                    snap_scale,
-                                    content_clip.snap_mode,
-                                ),
-                            );
-                            let snapped_clip =
-                                crate::backend::visual::snapped_logical_rect_relative_with_mode(
-                                    crate::ssd::LogicalRect::new(
-                                        content_clip.rect.loc.x,
-                                        content_clip.rect.loc.y,
-                                        content_clip.rect.size.w,
-                                        content_clip.rect.size.h,
-                                    ),
-                                    output_geo.loc,
-                                    snap_scale,
-                                    content_clip.snap_mode,
-                                );
-                            let expected_left = (snapped_clip.x as f64 * scale.x).round() as i32;
-                            let expected_top = (snapped_clip.y as f64 * scale.y).round() as i32;
-                            let expected_right = ((snapped_clip.x + snapped_clip.width) as f64
-                                * scale.x)
-                                .round() as i32;
-                            let expected_bottom = ((snapped_clip.y + snapped_clip.height) as f64
-                                * scale.y)
-                                .round() as i32;
-                            tracing::info!(
-                                output = %output.name(),
-                                window_id = %window_id,
-                                window_location = ?window_location,
-                                output_scale = scale.x,
-                                window_scale_x = visual_state.scale.x,
-                                window_scale_y = visual_state.scale.y,
-                                physical_location = ?physical_location,
-                                border_rect = ?border_rect,
-                                snapped_inner = ?snapped_inner,
-                                content_clip = ?content_clip,
-                                snapped_clip = ?snapped_clip,
-                                expected_left,
-                                expected_top,
-                                expected_right,
-                                expected_bottom,
-                                "gap debug tty border/client geometry"
-                            );
-                            tracing::info!(
-                                output = %output.name(),
-                                window_id = %window_id,
-                                border_buffer_rect = ?border_buffer.map(|buffer| buffer.rect),
-                                border_buffer_width = ?border_buffer.map(|buffer| buffer.border_width),
-                                border_buffer_hole = ?border_buffer.and_then(|buffer| buffer.hole_rect),
-                                border_buffer_hole_precise = ?border_buffer.and_then(|buffer| buffer.hole_rect_precise),
-                                border_buffer_hole_radius_precise = ?border_buffer.and_then(|buffer| buffer.hole_radius_precise),
-                                border_fill_rect = ?border_fill.map(|buffer| buffer.rect),
-                                border_fill_hole = ?border_fill.and_then(|buffer| buffer.hole_rect),
-                                decoration_root_rect = ?decoration.layout.root.rect,
-                                decoration_slot_rect = ?decoration.layout.window_slot_rect(),
-                                "gap debug tty border buffers"
-                            );
-                            if let Some(decoration) = window_decorations.get(window) {
-                                let border_outer_physical = border_buffer.and_then(|buffer| {
-                                buffer
-                                    .rect_precise
-                                    .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
-                                        rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                    ))
-                                    .or_else(|| Some(crate::backend::visual::relative_physical_rect_from_root(
-                                        buffer.rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                        buffer.clip_rect,
-                                    )))
-                            });
-                                let border_inner_physical = border_buffer.and_then(|buffer| {
-                                buffer
-                                    .hole_rect_precise
-                                    .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
-                                        rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                    ))
-                                    .or_else(|| buffer.hole_rect.map(|rect| {
-                                        crate::backend::visual::relative_physical_rect_from_root(
-                                            rect,
-                                            decoration.layout.root.rect,
-                                            decoration.root_subpixel_offset,
-                                            output_geo,
-                                            scale,
-                                            Some(rect),
-                                        )
-                                    }))
-                            });
-                                let titlebar_fill = decoration.buffers.iter().find(|buffer| {
-                                    buffer.source_kind == "fill" && buffer.rect.height == 30
-                                });
-                                let titlebar_fill_physical = titlebar_fill.map(|buffer| {
-                                buffer
-                                    .rect_precise
-                                    .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
-                                        rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                    ))
-                                    .unwrap_or_else(|| {
-                                        crate::backend::visual::relative_physical_rect_from_root(
-                                            buffer.rect,
-                                            decoration.layout.root.rect,
-                                            decoration.root_subpixel_offset,
-                                            output_geo,
-                                            scale,
-                                            buffer.clip_rect,
-                                        )
-                                    })
-                            });
-                                let titlebar_shader = decoration
-                                    .shader_buffers
-                                    .iter()
-                                    .find(|buffer| buffer.rect.height == 30);
-                                let titlebar_shader_precise = titlebar_shader.and_then(|buffer| {
-                                    buffer.rect_precise.map(|rect| {
-                                        crate::backend::visual::PreciseLogicalRect {
-                                            x: rect.x - decoration.layout.root.rect.x as f32,
-                                            y: rect.y - decoration.layout.root.rect.y as f32,
-                                            width: rect.width,
-                                            height: rect.height,
-                                        }
-                                    })
-                                });
-                                let titlebar_shader_clip_precise =
-                                    titlebar_shader.and_then(|buffer| {
-                                        buffer.clip_rect_precise.map(|rect| {
-                                            crate::backend::visual::PreciseLogicalRect {
-                                                x: rect.x - decoration.layout.root.rect.x as f32,
-                                                y: rect.y - decoration.layout.root.rect.y as f32,
-                                                width: rect.width,
-                                                height: rect.height,
-                                            }
-                                        })
-                                    });
-                                let titlebar_shader_physical = titlebar_shader.map(|buffer| {
-                                buffer
-                                    .rect_precise
-                                    .map(|rect| crate::backend::visual::relative_physical_rect_from_root_precise(
-                                        rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                    ))
-                                    .unwrap_or_else(|| {
-                                        crate::backend::visual::relative_physical_rect_from_root(
-                                            buffer.rect,
-                                            decoration.layout.root.rect,
-                                            decoration.root_subpixel_offset,
-                                            output_geo,
-                                            scale,
-                                            buffer.clip_rect,
-                                        )
-                                    })
-                            });
-                                let titlebar_shader_clip_physical_precise =
-                                    titlebar_shader_clip_precise.map(|clip| {
-                                        let scale_x = scale.x.abs().max(0.0001) as f32;
-                                        let scale_y = scale.y.abs().max(0.0001) as f32;
-                                        (
-                                            clip.x * scale_x,
-                                            clip.y * scale_y,
-                                            clip.width * scale_x,
-                                            clip.height * scale_y,
-                                        )
-                                    });
-                                let titlebar_shader_clip_physical_global_precise =
-                                    titlebar_shader_clip_physical_precise;
-                                let border_expected_inner_precise = border_buffer
-                                    .and_then(|buffer| buffer.hole_rect_precise)
-                                    .map(|rect| crate::backend::visual::PreciseLogicalRect {
-                                        x: rect.x - decoration.layout.root.rect.x as f32,
-                                        y: rect.y - decoration.layout.root.rect.y as f32,
-                                        width: rect.width,
-                                        height: rect.height,
-                                    });
-                                let border_expected_inner_physical_precise =
-                                    border_expected_inner_precise.map(|rect| {
-                                        let scale_x = scale.x.abs().max(0.0001) as f32;
-                                        let scale_y = scale.y.abs().max(0.0001) as f32;
-                                        (
-                                            rect.x * scale_x,
-                                            rect.y * scale_y,
-                                            rect.width * scale_x,
-                                            rect.height * scale_y,
-                                        )
-                                    });
-                                let shader_clip_vs_border_inner_precise =
-                                    titlebar_shader_clip_physical_global_precise
-                                        .zip(border_expected_inner_physical_precise)
-                                        .map(|(shader, border)| {
-                                            (
-                                                shader.0 - border.0,
-                                                shader.1 - border.1,
-                                                (shader.0 + shader.2) - (border.0 + border.2),
-                                                (shader.1 + shader.3) - (border.1 + border.3),
-                                            )
-                                        });
-                                let content_clip_physical = smithay::utils::Rectangle::<
-                                    i32,
-                                    smithay::utils::Physical,
-                                >::new(
-                                    smithay::utils::Point::from((expected_left, expected_top)),
-                                    (
-                                        (expected_right - expected_left).max(0),
-                                        (expected_bottom - expected_top).max(0),
-                                    )
-                                        .into(),
-                                );
-                                let first_button = decoration.buffers.iter().find(|buffer| {
-                                    buffer.source_kind == "button" && buffer.border_width > 0.0
-                                });
-                                let first_button_physical = first_button.map(|buffer| {
-                                    crate::backend::visual::relative_physical_rect_from_root(
-                                        buffer.rect,
-                                        decoration.layout.root.rect,
-                                        decoration.root_subpixel_offset,
-                                        output_geo,
-                                        scale,
-                                        buffer.clip_rect,
-                                    )
-                                });
-                                let button_delta =
-                                    match (border_inner_physical, first_button_physical) {
-                                        (Some(inner), Some(button)) => Some((
-                                            button.loc.x - inner.loc.x,
-                                            button.loc.y - inner.loc.y,
-                                            (inner.loc.x + inner.size.w)
-                                                - (button.loc.x + button.size.w),
-                                            (inner.loc.y + inner.size.h)
-                                                - (button.loc.y + button.size.h),
-                                        )),
-                                        _ => None,
-                                    };
-                                tracing::info!(
-                                    output = %output.name(),
-                                    window_id = %window_id,
-                                    border_outer_physical = ?border_outer_physical,
-                                    border_inner_physical = ?border_inner_physical,
-                                    titlebar_shader_physical = ?titlebar_shader_physical,
-                                    titlebar_fill_physical = ?titlebar_fill_physical,
-                                    content_clip_physical = ?content_clip_physical,
-                                    border_expected_inner_precise = ?border_expected_inner_precise,
-                                    border_expected_inner_physical_precise = ?border_expected_inner_physical_precise,
-                                    titlebar_shader_precise = ?titlebar_shader_precise,
-                                    titlebar_shader_clip_precise = ?titlebar_shader_clip_precise,
-                                    titlebar_shader_clip_physical_precise = ?titlebar_shader_clip_physical_precise,
-                                    titlebar_shader_clip_physical_global_precise = ?titlebar_shader_clip_physical_global_precise,
-                                    shader_clip_vs_border_inner_precise = ?shader_clip_vs_border_inner_precise,
-                                    first_button_physical = ?first_button_physical,
-                                    button_delta = ?button_delta,
-                                    "gap debug tty border physical compare"
-                                );
-                            }
-                        }
                     let clipped = window_render::clipped_surface_elements(
                         window,
                         &mut backend.renderer,
@@ -6244,6 +5947,7 @@ fn render_surface(
                         commit_counter,
                         rect,
                         effect,
+                        window_effect_frame_shape(window_decorations.get(window), effect),
                         source_elements,
                     )
                     .inspect_err(|error| {
@@ -6382,6 +6086,7 @@ fn render_surface(
                             commit_counter,
                             rect,
                             effect,
+                            window_effect_frame_shape(window_decorations.get(window), effect),
                             source_elements,
                         )
                         .inspect_err(|error| {
@@ -6446,6 +6151,7 @@ fn render_surface(
                     commit_counter,
                     rect,
                     effect,
+                    window_effect_frame_shape(window_decorations.get(window), effect),
                     source_elements,
                 )
                 .inspect_err(|error| {
@@ -6506,6 +6212,7 @@ fn render_surface(
                         commit_counter,
                         rect,
                         effect,
+                        window_effect_frame_shape(window_decorations.get(window), effect),
                         source_elements,
                     )
                     .inspect_err(|error| {
@@ -8181,6 +7888,7 @@ fn subsurface_effect_elements(
         rect,
         frame_rect,
         effect,
+        decoration.effect_frame_shape(false),
         group,
     )
     .inspect_err(|error| {
@@ -8895,68 +8603,6 @@ fn log_gap_final_composite_readback(
         visual,
     );
 
-    let parent_box_border = decoration.buffers.iter().find(|buffer| {
-        buffer.source_kind == "box"
-            && buffer.border_width > 0.0
-            && buffer.hole_rect_precise.is_some_and(|hole| {
-                let shader = titlebar_shader.rect_precise.unwrap_or({
-                    crate::backend::visual::PreciseLogicalRect {
-                        x: titlebar_shader.rect.x as f32,
-                        y: titlebar_shader.rect.y as f32,
-                        width: titlebar_shader.rect.width as f32,
-                        height: titlebar_shader.rect.height as f32,
-                    }
-                });
-                shader.x >= hole.x - 1.0
-                    && shader.y >= hole.y - 1.0
-                    && shader.x + shader.width <= hole.x + hole.width + 1.0
-            })
-    });
-
-    let parent_hole_geometry = parent_box_border.and_then(|buffer| {
-        buffer.hole_rect_precise.map(|hole| {
-            let pre = crate::backend::visual::relative_physical_rect_from_root_precise(
-                hole,
-                root_rect,
-                decoration.root_subpixel_offset,
-                output_geo,
-                output_scale,
-            );
-            transform_physical_rect_for_visual(translate_physical_rect(pre, root_origin), visual)
-        })
-    });
-    let parent_border_geometry = parent_box_border.map(|buffer| {
-        let pre = buffer
-            .rect_precise
-            .map(|rect| {
-                crate::backend::visual::relative_physical_rect_from_root_precise(
-                    rect,
-                    root_rect,
-                    decoration.root_subpixel_offset,
-                    output_geo,
-                    output_scale,
-                )
-            })
-            .unwrap_or_else(|| {
-                crate::backend::visual::relative_physical_rect_from_root_snapped_edges(
-                    buffer.rect,
-                    root_rect,
-                    decoration.root_subpixel_offset,
-                    output_geo,
-                    output_scale,
-                )
-            });
-        transform_physical_rect_for_visual(translate_physical_rect(pre, root_origin), visual)
-    });
-    let titlebar_vs_parent_hole_delta = parent_hole_geometry.map(|hole| {
-        (
-            titlebar_geometry.loc.x - hole.loc.x,
-            titlebar_geometry.loc.y - hole.loc.y,
-            (titlebar_geometry.loc.x + titlebar_geometry.size.w) - (hole.loc.x + hole.size.w),
-            (titlebar_geometry.loc.y + titlebar_geometry.size.h) - (hole.loc.y + hole.size.h),
-        )
-    });
-
     tracing::info!(
         output = output_name,
         window_id,
@@ -8968,10 +8614,6 @@ fn log_gap_final_composite_readback(
         titlebar_rect = ?titlebar_shader.rect,
         titlebar_rect_precise = ?titlebar_shader.rect_precise,
         titlebar_geometry = ?titlebar_geometry,
-        parent_box_border_key = ?parent_box_border.map(|buffer| buffer.stable_key.as_str()),
-        parent_border_geometry = ?parent_border_geometry,
-        parent_hole_geometry = ?parent_hole_geometry,
-        titlebar_vs_parent_hole_delta = ?titlebar_vs_parent_hole_delta,
         "gap final composite geometry"
     );
 
@@ -8983,20 +8625,6 @@ fn log_gap_final_composite_readback(
                 smithay::utils::Rectangle::new(
                     smithay::utils::Point::from((
                         titlebar_geometry.loc.x + titlebar_geometry.size.w - 1 - inset,
-                        titlebar_geometry.loc.y,
-                    )),
-                    smithay::utils::Size::from((1, titlebar_geometry.size.h)),
-                ),
-            ));
-        }
-    }
-    if let Some(hole) = parent_hole_geometry {
-        for offset in [-2, -1, 0, 1, 2] {
-            probes.push((
-                format!("parent-hole-right-offset-{offset}px"),
-                smithay::utils::Rectangle::new(
-                    smithay::utils::Point::from((
-                        hole.loc.x + hole.size.w + offset,
                         titlebar_geometry.loc.y,
                     )),
                     smithay::utils::Size::from((1, titlebar_geometry.size.h)),
@@ -9187,6 +8815,21 @@ fn capture_origin_for_logical_rect(
 }
 
 /// `frame` in the physical-pixel space of a texture captured over `capture`.
+/// The shape a window effect's `EffectContext` sees (see
+/// `WindowDecorationState::effect_frame_shape`).
+fn window_effect_frame_shape(
+    decoration: Option<&crate::ssd::WindowDecorationState>,
+    effect: &crate::ssd::WindowEffectSlot,
+) -> crate::backend::shader_effect::NodeEffectShape {
+    let root_surface_only = matches!(
+        effect.effect.input,
+        crate::ssd::EffectInput::WindowSource(crate::ssd::WindowSourceInclude::RootSurface)
+    );
+    decoration
+        .map(|decoration| decoration.effect_frame_shape(root_surface_only))
+        .unwrap_or_default()
+}
+
 fn effect_frame_rect_in_texture(
     capture: crate::ssd::LogicalRect,
     frame: crate::ssd::LogicalRect,
@@ -9326,6 +8969,7 @@ fn window_effect_elements(
     commit_counter: smithay::backend::renderer::utils::CommitCounter,
     window_rect: crate::ssd::LogicalRect,
     effect: &crate::ssd::WindowEffectSlot,
+    frame_shape: crate::backend::shader_effect::NodeEffectShape,
     window_elements: &[TtyRenderElements],
 ) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
     window_effect_elements_in_frame(
@@ -9340,13 +8984,14 @@ fn window_effect_elements(
         window_rect,
         window_rect,
         effect,
+        frame_shape,
         window_elements,
     )
 }
 
 /// Like [`window_effect_elements`], for an effect covering `window_rect` that belongs to a
 /// larger or offset `frame_rect` (the window, for subsurface effects). The frame is exposed to
-/// shaders as `effect.frame_rect_px`.
+/// shaders as `effect.frame_rect_phy_px`.
 #[allow(clippy::too_many_arguments)]
 fn window_effect_elements_in_frame(
     renderer: &mut GlesRenderer,
@@ -9360,6 +9005,7 @@ fn window_effect_elements_in_frame(
     window_rect: crate::ssd::LogicalRect,
     frame_rect: crate::ssd::LogicalRect,
     effect: &crate::ssd::WindowEffectSlot,
+    frame_shape: crate::backend::shader_effect::NodeEffectShape,
     window_elements: &[TtyRenderElements],
 ) -> Result<Vec<TtyRenderElements>, crate::backend::shader_effect::ShaderEffectError> {
     if window_elements.is_empty() || window_rect.width <= 0 || window_rect.height <= 0 {
@@ -9483,8 +9129,11 @@ fn window_effect_elements_in_frame(
             (texture_size.w, texture_size.h),
             None,
             Some((texture_size.w, texture_size.h)),
-            Some(effect_frame_rect_in_texture(rect, frame_rect, scale)),
             &effect.effect,
+            frame_shape.effect_frame(
+                Some(effect_frame_rect_in_texture(rect, frame_rect, scale)),
+                scale.x,
+            ),
         )?;
     if window_effect_debug_enabled() {
         info!(
@@ -9592,6 +9241,7 @@ fn layer_source_effect_elements(
             commit_counter,
             layer_rect,
             effect,
+            Default::default(),
             capture_elements,
         )
         .inspect_err(|error| {
@@ -9948,6 +9598,7 @@ fn compose_one_popup_elements(
                 commit_counter,
                 popup_rect,
                 effect,
+                Default::default(),
                 &popup_elements,
             )
             .inspect_err(|error| {
@@ -10679,6 +10330,7 @@ fn backdrop_shader_elements_for_window(
                 Some(sample_region),
                 Some(output_size),
                 &cached.shader,
+                cached.node_shape.effect_frame(None, scale.x),
             )
             .ok()?;
             if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
@@ -11536,6 +11188,7 @@ fn configured_background_effect_elements_for_layer(
             sample_region,
             output_size,
             &backdrop_effect,
+            crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )?
     } else {
         crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -11547,6 +11200,7 @@ fn configured_background_effect_elements_for_layer(
             sample_region,
             output_size,
             &backdrop_effect,
+            crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )?
     };
     if crate::env_flag!("SHOJI_FIREFOX_BACKDROP_DEBUG") {
@@ -11998,6 +11652,7 @@ fn lower_layer_scene_elements(
                     sample_region,
                     output_size,
                     &backdrop_effect,
+                    crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
                 )?
             } else {
                 crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -12009,6 +11664,7 @@ fn lower_layer_scene_elements(
                     sample_region,
                     output_size,
                     &backdrop_effect,
+                    crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
                 )?
             };
             let mut sub_elements = layer_backdrop_cache
@@ -12679,6 +12335,7 @@ fn configured_background_effect_elements_for_window(
                 Some(sample_region),
                 Some(output_size),
                 &effect_config.effect,
+                crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
             )
             .ok()?;
             if crate::env_flag!("SHOJI_GAP_SHADER_READBACK_DEBUG") {
@@ -13218,6 +12875,7 @@ fn closing_snapshot_elements(
                     Default::default(),
                     rect,
                     effect,
+                    window_effect_frame_shape(Some(&snapshot.decoration), effect),
                     source_elements,
                 )
                 .inspect_err(|error| {
@@ -13279,6 +12937,7 @@ fn closing_snapshot_elements(
                         Default::default(),
                         rect,
                         effect,
+                        window_effect_frame_shape(Some(&snapshot.decoration), effect),
                         source_elements,
                     )
                     .inspect_err(|error| {
@@ -13332,6 +12991,7 @@ fn closing_snapshot_elements(
                         Default::default(),
                         rect,
                         effect,
+                        window_effect_frame_shape(Some(&snapshot.decoration), effect),
                         source_elements,
                     )
                     .inspect_err(|error| {
@@ -13385,6 +13045,7 @@ fn closing_snapshot_elements(
                         Default::default(),
                         rect,
                         effect,
+                        window_effect_frame_shape(Some(&snapshot.decoration), effect),
                         source_elements,
                     )
                     .inspect_err(|error| {

@@ -8,7 +8,7 @@ float hash(vec2 p) {
 
 vec4 shader_main(EffectContext effect) {
     vec4 color = texture2D(tex, effect.texture_uv);
-    vec2 pixel = floor(effect_texture_px(effect));
+    vec2 pixel = floor(effect_texture_phy_px(effect));
     float cell_size = 3.0;
     vec2 cell = floor(pixel / cell_size);
     vec2 local = mod(pixel, cell_size);

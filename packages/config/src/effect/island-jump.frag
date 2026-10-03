@@ -2,7 +2,7 @@ uniform float jump_px;
 uniform highp sampler2D field_input;
 
 vec4 shader_main(EffectContext effect) {
-    vec2 size = effect.texture_size_px;
+    vec2 size = effect.texture_size_phy_px;
     // Nearest-seed candidates must be fetched at texel centers.
     vec2 p = floor(effect.texture_uv * size) + 0.5;
     vec4 best = vec4(0.0);

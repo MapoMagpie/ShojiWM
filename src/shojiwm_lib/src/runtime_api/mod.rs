@@ -24,7 +24,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub use handle::RuntimeHandle;
 pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost};
 pub use message::{
-    CompositionPatch, DecorationRequest, SHADER_INPUT_STAGE_INDEX, EffectRequest, InputRequest, RuntimeEvent, RuntimeReply, RuntimeRequest,
+    CompositionPatch, DecorationRequest, OVERLAY_STAGE_INDEX, PAINT_STAGE_INDEX, SHADER_INPUT_STAGE_INDEX, EffectRequest, InputRequest, RuntimeEvent, RuntimeReply, RuntimeRequest,
     WindowRequest, WorkspaceRequest,
 };
 

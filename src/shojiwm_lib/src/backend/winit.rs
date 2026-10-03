@@ -322,6 +322,7 @@ fn layer_source_effect_element(
         None,
         Some((texture_size.w, texture_size.h)),
         &effect.effect,
+        crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
     ) else {
         return Vec::new();
     };
@@ -433,6 +434,7 @@ fn popup_source_effect_element(
         None,
         Some((texture_size.w, texture_size.h)),
         &effect.effect,
+        crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
     ) else {
         return Vec::new();
     };
@@ -3031,6 +3033,7 @@ fn backdrop_shader_elements_for_window(
                 Some(sample_region),
                 Some(output_size),
                 &cached.shader,
+                cached.node_shape.effect_frame(None, scale.x),
             )
             .ok();
             texture.as_ref()?;
@@ -3779,6 +3782,7 @@ fn lower_layer_scene_elements(
                 sample_region,
                 output_size,
                 &config.effect,
+                crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
             )
         } else {
             crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -3790,6 +3794,7 @@ fn lower_layer_scene_elements(
                 sample_region,
                 output_size,
                 &config.effect,
+                crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
             )
         }
         .ok();
@@ -4255,6 +4260,7 @@ fn configured_background_effect_elements_for_layer(
             sample_region,
             output_size,
             &config.effect,
+            crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )
     } else {
         crate::backend::shader_effect::apply_effect_pipeline_cached_for_key(
@@ -4266,6 +4272,7 @@ fn configured_background_effect_elements_for_layer(
             sample_region,
             output_size,
             &config.effect,
+            crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
         )
     }
     .ok();
@@ -4887,6 +4894,7 @@ fn configured_background_effect_elements_for_window(
                 Some(sample_region),
                 Some(output_size),
                 &config.effect,
+                crate::backend::shader_effect::EffectFrame::plain(None, scale.x),
             )
             .ok()?;
             let commit_counter = state

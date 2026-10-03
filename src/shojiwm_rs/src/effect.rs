@@ -270,6 +270,74 @@ impl ShaderStage {
     }
 }
 
+/// A paint shader for [`Element::paint`](crate::view::Element::paint) and
+/// [`Element::overlay`](crate::view::Element::overlay): a GLSL file defining
+/// `vec4 paint_main(PaintContext ctx)` that returns a premultiplied color
+/// (`paintShader` in TypeScript). The compositor hands it the node geometry
+/// in whole physical pixels.
+///
+/// ```
+/// use shojiwm_rs::prelude::*;
+///
+/// let glow = paint_shader("/path/to/glow.frag").uniform("strength", 0.6).outsets(12.0);
+/// # let _ = glow;
+/// ```
+#[derive(Debug, Clone)]
+pub struct PaintShader {
+    path: String,
+    uniforms: Vec<(String, Prop<Uniform>)>,
+    outsets: shojiwm_lib::ssd::Edges,
+}
+
+/// A paint shader; `path` is resolved against the config's asset root.
+pub fn paint_shader(path: &str) -> PaintShader {
+    PaintShader {
+        path: assets::resolve(path),
+        uniforms: Vec::new(),
+        outsets: shojiwm_lib::ssd::Edges::default(),
+    }
+}
+
+impl PaintShader {
+    pub fn uniform(mut self, name: &str, value: impl Into<Prop<Uniform>>) -> Self {
+        self.uniforms.push((name.to_owned(), value.into()));
+        self
+    }
+
+    /// Logical pixels drawn around the node on every side (glows, shadows).
+    pub fn outsets(mut self, outset: f64) -> Self {
+        self.outsets = shojiwm_lib::ssd::Edges::all(outset.max(0.0));
+        self
+    }
+
+    pub fn outset_edges(mut self, outsets: shojiwm_lib::ssd::Edges) -> Self {
+        self.outsets = outsets;
+        self
+    }
+
+    pub(crate) fn uniform_props(&self) -> impl Iterator<Item = (&str, &Prop<Uniform>)> {
+        self.uniforms.iter().map(|(name, value)| (name.as_str(), value))
+    }
+
+    pub(crate) fn compile(
+        &self,
+        read: &mut UniformReader<'_>,
+        stage_index: usize,
+    ) -> shojiwm_lib::ssd::PaintShader {
+        shojiwm_lib::ssd::PaintShader {
+            shader: ShaderModule {
+                path: self.path.clone(),
+            },
+            uniforms: self
+                .uniforms
+                .iter()
+                .map(|(name, value)| (name.clone(), read(stage_index, name, value)))
+                .collect(),
+            outsets: self.outsets,
+        }
+    }
+}
+
 /// When the compositor re-runs an effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalidate(EffectInvalidationPolicy);

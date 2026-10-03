@@ -1313,8 +1313,11 @@ impl ShojiRuntimeBridge {
                     window_id,
                     node: tree
                         .try_into()
+                        // `Other` maps to a plain JS `Error` that carries the message;
+                        // `InvalidData` has no registered class and throws a bare
+                        // `undefined` (see the native effect decode below).
                         .map_err(|error: shojiwm_lib::ssd::DecorationBridgeError| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+                            std::io::Error::other(error.to_string())
                         })?,
                 }
             }
@@ -1324,15 +1327,11 @@ impl ShojiRuntimeBridge {
                     .map(|patch| {
                         let node: DecorationNode = patch.node.try_into().map_err(
                             |error: shojiwm_lib::ssd::DecorationBridgeError| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    error.to_string(),
-                                )
+                                std::io::Error::other(error.to_string())
                             },
                         )?;
                         if node.stable_id.as_deref() != Some(patch.node_id.as_str()) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
+                            return Err(std::io::Error::other(
                                 format!(
                                     "composition patch id mismatch: envelope={}, node={:?}",
                                     patch.node_id, node.stable_id

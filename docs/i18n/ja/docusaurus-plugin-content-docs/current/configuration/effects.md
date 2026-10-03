@@ -195,7 +195,7 @@ COMPOSITOR.effect.window = () => ({
 ハンドル）を取ります。
 
 uniform値には数値または2／3／4成分の配列を指定でき、各成分をsignalにできます。
-`tex`、`effect_texture_size_px`、`effect_content_rect_px`、`effect_frame_rect_px`は
+`tex`、`effect_texture_size_phy_px`、`effect_content_rect_phy_px`、`effect_frame_rect_phy_px`（と旧名の`_px`版）は
 コンポジターが使用する予約bindingなので、独自のuniform名やtexture名には使えません。
 
 ```ts
@@ -415,10 +415,16 @@ ShojiWM は `EffectContext` を定義し、値を構築してから関数を呼�
 
 ```glsl
 struct EffectContext {
-    vec2 texture_uv;       // 作業テクスチャ全体の正規化座標
-    vec2 texture_size_px;  // 作業テクスチャ全体の物理ピクセルサイズ
-    vec4 content_rect_px;  // 可視内容の x, y, width, height
-    vec4 frame_rect_px;    // エフェクトが属するウィンドウの矩形
+    vec2 texture_uv;           // 作業テクスチャ全体の正規化座標
+    vec2 texture_size_phy_px;  // 作業テクスチャ全体の物理ピクセルサイズ
+    vec4 content_rect_phy_px;  // 可視内容の x, y, width, height
+    vec4 frame_rect_phy_px;    // エフェクトが属するウィンドウの矩形
+    vec4 frame_radius_phy_px;  // その角丸: 左上・右上・右下・左下
+    vec4 frame_border_phy_px;  // その枠幅: 上・右・下・左
+    vec4 clip_rect_phy_px;     // ShojiWM がエフェクトに掛けるクリップ（テクスチャ内）
+    vec4 clip_radius_phy_px;
+    bool has_clip;
+    float scale;               // 論理1pxあたりの物理ピクセル数
 };
 ```
 
@@ -427,21 +433,58 @@ struct EffectContext {
 | 名前 | 型 | 意味 |
 | --- | --- | --- |
 | `effect.texture_uv` | `vec2` | キャプチャパディングを含むテクスチャ全体の正規化座標 |
-| `effect.texture_size_px` | `vec2` | 作業テクスチャ全体の物理ピクセルサイズ |
-| `effect.content_rect_px` | `vec4` | テクスチャ内の可視内容を `(x, y, width, height)` で表した矩形 |
-| `effect.frame_rect_px` | `vec4` | ウィンドウエフェクトでは、テクスチャ内のウィンドウ自身の矩形（`outsets` を含まない）。テクスチャが別の範囲を覆う場合（`replaceSubsurfaces`）も同じ。それ以外では可視内容の矩形 |
+| `effect.texture_size_phy_px` | `vec2` | 作業テクスチャ全体の物理ピクセルサイズ |
+| `effect.content_rect_phy_px` | `vec4` | テクスチャ内の可視内容を `(x, y, width, height)` で表した矩形 |
+| `effect.frame_rect_phy_px` | `vec4` | ウィンドウエフェクトでは、テクスチャ内のウィンドウ自身の矩形（`outsets` を含まない）。テクスチャが別の範囲を覆う場合（`replaceSubsurfaces`）も同じ。それ以外では可視内容の矩形 |
+| `effect.frame_radius_phy_px` | `vec4` | フレームの角丸（左上・右上・右下・左下） |
+| `effect.frame_border_phy_px` | `vec4` | フレームの枠幅（上・右・下・左） |
+| `effect.clip_rect_phy_px` | `vec4` | ShojiWM がエフェクトに掛ける角丸クリップのテクスチャ内矩形 `(x, y, width, height)`。`has_clip` のときのみ有効 |
+| `effect.clip_radius_phy_px` | `vec4` | そのクリップの角丸 |
+| `effect.has_clip` | `bool` | エフェクトがクリップされているか（ウィンドウの角丸など） |
+| `effect.scale` | `float` | 論理1pxあたりの物理ピクセル数。論理pxの長さに掛ければ、どのスケールでも同じ見た目になります |
 | `tex` | `sampler2D` | このステージの入力。`texture2D(tex, effect.texture_uv)` でサンプリング |
 
-すべての`*_px`値は物理ピクセルです。さらに次のヘルパーを利用できます。
+フレームが何を指すかは、エフェクトの置き場所によって変わります。
+
+| 置き場所 | フレーム（矩形・角丸・枠） | クリップ |
+| --- | --- | --- |
+| `<ShaderEffect/>` | コンポーネント自身（`borderRadius`・枠） | 角丸の祖先（ウィンドウの角など） |
+| ウィンドウのスロット | ウィンドウ（`<WindowBorder>`、無ければルート）。`windowSource({include: 'root-surface'})` では枠の内側のクライアント領域 | なし |
+| レイヤー・ポップアップ・背景 | 覆う範囲。角丸と枠は 0（形はクライアントが自分で描くため） | なし |
+
+すべての`*_phy_px`値は物理ピクセル（論理ピクセル×出力スケール）です。さらに次のヘルパーを利用できます。
 
 | ヘルパー | 結果 |
 | --- | --- |
-| `effect_texture_px(effect)` | 作業テクスチャ全体における現在のフラグメント位置 |
-| `effect_content_px(effect)` | 可視内容の左上を原点とした現在のフラグメント位置 |
+| `effect_texture_phy_px(effect)` | 作業テクスチャ全体における現在のフラグメント位置 |
+| `effect_content_phy_px(effect)` | 可視内容の左上を原点とした現在のフラグメント位置 |
 | `effect_content_uv(effect)` | 可視内容上で`0.0`〜`1.0`、パディング部分では範囲外となる正規化座標 |
-| `effect_texture_uv_from_content_px(effect, px)` | 可視内容基準の物理ピクセルをサンプリング用texture UVへ変換 |
-| `effect_frame_px(effect)` | フレームの左上を原点とした現在のフラグメント位置 |
+| `effect_texture_uv_from_content_phy_px(effect, px)` | 可視内容基準の物理ピクセルをサンプリング用texture UVへ変換 |
+| `effect_frame_phy_px(effect)` | フレームの左上を原点とした現在のフラグメント位置 |
 | `effect_frame_uv(effect)` | フレーム基準の正規化座標。ウィンドウ上で`0.0`〜`1.0`、その外では範囲外 |
+| `effect_frame_sdf(effect)` | フレームの角丸矩形までの符号付き距離（内側が負） |
+| `effect_frame_coverage(effect)` | フレームの角丸矩形のカバレッジ（物理1px幅のアンチエイリアス） |
+| `effect_frame_inner_sdf(effect)` | フレームの枠の内側の縁までの符号付き距離 |
+| `effect_clip_sdf(effect)` / `effect_clip_coverage(effect)` | クリップについて同じもの（クリップが無ければ常に内側） |
+| `shoji_rrect_sdf(p, rect, radius)` / `shoji_coverage(sdf)` | 汎用の角丸矩形の距離とカバレッジ（[ペイントシェーダー](./paint.md#ヘルパー)と同じ） |
+
+例えば、ウィンドウの角に沿った縁のハイライトは次のように書けます。
+
+```glsl
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
+    float d = effect.has_clip ? effect_clip_sdf(effect) : effect_frame_sdf(effect);
+    float rim = 1.0 - smoothstep(0.0, 1.5 * effect.scale, abs(d + 0.75 * effect.scale));
+    return vec4(color.rgb + rim * 0.25, color.a);
+}
+```
+
+:::note[旧名]
+`_phy_px` が付く前は `texture_size_px`・`content_rect_px`・`frame_rect_px`・
+`effect_texture_px`・`effect_content_px`・`effect_texture_uv_from_content_px`・
+`effect_frame_px` という名前でした。旧名も同じ値のまま使えますが、新しいシェーダーでは
+`_phy_px` の名前を使ってください。
+:::
 
 サンプリングにはtexture UV、可視矩形に結び付く形状計算にはcontent座標を使ってください。
 作業テクスチャではキャプチャパディングが可視内容より前に置かれるため、content rectの
@@ -457,9 +500,9 @@ struct EffectContext {
 uniform vec2 displacement_px;
 
 vec4 shader_main(EffectContext effect) {
-    vec2 sample_px = effect_content_px(effect) + displacement_px;
+    vec2 sample_px = effect_content_phy_px(effect) + displacement_px;
     vec2 sample_uv = clamp(
-        effect_texture_uv_from_content_px(effect, sample_px),
+        effect_texture_uv_from_content_phy_px(effect, sample_px),
         vec2(0.0),
         vec2(1.0)
     );

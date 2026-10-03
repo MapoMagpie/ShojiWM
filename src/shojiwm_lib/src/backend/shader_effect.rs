@@ -52,6 +52,50 @@ pub struct CachedShaderEffect {
     pub clip_radius: i32,
     pub clip_rect_precise: Option<PreciseLogicalRect>,
     pub clip_radius_precise: Option<f32>,
+    /// The node's shape for `EffectContext`, in layout pixels.
+    pub node_shape: NodeEffectShape,
+}
+
+/// A decoration node's shape as the layout resolved it (physical pixels at
+/// `layout_scale`), handed to its effect as `EffectContext` frame data.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct NodeEffectShape {
+    pub layout_scale: f64,
+    /// top-left, top-right, bottom-right, bottom-left.
+    pub radius: [i32; 4],
+    /// top, right, bottom, left.
+    pub border: [i32; 4],
+    /// The clip ShojiWM applies, relative to the node's top-left:
+    /// (x, y, width, height) and its corner radii.
+    pub clip: Option<([i32; 4], [i32; 4])>,
+}
+
+impl NodeEffectShape {
+    /// The frame for a working texture at `texture_scale` physical pixels per
+    /// logical pixel, whose frame rect is `rect` (`None` = the content rect).
+    pub fn effect_frame(
+        &self,
+        rect: Option<Rectangle<i32, Buffer>>,
+        texture_scale: f64,
+    ) -> EffectFrame {
+        let texture_scale = texture_scale.abs().max(0.0001);
+        let ratio = if self.layout_scale > 0.0 {
+            (texture_scale / self.layout_scale) as f32
+        } else {
+            1.0
+        };
+        let map = |values: [i32; 4]| values.map(|value| value as f32 * ratio);
+        EffectFrame {
+            rect,
+            radius: map(self.radius),
+            border: map(self.border),
+            clip: self.clip.map(|(rect, radius)| EffectFrameClip {
+                rect: map(rect),
+                radius: map(radius),
+            }),
+            scale: texture_scale as f32,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +150,9 @@ pub struct ShaderEffectSpec {
     pub render_scale: f32,
     pub clip_rect: Option<SnappedLogicalRect>,
     pub clip_radius: f32,
+    /// What the effect belongs to (radius, border, clip, scale), for
+    /// `EffectContext`. Its rect is relative to the working texture.
+    pub frame: EffectFrame,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -161,6 +208,7 @@ pub struct StableBackdropFramebufferElement {
     clip_radius: f32,
     popup_source: Option<GlesTexture>,
     pipeline: Arc<Mutex<EffectInstancePipelineCache>>,
+    frame: EffectFrame,
     kind: Kind,
 }
 
@@ -851,6 +899,7 @@ pub fn framebuffer_backdrop_element_for_output_rects_with_popup_source(
             render_scale: scale.x as f32,
             clip_rect: None,
             clip_radius: 0.0,
+            frame: EffectFrame::plain(None, scale.x),
         },
     )?;
     element.popup_source = popup_source;
@@ -1364,6 +1413,11 @@ struct MultiTextureStageProgram {
     uniform_texture_size: ffi::types::GLint,
     uniform_content_rect: ffi::types::GLint,
     uniform_frame_rect: ffi::types::GLint,
+    /// `effect_frame_radius_phy_px`, `effect_frame_border_phy_px`,
+    /// `effect_clip_rect_phy_px`, `effect_clip_radius_phy_px`.
+    uniform_frame_shape: [ffi::types::GLint; 4],
+    uniform_has_clip: ffi::types::GLint,
+    uniform_scale: ffi::types::GLint,
     texture_uniforms: Vec<(String, ffi::types::GLint)>,
     value_uniforms: Vec<(String, ffi::types::GLint)>,
     attrib_vert: ffi::types::GLint,
@@ -1419,11 +1473,112 @@ struct EffectExecutionContext {
     size: (i32, i32),
     state_base_size: (i32, i32),
     content_rect: Rectangle<i32, Buffer>,
-    /// The frame the effect belongs to (a window's own rect) in the working texture; the
-    /// content rect unless the caller knows better.
-    frame_rect: Rectangle<i32, Buffer>,
+    /// The frame the effect belongs to (a window's own rect, a decoration
+    /// node) in the working texture, with its shape.
+    frame: ResolvedEffectFrame,
     named: HashMap<String, GlesTexture>,
     source_signatures: EffectSourceSignatures,
+}
+
+/// What an effect belongs to, as the caller knows it: exposed to shaders as
+/// `effect.frame_*_phy_px`, `effect.clip_*_phy_px` and `effect.scale`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectFrame {
+    /// The frame in the working texture; `None` means the content rect.
+    pub rect: Option<Rectangle<i32, Buffer>>,
+    /// Corner radii (top-left, top-right, bottom-right, bottom-left), texture pixels.
+    pub radius: [f32; 4],
+    /// Border widths (top, right, bottom, left), texture pixels.
+    pub border: [f32; 4],
+    /// The clip ShojiWM applies to the effect, relative to the frame's
+    /// top-left, texture pixels.
+    pub clip: Option<EffectFrameClip>,
+    /// Texture (physical) pixels per logical pixel.
+    pub scale: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectFrameClip {
+    pub rect: [f32; 4],
+    pub radius: [f32; 4],
+}
+
+impl EffectFrame {
+    /// A frame known only by its rect (or the content rect), at `scale`.
+    pub fn plain(rect: Option<Rectangle<i32, Buffer>>, scale: f64) -> Self {
+        Self {
+            rect,
+            radius: [0.0; 4],
+            border: [0.0; 4],
+            clip: None,
+            scale: scale.abs().max(0.0001) as f32,
+        }
+    }
+}
+
+impl Default for EffectFrame {
+    fn default() -> Self {
+        Self::plain(None, 1.0)
+    }
+}
+
+/// `EffectFrame` resolved against the working texture of one pipeline run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ResolvedEffectFrame {
+    rect: Rectangle<i32, Buffer>,
+    radius: [f32; 4],
+    border: [f32; 4],
+    /// In working-texture coordinates.
+    clip: Option<EffectFrameClip>,
+    scale: f32,
+}
+
+impl ResolvedEffectFrame {
+    fn new(frame: EffectFrame, content_rect: Rectangle<i32, Buffer>) -> Self {
+        let rect = frame.rect.unwrap_or(content_rect);
+        Self {
+            rect,
+            radius: frame.radius,
+            border: frame.border,
+            clip: frame.clip.map(|clip| EffectFrameClip {
+                rect: [
+                    clip.rect[0] + rect.loc.x as f32,
+                    clip.rect[1] + rect.loc.y as f32,
+                    clip.rect[2],
+                    clip.rect[3],
+                ],
+                radius: clip.radius,
+            }),
+            scale: frame.scale,
+        }
+    }
+
+    /// The same frame in a texture resized from `from` to `to`.
+    fn scaled(self, from: (i32, i32), to: (i32, i32)) -> Self {
+        let sx = to.0 as f32 / from.0.max(1) as f32;
+        let sy = to.1 as f32 / from.1.max(1) as f32;
+        let s = sx.min(sy);
+        Self {
+            rect: scale_effect_rect(self.rect, from, to),
+            radius: self.radius.map(|value| value * s),
+            border: [
+                self.border[0] * sy,
+                self.border[1] * sx,
+                self.border[2] * sy,
+                self.border[3] * sx,
+            ],
+            clip: self.clip.map(|clip| EffectFrameClip {
+                rect: [
+                    clip.rect[0] * sx,
+                    clip.rect[1] * sy,
+                    clip.rect[2] * sx,
+                    clip.rect[3] * sy,
+                ],
+                radius: clip.radius.map(|value| value * s),
+            }),
+            scale: self.scale * s,
+        }
+    }
 }
 
 /// Content signatures of the subject sources the current pipeline run can sample, as computed
@@ -1591,6 +1746,7 @@ impl ShaderEffectElementState {
             clip_radius: spec.clip_radius,
             popup_source: None,
             pipeline: self.backdrop_pipeline.clone(),
+            frame: spec.frame,
             kind: Kind::Unspecified,
         })
     }
@@ -2060,6 +2216,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 sample_src,
                 Some((dst.size.w, dst.size.h)),
                 &self.shader,
+                self.frame,
                 pipeline,
                 BackdropFinishMode::DeferToDisplay,
             )
@@ -2072,6 +2229,7 @@ impl RenderElement<GlesRenderer> for StableBackdropFramebufferElement {
                 sample_src,
                 Some((dst.size.w, dst.size.h)),
                 &self.shader,
+                self.frame,
                 pipeline,
                 BackdropFinishMode::DeferToDisplay,
             )
@@ -2341,7 +2499,7 @@ impl StableBackdropTextureElement {
     }
 }
 
-fn shader_uniform_type(
+pub(crate) fn shader_uniform_type(
     value: &ShaderUniformValue,
 ) -> smithay::backend::renderer::gles::UniformType {
     match value {
@@ -2360,7 +2518,7 @@ fn shader_uniform_type(
     }
 }
 
-fn append_shader_uniform_names(
+pub(crate) fn append_shader_uniform_names(
     uniforms: &mut Vec<UniformName>,
     name: &str,
     value: &ShaderUniformValue,
@@ -2381,7 +2539,7 @@ fn append_shader_uniform_names(
     }
 }
 
-fn append_shader_uniform_values(
+pub(crate) fn append_shader_uniform_values(
     uniforms: &mut Vec<Uniform<'static>>,
     name: &str,
     value: &ShaderUniformValue,
@@ -2555,7 +2713,7 @@ fn shader_file_stamp(path: &str) -> ShaderFileStamp {
 /// True when the program cached under `cache_key` should be dropped and the shader built again:
 /// it is a stand-in and the shader file has changed since it failed, or it was built from a
 /// shader file that has changed since (checked once per config reload).
-fn cached_shader_is_outdated(cache_key: &str, path: &str) -> bool {
+pub(crate) fn cached_shader_is_outdated(cache_key: &str, path: &str) -> bool {
     let unverified = BUILT_SHADERS.with(|built| {
         built
             .borrow()
@@ -2655,7 +2813,7 @@ fn shader_compile_log(
 /// Builds the program for the shader at `path`; on any failure reports it and builds the
 /// stand-in from `fallback_source` instead. `compile` receives the user-level source (it does
 /// the wrapping itself); `wrap` is the same wrapping, used only to fetch a readable compile log.
-fn compile_shader_or_fallback<P>(
+pub(crate) fn compile_shader_or_fallback<P>(
     renderer: &mut GlesRenderer,
     cache_key: &str,
     path: &str,
@@ -2776,6 +2934,7 @@ fn compile_shader_program(
             smithay::backend::renderer::gles::UniformType::_4f,
         ),
     ];
+    uniform_names.extend(effect_context_uniform_names());
     for (name, value) in &shader_module.uniforms {
         append_shader_uniform_names(&mut uniform_names, name, value);
     }
@@ -2951,24 +3110,14 @@ fn compile_noise_salt_program(
     {
         let program = renderer.compile_custom_texture_shader(
             wrap_texture_stage_source(include_str!("noise_salt.frag")),
-            &[
-                UniformName::new(
-                    "effect_texture_size_px",
-                    smithay::backend::renderer::gles::UniformType::_2f,
-                ),
-                UniformName::new(
-                    "effect_content_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-                UniformName::new(
-                    "effect_frame_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-                UniformName::new(
+            &{
+                let mut names = effect_context_uniform_names();
+                names.push(UniformName::new(
                     "noise_amount",
                     smithay::backend::renderer::gles::UniformType::_1f,
-                ),
-            ],
+                ));
+                names
+            },
         )?;
         renderer
             .egl_context()
@@ -3004,20 +3153,7 @@ vec4 shader_main(EffectContext effect) {
 }
 "#,
             ),
-            &[
-                UniformName::new(
-                    "effect_texture_size_px",
-                    smithay::backend::renderer::gles::UniformType::_2f,
-                ),
-                UniformName::new(
-                    "effect_content_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-                UniformName::new(
-                    "effect_frame_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-            ],
+            &effect_context_uniform_names(),
         )?;
         renderer
             .egl_context()
@@ -3054,20 +3190,7 @@ vec4 shader_main(EffectContext effect) {
 }
 "#,
             ),
-            &[
-                UniformName::new(
-                    "effect_texture_size_px",
-                    smithay::backend::renderer::gles::UniformType::_2f,
-                ),
-                UniformName::new(
-                    "effect_content_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-                UniformName::new(
-                    "effect_frame_rect_px",
-                    smithay::backend::renderer::gles::UniformType::_4f,
-                ),
-            ],
+            &effect_context_uniform_names(),
         )?;
         renderer
             .egl_context()
@@ -3168,9 +3291,9 @@ fn wrap_multi_texture_stage_source(source: &str) -> String {
 precision highp float;
 
 uniform sampler2D tex;
-uniform vec2 effect_texture_size_px;
-uniform vec4 effect_content_rect_px;
-uniform vec4 effect_frame_rect_px;
+uniform vec2 effect_texture_size_phy_px;
+uniform vec4 effect_content_rect_phy_px;
+uniform vec4 effect_frame_rect_phy_px;
 
 varying vec2 v_coords;
 
@@ -3181,9 +3304,9 @@ varying vec2 v_coords;
 void main() {{
     EffectContext effect = make_effect_context(
         v_coords,
-        effect_texture_size_px,
-        effect_content_rect_px,
-        effect_frame_rect_px
+        effect_texture_size_phy_px,
+        effect_content_rect_phy_px,
+        effect_frame_rect_phy_px
     );
     gl_FragColor = shader_main(effect);
 }}
@@ -3280,9 +3403,17 @@ fn multi_texture_stage_program(
         Ok::<_, GlesError>(Arc::new(MultiTextureStageProgram {
             program,
             uniform_tex: location("tex"),
-            uniform_texture_size: location("effect_texture_size_px"),
-            uniform_content_rect: location("effect_content_rect_px"),
-            uniform_frame_rect: location("effect_frame_rect_px"),
+            uniform_texture_size: location("effect_texture_size_phy_px"),
+            uniform_content_rect: location("effect_content_rect_phy_px"),
+            uniform_frame_rect: location("effect_frame_rect_phy_px"),
+            uniform_frame_shape: [
+                location("effect_frame_radius_phy_px"),
+                location("effect_frame_border_phy_px"),
+                location("effect_clip_rect_phy_px"),
+                location("effect_clip_radius_phy_px"),
+            ],
+            uniform_has_clip: location("effect_has_clip"),
+            uniform_scale: location("effect_scale"),
             texture_uniforms: stage
                 .textures
                 .keys()
@@ -3415,20 +3546,7 @@ fn compile_texture_program(
             ),
         ]
     } else {
-        vec![
-            UniformName::new(
-                "effect_texture_size_px",
-                smithay::backend::renderer::gles::UniformType::_2f,
-            ),
-            UniformName::new(
-                "effect_content_rect_px",
-                smithay::backend::renderer::gles::UniformType::_4f,
-            ),
-            UniformName::new(
-                "effect_frame_rect_px",
-                smithay::backend::renderer::gles::UniformType::_4f,
-            ),
-        ]
+        effect_context_uniform_names()
     };
     if let Some(uniforms) = uniforms {
         for (name, value) in uniforms {
@@ -3674,8 +3792,27 @@ void main() {{
 
 fn effect_context_shader_prelude() -> &'static str {
     r#"
+// The shape of what the effect belongs to. Programs that do not know it
+// leave these at zero (no radius, border or clip; scale 1).
+uniform vec4 effect_frame_radius_phy_px;
+uniform vec4 effect_frame_border_phy_px;
+uniform vec4 effect_clip_rect_phy_px;
+uniform vec4 effect_clip_radius_phy_px;
+uniform float effect_has_clip;
+uniform float effect_scale;
+
 struct EffectContext {
     vec2 texture_uv;
+    vec2 texture_size_phy_px;
+    vec4 content_rect_phy_px;
+    vec4 frame_rect_phy_px;
+    vec4 frame_radius_phy_px;   // top-left, top-right, bottom-right, bottom-left
+    vec4 frame_border_phy_px;   // top, right, bottom, left
+    vec4 clip_rect_phy_px;      // in the texture, like frame_rect_phy_px
+    vec4 clip_radius_phy_px;
+    bool has_clip;
+    float scale;                // physical pixels per logical pixel
+    // Former names of the size/rect fields above (same values).
     vec2 texture_size_px;
     vec4 content_rect_px;
     vec4 frame_rect_px;
@@ -3683,36 +3820,128 @@ struct EffectContext {
 
 EffectContext make_effect_context(
     vec2 texture_uv,
-    vec2 texture_size_px,
-    vec4 content_rect_px,
-    vec4 frame_rect_px
+    vec2 texture_size_phy_px,
+    vec4 content_rect_phy_px,
+    vec4 frame_rect_phy_px
 ) {
-    return EffectContext(texture_uv, texture_size_px, content_rect_px, frame_rect_px);
+    return EffectContext(
+        texture_uv,
+        texture_size_phy_px,
+        content_rect_phy_px,
+        frame_rect_phy_px,
+        effect_frame_radius_phy_px,
+        effect_frame_border_phy_px,
+        effect_clip_rect_phy_px,
+        effect_clip_radius_phy_px,
+        effect_has_clip > 0.5,
+        effect_scale > 0.0 ? effect_scale : 1.0,
+        texture_size_phy_px,
+        content_rect_phy_px,
+        frame_rect_phy_px
+    );
 }
 
-vec2 effect_texture_px(EffectContext effect) {
-    return effect.texture_uv * effect.texture_size_px;
+// Signed distance to a rounded rect (negative inside). `rect` is
+// (x, y, width, height); `radius` is top-left, top-right, bottom-right,
+// bottom-left.
+float shoji_rrect_sdf(vec2 p, vec4 rect, vec4 radius) {
+    vec2 half_size = rect.zw * 0.5;
+    vec2 q = p - rect.xy - half_size;
+    float r;
+    if (q.x >= 0.0) {
+        r = q.y >= 0.0 ? radius.z : radius.y;
+    } else {
+        r = q.y >= 0.0 ? radius.w : radius.x;
+    }
+    r = min(r, min(half_size.x, half_size.y));
+    vec2 d = abs(q) - (half_size - vec2(r));
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0)) - r;
 }
 
-vec2 effect_content_px(EffectContext effect) {
-    return effect_texture_px(effect) - effect.content_rect_px.xy;
+// Pixel coverage of a signed distance, antialiased over one physical pixel.
+float shoji_coverage(float sdf) {
+    return clamp(0.5 - sdf, 0.0, 1.0);
+}
+
+vec2 effect_texture_phy_px(EffectContext effect) {
+    return effect.texture_uv * effect.texture_size_phy_px;
+}
+
+vec2 effect_content_phy_px(EffectContext effect) {
+    return effect_texture_phy_px(effect) - effect.content_rect_phy_px.xy;
 }
 
 vec2 effect_content_uv(EffectContext effect) {
-    return effect_content_px(effect) / max(effect.content_rect_px.zw, vec2(1.0));
+    return effect_content_phy_px(effect) / max(effect.content_rect_phy_px.zw, vec2(1.0));
 }
 
-vec2 effect_texture_uv_from_content_px(EffectContext effect, vec2 content_px) {
-    return (effect.content_rect_px.xy + content_px) /
-        max(effect.texture_size_px, vec2(1.0));
+vec2 effect_texture_uv_from_content_phy_px(EffectContext effect, vec2 content_phy_px) {
+    return (effect.content_rect_phy_px.xy + content_phy_px) /
+        max(effect.texture_size_phy_px, vec2(1.0));
 }
 
-vec2 effect_frame_px(EffectContext effect) {
-    return effect_texture_px(effect) - effect.frame_rect_px.xy;
+vec2 effect_frame_phy_px(EffectContext effect) {
+    return effect_texture_phy_px(effect) - effect.frame_rect_phy_px.xy;
 }
 
 vec2 effect_frame_uv(EffectContext effect) {
-    return effect_frame_px(effect) / max(effect.frame_rect_px.zw, vec2(1.0));
+    return effect_frame_phy_px(effect) / max(effect.frame_rect_phy_px.zw, vec2(1.0));
+}
+
+// Signed distance to the frame's rounded rect (negative inside).
+float effect_frame_sdf(EffectContext effect) {
+    return shoji_rrect_sdf(
+        effect_texture_phy_px(effect),
+        effect.frame_rect_phy_px,
+        effect.frame_radius_phy_px
+    );
+}
+
+float effect_frame_coverage(EffectContext effect) {
+    return shoji_coverage(effect_frame_sdf(effect));
+}
+
+// Signed distance to the inner edge of the frame's border.
+float effect_frame_inner_sdf(EffectContext effect) {
+    vec4 b = effect.frame_border_phy_px;
+    vec4 r = effect.frame_radius_phy_px;
+    vec4 rect = effect.frame_rect_phy_px;
+    vec4 inner = vec4(rect.xy + vec2(b.w, b.x), max(rect.zw - vec2(b.y + b.w, b.x + b.z), vec2(0.0)));
+    vec4 inner_radius = max(r - vec4(max(b.x, b.w), max(b.x, b.y), max(b.z, b.y), max(b.z, b.w)), vec4(0.0));
+    return shoji_rrect_sdf(effect_texture_phy_px(effect), inner, inner_radius);
+}
+
+// Signed distance to the clip ShojiWM applies (very negative without one).
+float effect_clip_sdf(EffectContext effect) {
+    if (!effect.has_clip) {
+        return -1.0e6;
+    }
+    return shoji_rrect_sdf(
+        effect_texture_phy_px(effect),
+        effect.clip_rect_phy_px,
+        effect.clip_radius_phy_px
+    );
+}
+
+float effect_clip_coverage(EffectContext effect) {
+    return shoji_coverage(effect_clip_sdf(effect));
+}
+
+// Former helper names.
+vec2 effect_texture_px(EffectContext effect) {
+    return effect_texture_phy_px(effect);
+}
+
+vec2 effect_content_px(EffectContext effect) {
+    return effect_content_phy_px(effect);
+}
+
+vec2 effect_texture_uv_from_content_px(EffectContext effect, vec2 content_px) {
+    return effect_texture_uv_from_content_phy_px(effect, content_px);
+}
+
+vec2 effect_frame_px(EffectContext effect) {
+    return effect_frame_phy_px(effect);
 }
 "#
 }
@@ -3736,9 +3965,9 @@ uniform samplerExternalOES tex;
 uniform sampler2D tex;
 #endif
 
-uniform vec2 effect_texture_size_px;
-uniform vec4 effect_content_rect_px;
-uniform vec4 effect_frame_rect_px;
+uniform vec2 effect_texture_size_phy_px;
+uniform vec4 effect_content_rect_phy_px;
+uniform vec4 effect_frame_rect_phy_px;
 
 varying vec2 v_coords;
 
@@ -3749,9 +3978,9 @@ varying vec2 v_coords;
 void main() {{
     EffectContext effect = make_effect_context(
         v_coords,
-        effect_texture_size_px,
-        effect_content_rect_px,
-        effect_frame_rect_px
+        effect_texture_size_phy_px,
+        effect_content_rect_phy_px,
+        effect_frame_rect_phy_px
     );
     gl_FragColor = shader_main(effect);
 }}
@@ -3782,6 +4011,25 @@ fn uniforms_for_spec(spec: &ShaderEffectSpec) -> Vec<Uniform<'static>> {
             [clip_radius, clip_radius, clip_radius, clip_radius],
         ),
     ];
+    // The pixel path works in the element's own coordinate space (its area),
+    // so the frame is the whole area and pixel lengths shrink by the render
+    // scale.
+    let to_area = 1.0 / spec.render_scale.max(0.0001);
+    let area = Rectangle::<i32, Buffer>::from_size((spec.rect.size.w, spec.rect.size.h).into());
+    uniforms.extend(effect_context_uniforms(
+        (spec.rect.size.w, spec.rect.size.h),
+        area,
+        ResolvedEffectFrame {
+            rect: area,
+            radius: spec.frame.radius.map(|value| value * to_area),
+            border: spec.frame.border.map(|value| value * to_area),
+            clip: spec.frame.clip.map(|clip| EffectFrameClip {
+                rect: clip.rect.map(|value| value * to_area),
+                radius: clip.radius.map(|value| value * to_area),
+            }),
+            scale: spec.frame.scale * to_area,
+        },
+    ));
     if let Some(stage) = spec.shader.last_shader_stage() {
         uniforms.extend(uniforms_for_shader_stage(stage));
     }
@@ -3962,6 +4210,7 @@ pub fn apply_effect_pipeline(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
 ) -> Result<GlesTexture, ShaderEffectError> {
     apply_effect_pipeline_with_cache(
         renderer,
@@ -3971,6 +4220,7 @@ pub fn apply_effect_pipeline(
         sample_region,
         output_size,
         effect,
+        frame,
         None,
         BackdropFinishMode::Materialize,
     )
@@ -3985,6 +4235,7 @@ pub fn apply_effect_pipeline_cached_for_key(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
 ) -> Result<GlesTexture, ShaderEffectError> {
     SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
@@ -3997,6 +4248,7 @@ pub fn apply_effect_pipeline_cached_for_key(
             sample_region,
             output_size,
             effect,
+            frame,
             cache,
         )
     })
@@ -4010,6 +4262,7 @@ fn apply_effect_pipeline_cached(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
     cache: &mut EffectPipelineCache,
 ) -> Result<GlesTexture, ShaderEffectError> {
     apply_effect_pipeline_cached_with_finish_mode(
@@ -4020,6 +4273,7 @@ fn apply_effect_pipeline_cached(
         sample_region,
         output_size,
         effect,
+        frame,
         cache,
         BackdropFinishMode::Materialize,
     )
@@ -4033,6 +4287,7 @@ fn apply_effect_pipeline_cached_with_finish_mode(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
     cache: &mut EffectPipelineCache,
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -4044,6 +4299,7 @@ fn apply_effect_pipeline_cached_with_finish_mode(
         sample_region,
         output_size,
         effect,
+        frame,
         Some(cache),
         finish_mode,
     )
@@ -4057,6 +4313,7 @@ fn apply_effect_pipeline_with_cache(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
     cache: Option<&mut EffectPipelineCache>,
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -4070,7 +4327,7 @@ fn apply_effect_pipeline_with_cache(
         size,
         state_base_size: size,
         content_rect,
-        frame_rect: content_rect,
+        frame: ResolvedEffectFrame::new(frame, content_rect),
         named: HashMap::new(),
         source_signatures: EffectSourceSignatures::default(),
     };
@@ -4102,9 +4359,9 @@ pub fn apply_effect_pipeline_cached_for_key_with_captured_subject(
     size: (i32, i32),
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
-    // The frame (e.g. the whole window) in the working texture; `None` = the content rect.
-    frame_rect: Option<Rectangle<i32, Buffer>>,
     effect: &CompiledEffect,
+    // The frame (e.g. the whole window) and its shape.
+    frame: EffectFrame,
 ) -> Result<GlesTexture, ShaderEffectError> {
     SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
@@ -4119,7 +4376,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_captured_subject(
             size,
             state_base_size: size,
             content_rect,
-            frame_rect: frame_rect.unwrap_or(content_rect),
+            frame: ResolvedEffectFrame::new(frame, content_rect),
             named: HashMap::new(),
             // The captured subject feeds every subject alias, so its signature does too.
             source_signatures: EffectSourceSignatures {
@@ -4154,6 +4411,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_layer_source(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
 ) -> Result<GlesTexture, ShaderEffectError> {
     SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
@@ -4166,7 +4424,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_layer_source(
             size,
             state_base_size: size,
             content_rect: effect_content_rect(size, sample_region),
-            frame_rect: effect_content_rect(size, sample_region),
+            frame: ResolvedEffectFrame::new(frame, effect_content_rect(size, sample_region)),
             named: HashMap::new(),
             source_signatures: EffectSourceSignatures {
                 layer: layer_source_signature,
@@ -4195,6 +4453,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_popup_source(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
 ) -> Result<GlesTexture, ShaderEffectError> {
     SHARED_EFFECT_PIPELINE_CACHES.with(|caches| {
         let mut caches = caches.borrow_mut();
@@ -4208,6 +4467,7 @@ pub fn apply_effect_pipeline_cached_for_key_with_popup_source(
             sample_region,
             output_size,
             effect,
+            frame,
             cache,
             BackdropFinishMode::Materialize,
         )
@@ -4223,6 +4483,7 @@ fn apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
     sample_region: Option<Rectangle<f64, Buffer>>,
     output_size: Option<(i32, i32)>,
     effect: &CompiledEffect,
+    frame: EffectFrame,
     cache: &mut EffectPipelineCache,
     finish_mode: BackdropFinishMode,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -4234,7 +4495,7 @@ fn apply_effect_pipeline_cached_with_popup_source_and_finish_mode(
         size,
         state_base_size: size,
         content_rect: effect_content_rect(size, sample_region),
-        frame_rect: effect_content_rect(size, sample_region),
+        frame: ResolvedEffectFrame::new(frame, effect_content_rect(size, sample_region)),
         named: HashMap::new(),
         source_signatures: EffectSourceSignatures::default(),
     };
@@ -4710,7 +4971,7 @@ fn run_effect_pipeline_inner(
                 current,
                 current_size,
                 ctx.content_rect,
-                ctx.frame_rect,
+                ctx.frame,
                 noise.clone(),
                 cache.as_deref_mut(),
             )?,
@@ -4796,8 +5057,8 @@ fn run_effect_pipeline_inner(
                     .replace(target_format);
                 let previous_size = ctx.size;
                 let previous_content_rect = ctx.content_rect;
-                let previous_frame_rect = ctx.frame_rect;
-                ctx.frame_rect = scale_effect_rect(ctx.frame_rect, ctx.size, state_size);
+                let previous_frame = ctx.frame;
+                ctx.frame = ctx.frame.scaled(ctx.size, state_size);
                 ctx.size = state_size;
                 ctx.content_rect = Rectangle::from_size(state_size.into());
                 let rendered = run_effect_pipeline(
@@ -4815,7 +5076,7 @@ fn run_effect_pipeline_inner(
                     .target_format = previous_target_format;
                 ctx.size = previous_size;
                 ctx.content_rect = previous_content_rect;
-                ctx.frame_rect = previous_frame_rect;
+                ctx.frame = previous_frame;
                 let rendered = rendered?;
                 let state_cache = cache
                     .as_deref_mut()
@@ -4863,7 +5124,7 @@ fn run_effect_pipeline_inner(
                 effect_context_uniforms(
                     current_size,
                     effect_content_rect(current_size, Some(region)),
-                    ctx.frame_rect,
+                    ctx.frame,
                 ),
                 cache.as_deref_mut(),
                 "effect-crop-finish",
@@ -4874,7 +5135,7 @@ fn run_effect_pipeline_inner(
                 current,
                 current_size,
                 program,
-                effect_context_uniforms(current_size, ctx.content_rect, ctx.frame_rect),
+                effect_context_uniforms(current_size, ctx.content_rect, ctx.frame),
                 cache,
                 "effect-finish",
             )?;
@@ -4927,7 +5188,7 @@ fn resolve_effect_input(
             apply_texture_shader_stage(renderer, texture, requested_size, stage, ctx, cache)
         }
         EffectInput::Shader(stage) => {
-            apply_shader_input_stage(renderer, requested_size, stage, cache)
+            apply_shader_input_stage(renderer, requested_size, stage, ctx.frame, cache)
         }
         EffectInput::Named(name) => ctx
             .named
@@ -4982,7 +5243,7 @@ fn effect_content_rect(
 fn effect_context_uniforms(
     size: (i32, i32),
     content_rect: Rectangle<i32, Buffer>,
-    frame_rect: Rectangle<i32, Buffer>,
+    frame: ResolvedEffectFrame,
 ) -> Vec<Uniform<'static>> {
     let rect_uniform = |rect: Rectangle<i32, Buffer>| {
         [
@@ -4992,11 +5253,40 @@ fn effect_context_uniforms(
             rect.size.h as f32,
         ]
     };
+    let clip = frame.clip.unwrap_or(EffectFrameClip {
+        rect: [0.0; 4],
+        radius: [0.0; 4],
+    });
     vec![
-        Uniform::new("effect_texture_size_px", [size.0 as f32, size.1 as f32]),
-        Uniform::new("effect_content_rect_px", rect_uniform(content_rect)),
-        Uniform::new("effect_frame_rect_px", rect_uniform(frame_rect)),
+        Uniform::new("effect_texture_size_phy_px", [size.0 as f32, size.1 as f32]),
+        Uniform::new("effect_content_rect_phy_px", rect_uniform(content_rect)),
+        Uniform::new("effect_frame_rect_phy_px", rect_uniform(frame.rect)),
+        Uniform::new("effect_frame_radius_phy_px", frame.radius),
+        Uniform::new("effect_frame_border_phy_px", frame.border),
+        Uniform::new("effect_clip_rect_phy_px", clip.rect),
+        Uniform::new("effect_clip_radius_phy_px", clip.radius),
+        Uniform::new("effect_has_clip", if frame.clip.is_some() { 1.0f32 } else { 0.0 }),
+        Uniform::new("effect_scale", frame.scale),
     ]
+}
+
+/// The uniforms `effect_context_uniforms` sets, for program compilation.
+fn effect_context_uniform_names() -> Vec<UniformName<'static>> {
+    use smithay::backend::renderer::gles::UniformType;
+    [
+        ("effect_texture_size_phy_px", UniformType::_2f),
+        ("effect_content_rect_phy_px", UniformType::_4f),
+        ("effect_frame_rect_phy_px", UniformType::_4f),
+        ("effect_frame_radius_phy_px", UniformType::_4f),
+        ("effect_frame_border_phy_px", UniformType::_4f),
+        ("effect_clip_rect_phy_px", UniformType::_4f),
+        ("effect_clip_radius_phy_px", UniformType::_4f),
+        ("effect_has_clip", UniformType::_1f),
+        ("effect_scale", UniformType::_1f),
+    ]
+    .into_iter()
+    .map(|(name, ty)| UniformName::new(name, ty))
+    .collect()
 }
 
 /// Renders framebuffer-orientation `source` pixels into `target` in
@@ -5121,13 +5411,13 @@ fn apply_texture_shader_stage(
             textures,
             size,
             ctx.content_rect,
-            ctx.frame_rect,
+            ctx.frame,
             stage,
             cache,
         );
     }
     let program = compile_texture_stage_program(renderer, stage)?;
-    let mut uniforms = effect_context_uniforms(size, ctx.content_rect, ctx.frame_rect);
+    let mut uniforms = effect_context_uniforms(size, ctx.content_rect, ctx.frame);
     for (name, value) in &stage.uniforms {
         append_shader_uniform_values(&mut uniforms, name, value);
     }
@@ -5148,10 +5438,15 @@ fn apply_multi_texture_shader_stage(
     textures: Vec<(String, GlesTexture)>,
     size: (i32, i32),
     content_rect: Rectangle<i32, Buffer>,
-    frame_rect: Rectangle<i32, Buffer>,
+    frame: ResolvedEffectFrame,
     stage: &ShaderStage,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
+    let frame_rect = frame.rect;
+    let clip = frame.clip.unwrap_or(EffectFrameClip {
+        rect: [0.0; 4],
+        radius: [0.0; 4],
+    });
     let program = multi_texture_stage_program(renderer, stage)?;
     if program.renderer_context_id != renderer.context_id() {
         return Err(ShaderEffectError::RendererContextMismatch);
@@ -5190,6 +5485,18 @@ fn apply_multi_texture_shader_stage(
                 frame_rect.size.w as f32,
                 frame_rect.size.h as f32,
             );
+            for (location, value) in program
+                .uniform_frame_shape
+                .iter()
+                .zip([frame.radius, frame.border, clip.rect, clip.radius])
+            {
+                gl.Uniform4f(*location, value[0], value[1], value[2], value[3]);
+            }
+            gl.Uniform1f(
+                program.uniform_has_clip,
+                if frame.clip.is_some() { 1.0 } else { 0.0 },
+            );
+            gl.Uniform1f(program.uniform_scale, frame.scale);
 
             for (index, ((_, location), (_, texture))) in program
                 .texture_uniforms
@@ -5269,6 +5576,7 @@ fn apply_shader_input_stage(
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     stage: &ShaderStage,
+    frame: ResolvedEffectFrame,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
     timescope::scope!("effect shader input stage");
@@ -5289,6 +5597,15 @@ fn apply_shader_input_stage(
         render_scale: 1.0,
         clip_rect: None,
         clip_radius: 0.0,
+        // The input shader draws the whole working texture, which is the
+        // pixel path's frame; carry the shape over.
+        frame: EffectFrame {
+            rect: None,
+            radius: frame.radius,
+            border: frame.border,
+            clip: frame.clip,
+            scale: frame.scale,
+        },
     };
     let mut state = ShaderEffectElementState::default();
     let element = state.element(renderer, spec)?;
@@ -5317,7 +5634,7 @@ fn apply_noise_stage(
     texture: GlesTexture,
     size: (i32, i32),
     content_rect: Rectangle<i32, Buffer>,
-    frame_rect: Rectangle<i32, Buffer>,
+    frame: ResolvedEffectFrame,
     noise: NoiseStage,
     cache: Option<&mut EffectPipelineCache>,
 ) -> Result<GlesTexture, ShaderEffectError> {
@@ -5330,7 +5647,7 @@ fn apply_noise_stage(
                 size,
                 program,
                 {
-                    let mut uniforms = effect_context_uniforms(size, content_rect, frame_rect);
+                    let mut uniforms = effect_context_uniforms(size, content_rect, frame);
                     uniforms.push(Uniform::new("noise_amount", noise.amount));
                     uniforms
                 },
@@ -6139,6 +6456,9 @@ mod multi_texture_program_tests {
             uniform_texture_size: -1,
             uniform_content_rect: -1,
             uniform_frame_rect: -1,
+            uniform_frame_shape: [-1; 4],
+            uniform_has_clip: -1,
+            uniform_scale: -1,
             texture_uniforms: Vec::new(),
             value_uniforms: Vec::new(),
             attrib_vert: -1,
@@ -6449,8 +6769,8 @@ mod frame_rect_tests {
             size,
             None,
             Some(size),
-            Some(frame),
             &effect,
+            EffectFrame::plain(Some(frame), 1.0),
         );
         let _ = std::fs::remove_file(&shader_path);
         let texture = texture.unwrap();
@@ -6474,5 +6794,171 @@ mod frame_rect_tests {
         assert!(close(u, 0.0), "left of the frame: {u}");
         let (u, _) = pixel(90, 20);
         assert!(close(u, 1.0), "right of the frame: {u}");
+    }
+
+    /// The `*_phy_px` names and their former `*_px` aliases carry the same values.
+    #[test]
+    fn effect_context_keeps_the_former_px_names() {
+        let Some(mut renderer) = try_renderer() else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let shader_path = std::env::temp_dir().join(format!(
+            "shojiwm-phy-px-alias-test-{}.frag",
+            std::process::id()
+        ));
+        std::fs::write(
+            &shader_path,
+            "vec4 shader_main(EffectContext effect) {\n\
+             \x20   return vec4(\n\
+             \x20       effect.frame_rect_phy_px.z / 255.0,\n\
+             \x20       effect.frame_rect_px.z / 255.0,\n\
+             \x20       (effect_frame_phy_px(effect).x - effect_frame_px(effect).x) + 0.5,\n\
+             \x20       1.0);\n\
+             }\n",
+        )
+        .unwrap();
+        let effect = CompiledEffect {
+            input: EffectInput::WindowSource(WindowSourceInclude::Full),
+            capture_padding: 0,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Shader(ShaderStage {
+                shader: ShaderModule {
+                    path: shader_path.to_string_lossy().into_owned(),
+                },
+                uniforms: Default::default(),
+                textures: Default::default(),
+            })],
+            alpha: EffectAlphaMode::Preserve,
+        };
+        let size = (100, 50);
+        let subject: GlesTexture = renderer
+            .create_buffer(Fourcc::Abgr8888, size.into())
+            .unwrap();
+        let frame = Rectangle::<i32, Buffer>::new((20, 10).into(), (40, 20).into());
+        let texture = apply_effect_pipeline_cached_for_key_with_captured_subject(
+            &mut renderer,
+            "phy-px-alias-test".into(),
+            subject,
+            None,
+            size,
+            None,
+            Some(size),
+            &effect,
+            EffectFrame::plain(Some(frame), 1.0),
+        );
+        let _ = std::fs::remove_file(&shader_path);
+        let texture = texture.unwrap();
+        let mapping = renderer
+            .copy_texture(&texture, Rectangle::from_size(size.into()), Fourcc::Abgr8888)
+            .unwrap();
+        let bytes = renderer.map_texture(&mapping).unwrap().to_vec();
+        let offset = ((20 * size.0 + 40) * 4) as usize;
+        assert_eq!(&bytes[offset..offset + 3], &[40, 40, 128], "aliases match");
+    }
+
+    fn run_frame_probe(source: &str, frame: EffectFrame) -> Option<Vec<u8>> {
+        let mut renderer = try_renderer()?;
+        let shader_path = std::env::temp_dir().join(format!(
+            "shojiwm-frame-shape-test-{}-{}.frag",
+            std::process::id(),
+            source.len()
+        ));
+        std::fs::write(&shader_path, source).unwrap();
+        let effect = CompiledEffect {
+            input: EffectInput::WindowSource(WindowSourceInclude::Full),
+            capture_padding: 0,
+            invalidate: EffectInvalidationPolicy::Always,
+            pipeline: vec![EffectStage::Shader(ShaderStage {
+                shader: ShaderModule {
+                    path: shader_path.to_string_lossy().into_owned(),
+                },
+                uniforms: Default::default(),
+                textures: Default::default(),
+            })],
+            alpha: EffectAlphaMode::Preserve,
+        };
+        let size = (100, 50);
+        let subject: GlesTexture = renderer
+            .create_buffer(Fourcc::Abgr8888, size.into())
+            .unwrap();
+        let texture = apply_effect_pipeline_cached_for_key_with_captured_subject(
+            &mut renderer,
+            format!("frame-shape-test-{}", source.len()),
+            subject,
+            None,
+            size,
+            None,
+            Some(size),
+            &effect,
+            frame,
+        );
+        let _ = std::fs::remove_file(&shader_path);
+        let texture = texture.unwrap();
+        let mapping = renderer
+            .copy_texture(&texture, Rectangle::from_size(size.into()), Fourcc::Abgr8888)
+            .unwrap();
+        Some(renderer.map_texture(&mapping).unwrap().to_vec())
+    }
+
+    fn probe_frame() -> EffectFrame {
+        EffectFrame {
+            rect: Some(Rectangle::new((20, 10).into(), (40, 20).into())),
+            radius: [8.0, 8.0, 8.0, 8.0],
+            border: [1.0, 3.0, 1.0, 1.0],
+            clip: Some(EffectFrameClip {
+                rect: [5.0, 0.0, 30.0, 20.0],
+                radius: [4.0; 4],
+            }),
+            scale: 1.5,
+        }
+    }
+
+    /// The frame's radius, border, clip and scale reach the shader in
+    /// working-texture pixels (the clip translated by the frame origin).
+    #[test]
+    fn effect_context_carries_the_frame_shape() {
+        let Some(bytes) = run_frame_probe(
+            "vec4 shader_main(EffectContext effect) {\n\
+             \x20   return vec4(\n\
+             \x20       effect.frame_radius_phy_px.x / 255.0,\n\
+             \x20       effect.frame_border_phy_px.y / 255.0,\n\
+             \x20       effect.has_clip ? effect.clip_rect_phy_px.x / 255.0 : 0.0,\n\
+             \x20       effect.scale / 4.0);\n\
+             }\n",
+            probe_frame(),
+        ) else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let offset = ((20 * 100 + 40) * 4) as usize;
+        assert_eq!(&bytes[offset..offset + 3], &[8, 3, 25], "radius, border, clip x");
+        let scale = bytes[offset + 3] as f32 / 255.0 * 4.0;
+        assert!((scale - 1.5).abs() < 0.02, "scale {scale}");
+    }
+
+    /// `effect_frame_coverage` cuts the frame's rounded corners and
+    /// `effect_clip_coverage` follows the clip.
+    #[test]
+    fn effect_frame_and_clip_coverage_helpers() {
+        let Some(bytes) = run_frame_probe(
+            "vec4 shader_main(EffectContext effect) {\n\
+             \x20   return vec4(effect_frame_coverage(effect), effect_clip_coverage(effect), 0.0, 1.0);\n\
+             }\n",
+            probe_frame(),
+        ) else {
+            eprintln!("skipping: no render node");
+            return;
+        };
+        let pixel = |x: i32, y: i32| {
+            let offset = ((y * 100 + x) * 4) as usize;
+            (bytes[offset], bytes[offset + 1])
+        };
+        assert_eq!(pixel(40, 20), (255, 255), "frame centre is inside both");
+        assert_eq!(pixel(20, 10).0, 0, "frame corner is cut by the 8px radius");
+        assert_eq!(pixel(24, 20).0, 255, "frame edge away from the corner");
+        assert_eq!(pixel(22, 20).1, 0, "left of the clip (x < 25)");
+        assert_eq!(pixel(50, 20).1, 255, "inside the clip");
+        assert_eq!(pixel(10, 20), (0, 0), "outside the frame");
     }
 }

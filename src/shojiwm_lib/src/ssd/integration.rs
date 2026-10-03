@@ -1,7 +1,6 @@
 use bumpalo::Bump;
 use hashbrown::{DefaultHashBuilder, HashMap as BumpHashMap};
 use smithay::{
-    backend::renderer::element::solid::SolidColorBuffer,
     desktop::Window,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
     utils::{Logical, Point, Rectangle, Size},
@@ -13,7 +12,7 @@ use std::{
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::backend::rounded::RoundedElementState;
+use crate::backend::paint::PaintElementState;
 use crate::backend::visual::RectSnapMode;
 use crate::backend::visual::{inverse_transform_point, transformed_root_rect};
 
@@ -34,7 +33,9 @@ use crate::backend::{
 };
 use crate::state::{ActiveManagedWindowAnimation, ShojiWM};
 
-use crate::runtime_api::{CompositionPatch, SHADER_INPUT_STAGE_INDEX};
+use crate::runtime_api::{
+    CompositionPatch, OVERLAY_STAGE_INDEX, PAINT_STAGE_INDEX, SHADER_INPUT_STAGE_INDEX,
+};
 use super::{
     ComputedDecorationTree, DecorationEvaluationError, DecorationEvaluator,
     DecorationHandlerInvocation, DecorationHitTestResult, DecorationNode, DecorationTree,
@@ -73,9 +74,50 @@ fn is_shader_uniform_only_update(
             .all(|patch| matches!(patch, CompositionPatch::ShaderUniform { .. }))
 }
 
+/// The uniforms of a node's `paint` / `overlay` shader addressed by a
+/// patch `stage_index`, or `None` for effect pipeline stages.
+fn paint_slot_for_stage(stage_index: usize) -> Option<super::paint::PaintSlot> {
+    match stage_index {
+        PAINT_STAGE_INDEX => Some(super::paint::PaintSlot::Paint),
+        OVERLAY_STAGE_INDEX => Some(super::paint::PaintSlot::Overlay),
+        _ => None,
+    }
+}
+
+fn paint_shader_mut(
+    style: &mut super::DecorationStyle,
+    slot: super::paint::PaintSlot,
+) -> Option<&mut super::PaintShader> {
+    match slot {
+        super::paint::PaintSlot::Paint => style.paint.as_mut(),
+        _ => style.overlay.as_mut(),
+    }
+}
+
+fn validate_paint_uniform(
+    style: &super::DecorationStyle,
+    slot: super::paint::PaintSlot,
+    node_id: &str,
+    name: &str,
+    value: &super::ShaderUniformValue,
+) -> Result<(), DecorationEvaluationError> {
+    let shader = match slot {
+        super::paint::PaintSlot::Paint => style.paint.as_ref(),
+        _ => style.overlay.as_ref(),
+    };
+    let current = shader.and_then(|shader| shader.uniforms.get(name));
+    match current {
+        Some(current) if current.shape_matches(value) => Ok(()),
+        _ => Err(DecorationEvaluationError::RuntimeProtocol(format!(
+            "paint uniform patch target is missing: {node_id}.{name}"
+        ))),
+    }
+}
+
 fn apply_shader_uniform_fast_update(
     tree: &mut DecorationTree,
     layout: &mut ComputedDecorationTree,
+    buffers: &mut [CachedDecorationBuffer],
     shader_buffers: &mut [CachedShaderEffect],
     patches: &[CompositionPatch],
 ) -> Result<ShaderUniformFastUpdate, DecorationEvaluationError> {
@@ -84,7 +126,7 @@ fn apply_shader_uniform_fast_update(
             node_id,
             stage_index,
             name,
-            ..
+            value,
         } = patch
         else {
             return Err(DecorationEvaluationError::RuntimeProtocol(
@@ -97,6 +139,18 @@ fn apply_shader_uniform_fast_update(
                 "cached composition patch target is missing: {node_id}"
             )));
         };
+        let Some(computed_node) = find_computed_decoration_node(&layout.root, node_id) else {
+            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
+                "computed shader uniform patch target is missing: {node_id}"
+            )));
+        };
+
+        if let Some(slot) = paint_slot_for_stage(*stage_index) {
+            validate_paint_uniform(&tree_node.style, slot, node_id, name, value)?;
+            validate_paint_uniform(&computed_node.style, slot, node_id, name, value)?;
+            continue;
+        }
+
         let super::DecorationNodeKind::ShaderEffect(tree_effect) = &tree_node.kind else {
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "shader uniform patch target is not ShaderEffect: {node_id}"
@@ -104,11 +158,6 @@ fn apply_shader_uniform_fast_update(
         };
         validate_shader_uniform(&tree_effect.shader, node_id, *stage_index, name)?;
 
-        let Some(computed_node) = find_computed_decoration_node(&layout.root, node_id) else {
-            return Err(DecorationEvaluationError::RuntimeProtocol(format!(
-                "computed shader uniform patch target is missing: {node_id}"
-            )));
-        };
         let super::DecorationNodeKind::ShaderEffect(computed_effect) = &computed_node.kind else {
             return Err(DecorationEvaluationError::RuntimeProtocol(format!(
                 "computed shader uniform patch target is not ShaderEffect: {node_id}"
@@ -135,6 +184,43 @@ fn apply_shader_uniform_fast_update(
         else {
             unreachable!("uniform-only update was validated above");
         };
+
+        if let Some(slot) = paint_slot_for_stage(*stage_index) {
+            let set = |style: &mut super::DecorationStyle| -> bool {
+                let shader = paint_shader_mut(style, slot).expect("paint uniform was validated");
+                let current = shader
+                    .uniforms
+                    .get_mut(name)
+                    .expect("paint uniform was validated");
+                if current == value {
+                    return false;
+                }
+                current.clone_from(value);
+                true
+            };
+            let tree_node = find_decoration_node_mut(&mut tree.root, node_id)
+                .expect("uniform patch tree target was validated");
+            update.tree_changed |= set(&mut tree_node.style);
+            let computed_node = find_computed_decoration_node_mut(&mut layout.root, node_id)
+                .expect("uniform patch computed target was validated");
+            set(&mut computed_node.style);
+
+            let suffix = format!(":{}", slot.key());
+            for buffer in buffers.iter_mut().filter(|buffer| {
+                buffer.owner_node_id.as_deref() == Some(node_id.as_str())
+                    && buffer.stable_key.ends_with(&suffix)
+            }) {
+                let Some(current) = buffer.paint.uniforms.get_mut(name) else {
+                    continue;
+                };
+                if current != value {
+                    current.clone_from(value);
+                    update.rendered_changed = true;
+                    update.damage_rects.push(buffer.rect);
+                }
+            }
+            continue;
+        }
 
         let tree_node = find_decoration_node_mut(&mut tree.root, node_id)
             .expect("uniform patch tree target was validated");
@@ -386,13 +472,6 @@ impl NodeGeometryLookup for BumpNodeGeometryMap<'_> {
     fn node_geometry(&self, stable_id: &str) -> Option<NodeGeometry> {
         self.get(stable_id).copied()
     }
-}
-
-fn clip_debug_enabled() -> bool {
-    use std::sync::OnceLock;
-
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| crate::env_flag!("SHOJI_CLIP_DEBUG"))
 }
 
 fn handler_debug_enabled() -> bool {
@@ -736,7 +815,7 @@ pub struct WindowDecorationState {
     pub shader_buffers: Vec<CachedShaderEffect>,
     pub text_buffers: Vec<CachedDecorationLabel>,
     pub icon_buffers: Vec<CachedDecorationIcon>,
-    pub rounded_cache: std::collections::HashMap<String, RoundedElementState>,
+    pub paint_cache: std::collections::HashMap<String, PaintElementState>,
     pub shader_cache:
         std::collections::HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
     pub backdrop_cache:
@@ -767,6 +846,39 @@ pub struct ContentClip {
 }
 
 impl WindowDecorationState {
+    /// The window's shape for a window effect's `EffectContext`: the frame
+    /// of the `<WindowBorder>` (or the root), or — for an effect over the
+    /// root surface only — the client area inside its border.
+    pub fn effect_frame_shape(
+        &self,
+        root_surface_only: bool,
+    ) -> crate::backend::shader_effect::NodeEffectShape {
+        fn find_border(
+            node: &super::ComputedDecorationNode,
+        ) -> Option<&super::ComputedDecorationNode> {
+            if matches!(node.kind, super::DecorationNodeKind::WindowBorder) {
+                return Some(node);
+            }
+            node.children.iter().find_map(find_border)
+        }
+        let node = find_border(&self.layout.root).unwrap_or(&self.layout.root);
+        let geometry = super::paint::node_geometry(node, Default::default());
+        crate::backend::shader_effect::NodeEffectShape {
+            layout_scale: node.frame.scale,
+            radius: if root_surface_only {
+                geometry.inner_radius
+            } else {
+                geometry.radius
+            },
+            border: if root_surface_only {
+                [0; 4]
+            } else {
+                geometry.border
+            },
+            clip: None,
+        }
+    }
+
     pub fn hit_test(&self, point: Point<f64, Logical>) -> DecorationHitTestResult {
         self.layout.hit_test_at(point.x, point.y)
     }
@@ -795,28 +907,17 @@ impl WindowDecorationState {
     }
 }
 
+/// One paint item of a decoration node (shadow, background, border or user
+/// paint shader), see `ssd::paint`.
 #[derive(Debug, Clone)]
 pub struct CachedDecorationBuffer {
     pub owner_node_id: Option<String>,
     pub stable_key: String,
     pub order: usize,
+    /// Logical bounds of everything the item draws, for culling and damage.
     pub rect: LogicalRect,
-    pub rect_precise: Option<PreciseLogicalRect>,
-    pub color: super::Color,
-    pub buffer: SolidColorBuffer,
-    pub radius: i32,
-    pub radius_precise: Option<f32>,
-    pub border_width: f32,
-    pub hole_rect: Option<LogicalRect>,
-    pub hole_rect_precise: Option<PreciseLogicalRect>,
-    pub hole_radius: i32,
-    pub hole_radius_precise: Option<f32>,
-    pub shared_inner_hole: bool,
-    pub clip_rect: Option<LogicalRect>,
-    pub clip_radius: i32,
-    pub clip_rect_precise: Option<PreciseLogicalRect>,
-    pub clip_radius_precise: Option<f32>,
     pub source_kind: &'static str,
+    pub paint: super::paint::PaintItem,
 }
 
 impl ShojiWM {
@@ -3017,14 +3118,14 @@ impl ShojiWM {
                         .remove(&window)
                         .map(|cached| {
                             (
-                                cached.rounded_cache,
+                                cached.paint_cache,
                                 cached.shader_cache,
                                 cached.backdrop_cache,
                                 cached.window_effect_cache,
                             )
                         })
                         .unwrap_or_default();
-                    let (rounded_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
+                    let (paint_cache, shader_cache, backdrop_cache, window_effect_cache) = caches;
                     let static_transform = evaluation.transform;
                     let static_managed = evaluation.managed_window.clone();
                     let (
@@ -3066,7 +3167,7 @@ impl ShojiWM {
                             shader_buffers,
                             text_buffers,
                             icon_buffers,
-                            rounded_cache,
+                            paint_cache,
                             shader_cache,
                             backdrop_cache,
                             window_effect_cache,
@@ -3496,6 +3597,7 @@ impl ShojiWM {
                                 apply_shader_uniform_fast_update(
                                     &mut cached.tree,
                                     &mut cached.layout,
+                                    &mut cached.buffers,
                                     &mut cached.shader_buffers,
                                     &evaluation.node_patches,
                                 )?
@@ -5945,7 +6047,9 @@ fn fit_children_inner_clip_resolved(
     ) {
         return None;
     }
-    node.style.border?;
+    if !node.style.has_border() {
+        return None;
+    }
     Some(
         node.resolved_effective_clip
             .unwrap_or(crate::ssd::ResolvedDecorationClip {
@@ -5956,24 +6060,6 @@ fn fit_children_inner_clip_resolved(
     )
 }
 
-fn fit_children_inner_hole_rect(
-    node: &super::ComputedDecorationNode,
-    border_width: i32,
-) -> LogicalRect {
-    let fallback_inner_rect = node.rect.inset_uniform(border_width);
-
-    let inner_rect = node.frame.logical_rect(
-        fit_children_inner_clip_resolved(node)
-            .map(|clip| clip.rect)
-            .unwrap_or(node.resolved_content_rect),
-    );
-    if inner_rect.width <= 0 || inner_rect.height <= 0 {
-        fallback_inner_rect
-    } else {
-        inner_rect
-    }
-}
-
 fn precise_rect_from_logical(rect: LogicalRect) -> PreciseLogicalRect {
     PreciseLogicalRect {
         x: rect.x as f32,
@@ -5981,48 +6067,6 @@ fn precise_rect_from_logical(rect: LogicalRect) -> PreciseLogicalRect {
         width: rect.width as f32,
         height: rect.height as f32,
     }
-}
-
-fn fit_children_inner_clip_logical(
-    node: &super::ComputedDecorationNode,
-) -> Option<super::DecorationClip> {
-    if !matches!(
-        node.style.effective_border_fit(&node.kind),
-        super::BorderFit::FitChildren
-    ) {
-        return None;
-    }
-    node.style.border?;
-    let border_width = node.frame.logical_len_rounded(node.resolved_border_width).max(0);
-    let rect = fit_children_inner_hole_rect(node, border_width);
-    if rect.width <= 0 || rect.height <= 0 {
-        return None;
-    }
-    Some(super::DecorationClip {
-        rect,
-        radius: node
-            .frame
-            .logical_len_rounded(node.resolved_border_radius - node.resolved_border_width)
-            .max(0),
-    })
-}
-
-fn normal_border_inner_rect(node: &super::ComputedDecorationNode) -> Option<LogicalRect> {
-    node.style.border?;
-    let border_width = node.frame.logical_len_rounded(node.resolved_border_width).max(0);
-    let rect = node.rect.inset_uniform(border_width);
-    (rect.width > 0 && rect.height > 0).then_some(rect)
-}
-
-fn normal_border_inner_rect_precise(
-    node: &super::ComputedDecorationNode,
-) -> Option<PreciseLogicalRect> {
-    node.style.border?;
-    let border_width = node.resolved_border_width;
-    let rect = node
-        .resolved_rect
-        .inset(super::ResolvedLayoutEdges::all(border_width));
-    (rect.width.raw() > 0 && rect.height.raw() > 0).then(|| node.frame.precise_rect(rect))
 }
 
 fn node_child_mask_resolved(
@@ -6256,6 +6300,7 @@ impl super::ComputedDecorationNode {
             }),
             resolved_effective_clip: self.resolved_effective_clip,
             frame: self.frame.translated(dx as f64, dy as f64),
+            transform_scale: self.transform_scale,
             children: self
                 .children
                 .iter()
@@ -6278,23 +6323,9 @@ fn translate_cached_decoration_position(
         .content_clip
         .map(|clip| translate_content_clip(clip, dx, dy));
 
+    // Paint geometry is root-local; only the logical bounds move.
     for buffer in &mut decoration.buffers {
         buffer.rect = translate_logical_rect(buffer.rect, dx, dy);
-        buffer.rect_precise = buffer
-            .rect_precise
-            .map(|rect| translate_precise_rect(rect, dx, dy));
-        buffer.hole_rect = buffer
-            .hole_rect
-            .map(|rect| translate_logical_rect(rect, dx, dy));
-        buffer.hole_rect_precise = buffer
-            .hole_rect_precise
-            .map(|rect| translate_precise_rect(rect, dx, dy));
-        buffer.clip_rect = buffer
-            .clip_rect
-            .map(|rect| translate_logical_rect(rect, dx, dy));
-        buffer.clip_rect_precise = buffer
-            .clip_rect_precise
-            .map(|rect| translate_precise_rect(rect, dx, dy));
     }
 
     for buffer in &mut decoration.shader_buffers {
@@ -6369,6 +6400,15 @@ fn translate_precise_rect(rect: PreciseLogicalRect, dx: i32, dy: i32) -> Precise
     }
 }
 
+/// The paint items of a laid-out tree, in render order (front first).
+#[cfg(test)]
+pub(crate) fn paint_buffers_for_layout(layout: &ComputedDecorationTree) -> Vec<CachedDecorationBuffer> {
+    let order_map = build_render_order_map(layout);
+    let mut buffers = build_cached_buffers(layout, &order_map);
+    buffers.sort_by_key(|buffer| buffer.order);
+    buffers
+}
+
 fn build_cached_buffers(
     layout: &ComputedDecorationTree,
     order_map: &std::collections::HashMap<String, usize>,
@@ -6398,13 +6438,7 @@ fn build_cached_buffers_and_shaders(
     collect_cached_buffers(
         &layout.root,
         "root".to_string(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        super::paint::PaintClipState::default(),
         order_map,
         dirty_node_ids,
         node_geometry,
@@ -6928,24 +6962,24 @@ fn collect_render_orders(
     if node.style.visible == Some(false) {
         return;
     }
+    if matches!(node.kind, super::DecorationNodeKind::WindowSlot) {
+        return;
+    }
+
+    let mut push = |key: String, order: &mut usize| {
+        map.insert(format!("{path}:{key}"), *order);
+        *order += 1;
+    };
+
+    if super::paint::has_overlay(node) {
+        push(super::paint::PaintSlot::Overlay.key(), order);
+    }
 
     match &node.kind {
-        super::DecorationNodeKind::Label(_) => {
-            map.insert(format!("{path}:label"), *order);
-            *order += 1;
-            return;
+        super::DecorationNodeKind::Label(_) => push("label".into(), order),
+        super::DecorationNodeKind::AppIcon | super::DecorationNodeKind::Image(_) => {
+            push("icon".into(), order)
         }
-        super::DecorationNodeKind::AppIcon => {
-            map.insert(format!("{path}:icon"), *order);
-            *order += 1;
-            return;
-        }
-        super::DecorationNodeKind::Image(_) => {
-            map.insert(format!("{path}:icon"), *order);
-            *order += 1;
-            return;
-        }
-        super::DecorationNodeKind::WindowSlot => return,
         _ => {}
     }
 
@@ -6953,50 +6987,28 @@ fn collect_render_orders(
         collect_render_orders(child, format!("{path}/child-{index}"), order, map);
     });
 
-    if let Some(border) = node.style.border {
-        let color = border.color.with_opacity(node.style.opacity);
-        if color.a > 0 && border.width > 0.0 {
-            map.insert(format!("{path}:border"), *order);
-            *order += 1;
-        }
-    }
-
-    if let super::DecorationNodeKind::ShaderEffect(_) = &node.kind {
-        map.insert(format!("{path}:shader"), *order);
+    let mut push = |key: String, order: &mut usize| {
+        map.insert(format!("{path}:{key}"), *order);
         *order += 1;
-    }
-
-    if let Some(background) = node
-        .style
-        .background
-        .map(|color| color.with_opacity(node.style.opacity))
-        && background.a > 0 {
-            if matches!(node.kind, super::DecorationNodeKind::WindowBorder) {
-                map.insert(format!("{path}:fill-top"), *order);
-                *order += 1;
-                map.insert(format!("{path}:fill-bottom"), *order);
-                *order += 1;
-                map.insert(format!("{path}:fill-left"), *order);
-                *order += 1;
-                map.insert(format!("{path}:fill-right"), *order);
-                *order += 1;
-            } else {
-                map.insert(format!("{path}:fill"), *order);
-                *order += 1;
-            }
+    };
+    let slots = super::paint::back_slots(node);
+    let effect_index = matches!(node.kind, super::DecorationNodeKind::ShaderEffect(_))
+        .then(|| super::paint::effect_slot_index(node, &slots));
+    for (index, slot) in slots.iter().enumerate() {
+        if effect_index == Some(index) {
+            push("shader".into(), order);
         }
+        push(slot.key(), order);
+    }
+    if effect_index == Some(slots.len()) {
+        push("shader".into(), order);
+    }
 }
 
 fn collect_cached_buffers(
     node: &super::ComputedDecorationNode,
     path: String,
-    ancestor_clip: Option<super::DecorationClip>,
-    ancestor_resolved_clip: Option<crate::ssd::ResolvedDecorationClip>,
-    ancestor_clip_rect_precise: Option<PreciseLogicalRect>,
-    ancestor_clip_radius_precise: Option<f32>,
-    nearest_rounded_clip: Option<super::DecorationClip>,
-    nearest_rounded_clip_rect_precise: Option<PreciseLogicalRect>,
-    nearest_rounded_clip_radius_precise: Option<f32>,
+    clips: super::paint::PaintClipState,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
     node_geometry: &impl NodeGeometryLookup,
@@ -7006,338 +7018,100 @@ fn collect_cached_buffers(
     if node.style.visible == Some(false) {
         return;
     }
+    if matches!(node.kind, super::DecorationNodeKind::WindowSlot) {
+        return;
+    }
 
     let include_node = dirty_node_ids.is_none_or(|dirty_node_ids| {
         node.stable_id
             .as_deref()
             .is_some_and(|stable_id| node_id_matches_dirty_scope(stable_id, dirty_node_ids))
     });
-    let shared_geometry = node
-        .stable_id
-        .as_deref()
-        .and_then(|stable_id| node_geometry.node_geometry(stable_id));
 
-    let node_radius = node.frame.logical_len_rounded(node.resolved_border_radius).max(0);
-    let current_clip_rect = ancestor_clip.map(|clip| clip.rect);
-    let current_clip_radius = ancestor_clip.map(|clip| clip.radius).unwrap_or(0);
-    let current_clip_rect_precise = ancestor_clip_rect_precise
-        .or_else(|| ancestor_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)));
-    let current_clip_radius_precise = ancestor_clip_radius_precise
-        .or_else(|| ancestor_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0)));
-    let border_fit = node.style.effective_border_fit(&node.kind);
-    let fit_children = matches!(border_fit, super::BorderFit::FitChildren);
-    let fit_children_inner_clip_resolved = if fit_children {
-        fit_children_inner_clip_resolved(node)
-    } else {
-        None
-    };
-    let fit_children_inner_clip_precise = if fit_children {
-        fit_children_inner_clip_resolved.map(|clip| node.frame.precise_rect(clip.rect))
-    } else {
-        None
-    };
-    let fit_children_inner_radius_precise = if fit_children {
-        fit_children_inner_clip_resolved.map(|clip| node.frame.logical_len(clip.radius).max(0.0))
-    } else {
-        None
-    };
-    let fit_children_inner_clip = if fit_children {
-        fit_children_inner_clip_logical(node)
-    } else {
-        None
-    };
-    let child_clip = fit_children_inner_clip.or(node.effective_clip);
-    let child_resolved_clip = fit_children_inner_clip_resolved.or(node.resolved_effective_clip);
-    let child_clip_rect_precise = if fit_children {
-        shared_geometry
-            .map(|geometry| geometry.content_rect_precise)
-            .or(fit_children_inner_clip_precise)
-            .or_else(|| child_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)))
-    } else {
-        shared_geometry
-            .and_then(|geometry| geometry.clip_rect_precise)
-            .or_else(|| child_resolved_clip.map(|clip| node.frame.precise_rect(clip.rect)))
-    };
-    let child_clip_radius_precise = if fit_children {
-        fit_children_inner_radius_precise
-            .or_else(|| child_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0)))
-    } else {
-        child_resolved_clip.map(|clip| node.frame.logical_len(clip.radius).max(0.0))
-    };
-    let effective_clip_rect = if current_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        current_clip_rect
-    } else {
-        nearest_rounded_clip.map(|clip| clip.rect)
-    };
-    let effective_clip_radius = if current_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        current_clip_radius
-    } else {
-        nearest_rounded_clip.map(|clip| clip.radius).unwrap_or(0)
-    };
-    let effective_clip_rect_precise = if current_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        current_clip_rect_precise
-    } else {
-        nearest_rounded_clip_rect_precise
-    };
-    let effective_clip_radius_precise = if current_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        current_clip_radius_precise
-    } else {
-        nearest_rounded_clip_radius_precise
-    };
-    let next_nearest_rounded_clip = if child_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        child_clip
-    } else {
-        nearest_rounded_clip
-    };
-    let next_nearest_rounded_clip_rect_precise = if child_clip_radius_precise.unwrap_or(0.0) > 0.0 {
-        child_clip_rect_precise
-    } else {
-        nearest_rounded_clip_rect_precise
-    };
-    let next_nearest_rounded_clip_radius_precise = if child_clip_radius_precise.unwrap_or(0.0) > 0.0
-    {
-        child_clip_radius_precise
-    } else {
-        nearest_rounded_clip_radius_precise
-    };
-    if clip_debug_enabled() {
-        trace!(
-            stable_id = node.stable_id.as_deref().unwrap_or("<none>"),
-            kind = node_kind_name(&node.kind),
-            current_clip_rect = ?current_clip_rect,
-            current_clip_rect_precise = ?current_clip_rect_precise,
-            current_clip_radius = current_clip_radius,
-            current_clip_radius_precise = ?current_clip_radius_precise,
-            child_clip_rect = ?child_clip.map(|clip| clip.rect),
-            child_clip_rect_precise = ?child_clip_rect_precise,
-            child_clip_radius = child_clip.map(|clip| clip.radius),
-            child_clip_radius_precise = ?child_clip_radius_precise,
-            effective_clip_rect = ?effective_clip_rect,
-            effective_clip_rect_precise = ?effective_clip_rect_precise,
-            effective_clip_radius = effective_clip_radius,
-            effective_clip_radius_precise = ?effective_clip_radius_precise,
-            fit_children,
-            include_node,
-            "clip propagation at cached buffer collection"
-        );
-    }
-    let border_hole_rect = if fit_children {
-        fit_children_inner_clip.map(|clip| clip.rect).or_else(|| {
-            node.style.border.map(|_border| {
-                fit_children_inner_hole_rect(node, node.frame.logical_len_rounded(node.resolved_border_width).max(0))
-            })
-        })
-    } else {
-        normal_border_inner_rect(node)
-    };
-    let border_hole_rect_precise = if fit_children {
-        shared_geometry
-            .map(|geometry| geometry.content_rect_precise)
-            .or(fit_children_inner_clip_precise)
-            .or_else(|| {
-                (!node.children.is_empty()).then(|| {
-                    node.frame.precise_rect(
-                        fit_children_inner_clip_resolved
-                            .map(|clip| clip.rect)
-                            .unwrap_or(node.resolved_content_rect),
-                    )
-                })
-            })
-    } else {
-        normal_border_inner_rect_precise(node)
-    };
-    let border_hole_radius = fit_children_inner_clip
-        .map(|clip| clip.radius.max(0))
-        .unwrap_or_else(|| {
-            node.frame
-                .logical_len_rounded(node.resolved_border_radius - node.resolved_border_width)
-                .max(0)
-        });
-    let border_hole_radius_precise = fit_children_inner_radius_precise.or_else(|| {
-        (node.style.border.is_some()).then(|| {
-            node.frame
-                .logical_len(node.resolved_border_radius - node.resolved_border_width)
-                .max(0.0)
-        })
-    });
+    if include_node {
+        let geometry = super::paint::node_geometry(node, clips);
+        let mut slots = super::paint::back_slots(node);
+        if super::paint::has_overlay(node) {
+            slots.push(super::paint::PaintSlot::Overlay);
+        }
+        for slot in slots {
+            let stable_key = format!("{path}:{}", slot.key());
+            let Some(item) = super::paint::paint_item(node, slot, geometry) else {
+                continue;
+            };
+            buffers.push(CachedDecorationBuffer {
+                owner_node_id: node.stable_id.clone(),
+                order: *order_map.get(&stable_key).unwrap_or(&usize::MAX),
+                rect: super::paint::item_logical_rect(node.frame, &item),
+                stable_key,
+                source_kind: slot.source_kind(),
+                paint: item,
+            });
+        }
 
-    match &node.kind {
-        super::DecorationNodeKind::Label(_)
-        | super::DecorationNodeKind::AppIcon
-        | super::DecorationNodeKind::Image(_)
-        | super::DecorationNodeKind::WindowSlot => {}
-        _ => {
-            if include_node {
-                if let Some(border) = node.style.border {
-                    let color = border.color.with_opacity(node.style.opacity);
-                    if color.a > 0 && border.width > 0.0 {
-                        let current_order = *order_map
-                            .get(&format!("{path}:border"))
-                            .unwrap_or(&usize::MAX);
-                        buffers.push(CachedDecorationBuffer {
-                            owner_node_id: node.stable_id.clone(),
-                            stable_key: format!("{path}:border"),
-                            order: current_order,
-                            rect: node.rect,
-                            rect_precise: Some(
-                                shared_geometry
-                                    .map(|geometry| geometry.rect_precise)
-                                    .unwrap_or_else(|| {
-                                        node.frame.precise_rect(node.resolved_rect)
-                                    }),
-                            ),
-                            color,
-                            buffer: SolidColorBuffer::new(
-                                (node.rect.width.max(1), node.rect.height.max(1)),
-                                [
-                                    color.r as f32 / 255.0,
-                                    color.g as f32 / 255.0,
-                                    color.b as f32 / 255.0,
-                                    color.a as f32 / 255.0,
-                                ],
-                            ),
-                            radius: node_radius,
-                            radius_precise: (!node.children.is_empty())
-                                .then(|| node.frame.logical_len(node.resolved_border_radius).max(0.0)),
-                            border_width: node.frame.logical_len(node.resolved_border_width).max(0.0),
-                            hole_rect: border_hole_rect,
-                            hole_rect_precise: border_hole_rect_precise,
-                            hole_radius: border_hole_radius,
-                            hole_radius_precise: border_hole_radius_precise,
-                            shared_inner_hole: !node.children.is_empty() && fit_children,
-                            clip_rect: effective_clip_rect,
-                            clip_radius: effective_clip_radius,
-                            clip_rect_precise: effective_clip_rect_precise,
-                            clip_radius_precise: effective_clip_radius_precise,
-                            source_kind: node_kind_name(&node.kind),
-                        });
+        if let super::DecorationNodeKind::ShaderEffect(effect) = &node.kind {
+            // Effects keep their established clip rule: the inherited clip
+            // when it is rounded, otherwise the nearest rounded ancestor.
+            let effect_clip = clips
+                .clip
+                .filter(|clip| clip.radius.raw() > 0)
+                .or(clips.nearest_rounded);
+            shader_buffers.push(CachedShaderEffect {
+                owner_node_id: node.stable_id.clone(),
+                stable_key: format!("{path}:shader"),
+                order: *order_map
+                    .get(&format!("{path}:shader"))
+                    .unwrap_or(&usize::MAX),
+                rect: node.rect,
+                rect_precise: Some(
+                    node.stable_id
+                        .as_deref()
+                        .and_then(|stable_id| node_geometry.node_geometry(stable_id))
+                        .map(|geometry| geometry.rect_precise)
+                        .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
+                ),
+                shader: effect.shader.clone(),
+                clip_rect: effect_clip.map(|clip| node.frame.logical_rect(clip.rect)),
+                clip_radius: effect_clip
+                    .map(|clip| node.frame.logical_len_rounded(clip.radius).max(0))
+                    .unwrap_or(0),
+                clip_rect_precise: effect_clip.map(|clip| node.frame.precise_rect(clip.rect)),
+                clip_radius_precise: effect_clip
+                    .map(|clip| node.frame.logical_len(clip.radius).max(0.0)),
+                node_shape: {
+                    let geometry = super::paint::node_geometry(node, clips);
+                    let node_rect = geometry.node;
+                    crate::backend::shader_effect::NodeEffectShape {
+                        layout_scale: node.frame.scale,
+                        radius: geometry.radius,
+                        border: geometry.border,
+                        clip: effect_clip.map(|clip| {
+                            let rect = super::paint::PxRect::from_resolved(clip.rect);
+                            let radius = clip.radius.raw().max(0);
+                            (
+                                [rect.x - node_rect.x, rect.y - node_rect.y, rect.w, rect.h],
+                                [radius; 4],
+                            )
+                        }),
                     }
-                }
-
-                if let super::DecorationNodeKind::ShaderEffect(effect) = &node.kind {
-                    let current_order = *order_map
-                        .get(&format!("{path}:shader"))
-                        .unwrap_or(&usize::MAX);
-                    shader_buffers.push(CachedShaderEffect {
-                        owner_node_id: node.stable_id.clone(),
-                        stable_key: format!("{path}:shader"),
-                        order: current_order,
-                        rect: node.rect,
-                        rect_precise: Some(
-                            shared_geometry
-                                .map(|geometry| geometry.rect_precise)
-                                .unwrap_or_else(|| node.frame.precise_rect(node.resolved_rect)),
-                        ),
-                        shader: effect.shader.clone(),
-                        clip_rect: effective_clip_rect,
-                        clip_radius: effective_clip_radius,
-                        clip_rect_precise: effective_clip_rect_precise,
-                        clip_radius_precise: effective_clip_radius_precise,
-                    });
-                }
-
-                if let Some(background) = node
-                    .style
-                    .background
-                    .map(|color| color.with_opacity(node.style.opacity))
-                    && background.a > 0 {
-                        if matches!(node.kind, super::DecorationNodeKind::WindowBorder) {
-                            if let Some(inner_rect) = border_hole_rect {
-                                push_cached_fill(
-                                    buffers,
-                                    *order_map
-                                        .get(&format!("{path}:fill-top"))
-                                        .unwrap_or(&usize::MAX),
-                                    format!("{path}:fill-top"),
-                                    node.rect,
-                                    Some(node.frame.precise_rect(node.resolved_rect)),
-                                    background,
-                                    node.stable_id.clone(),
-                                    node_radius,
-                                    Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
-                                    0.0,
-                                    Some(inner_rect),
-                                    border_hole_radius,
-                                    fit_children_inner_clip
-                                        .map(|clip| precise_rect_from_logical(clip.rect))
-                                        .or(border_hole_rect_precise),
-                                    border_hole_radius_precise,
-                                    effective_clip_rect_precise,
-                                    effective_clip_radius_precise,
-                                    None,
-                                    0,
-                                );
-                            } else {
-                                push_cached_fill(
-                                    buffers,
-                                    *order_map
-                                        .get(&format!("{path}:fill"))
-                                        .unwrap_or(&usize::MAX),
-                                    format!("{path}:fill"),
-                                    node.rect,
-                                    Some(node.frame.precise_rect(node.resolved_rect)),
-                                    background,
-                                    node.stable_id.clone(),
-                                    node_radius,
-                                    Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
-                                    0.0,
-                                    None,
-                                    0,
-                                    None,
-                                    None,
-                                    effective_clip_rect_precise,
-                                    effective_clip_radius_precise,
-                                    None,
-                                    0,
-                                );
-                            }
-                        } else {
-                            push_cached_fill(
-                                buffers,
-                                *order_map
-                                    .get(&format!("{path}:fill"))
-                                    .unwrap_or(&usize::MAX),
-                                format!("{path}:fill"),
-                                node.rect,
-                                Some(node.frame.precise_rect(node.resolved_rect)),
-                                background,
-                                node.stable_id.clone(),
-                                node_radius,
-                                Some(node.frame.logical_len(node.resolved_border_radius).max(0.0)),
-                                0.0,
-                                None,
-                                0,
-                                None,
-                                None,
-                                effective_clip_rect_precise,
-                                effective_clip_radius_precise,
-                                effective_clip_rect,
-                                effective_clip_radius,
-                            );
-                        }
-                    }
-            }
-
-            for_each_paint_ordered_child(node, |index, child| {
-                collect_cached_buffers(
-                    child,
-                    format!("{path}/child-{index}"),
-                    child_clip,
-                    child_resolved_clip,
-                    child_clip_rect_precise,
-                    child_clip_radius_precise,
-                    next_nearest_rounded_clip,
-                    next_nearest_rounded_clip_rect_precise,
-                    next_nearest_rounded_clip_radius_precise,
-                    order_map,
-                    dirty_node_ids,
-                    node_geometry,
-                    buffers,
-                    shader_buffers,
-                );
+                },
             });
         }
     }
+
+    let child_clips = clips.for_children(node);
+    for_each_paint_ordered_child(node, |index, child| {
+        collect_cached_buffers(
+            child,
+            format!("{path}/child-{index}"),
+            child_clips,
+            order_map,
+            dirty_node_ids,
+            node_geometry,
+            buffers,
+            shader_buffers,
+        );
+    });
 }
 
 fn collect_text_buffers(
@@ -7693,62 +7467,6 @@ fn collect_icon_buffers(
     }
 }
 
-fn push_cached_fill(
-    buffers: &mut Vec<CachedDecorationBuffer>,
-    order: usize,
-    stable_key: String,
-    rect: LogicalRect,
-    rect_precise: Option<PreciseLogicalRect>,
-    color: super::Color,
-    owner_node_id: Option<String>,
-    radius: i32,
-    radius_precise: Option<f32>,
-    border_width: f32,
-    hole_rect: Option<LogicalRect>,
-    hole_radius: i32,
-    hole_rect_precise: Option<PreciseLogicalRect>,
-    hole_radius_precise: Option<f32>,
-    clip_rect_precise: Option<PreciseLogicalRect>,
-    clip_radius_precise: Option<f32>,
-    clip_rect: Option<LogicalRect>,
-    clip_radius: i32,
-) {
-    if rect.width <= 0 || rect.height <= 0 || color.a == 0 {
-        return;
-    }
-
-    buffers.push(CachedDecorationBuffer {
-        owner_node_id,
-        stable_key,
-        order,
-        rect,
-        rect_precise: rect_precise.or_else(|| Some(precise_rect_from_logical(rect))),
-        color,
-        buffer: SolidColorBuffer::new(
-            (rect.width.max(1), rect.height.max(1)),
-            [
-                color.r as f32 / 255.0,
-                color.g as f32 / 255.0,
-                color.b as f32 / 255.0,
-                color.a as f32 / 255.0,
-            ],
-        ),
-        radius,
-        radius_precise,
-        border_width,
-        hole_rect,
-        hole_rect_precise,
-        hole_radius,
-        hole_radius_precise,
-        shared_inner_hole: false,
-        clip_rect,
-        clip_radius,
-        clip_rect_precise,
-        clip_radius_precise,
-        source_kind: "fill",
-    });
-}
-
 fn node_kind_name(kind: &super::DecorationNodeKind) -> &'static str {
     match kind {
         super::DecorationNodeKind::Box(_) => "box",
@@ -7834,7 +7552,6 @@ fn format_resolved_rect(rect: crate::ssd::ResolvedLogicalRect) -> String {
 #[derive(Debug, Clone, Copy)]
 struct NodeGeometry {
     rect_precise: PreciseLogicalRect,
-    content_rect_precise: PreciseLogicalRect,
     clip_rect_precise: Option<PreciseLogicalRect>,
 }
 
@@ -7843,7 +7560,6 @@ impl NodeGeometry {
         let frame = node.frame;
         Self {
             rect_precise: frame.precise_rect(node.resolved_rect),
-            content_rect_precise: frame.precise_rect(node.resolved_content_rect),
             clip_rect_precise: node
                 .resolved_effective_clip
                 .map(|clip| frame.precise_rect(clip.rect)),
@@ -7986,18 +7702,8 @@ fn log_decoration_refresh(
             window_id = snapshot.id,
             index,
             rect = %format_rect(buffer.rect),
-            color = %format_color(buffer.color),
-            radius = buffer.radius,
-            border_width = buffer.border_width,
-            hole_rect = buffer
-                .hole_rect
-                .map(format_rect)
-                .unwrap_or_else(|| "<none>".to_string()),
-            hole_radius = buffer.hole_radius,
-            clip_rect = buffer
-                .clip_rect
-                .map(format_rect)
-                .unwrap_or_else(|| "<none>".to_string()),
+            stable_key = %buffer.stable_key,
+            paint = ?buffer.paint,
             source_kind = buffer.source_kind,
             "cached decoration buffer"
         );
@@ -8009,10 +7715,6 @@ fn format_rect(rect: LogicalRect) -> String {
         "x={}, y={}, w={}, h={}",
         rect.x, rect.y, rect.width, rect.height
     )
-}
-
-fn format_color(color: super::Color) -> String {
-    format!("rgba({}, {}, {}, {})", color.r, color.g, color.b, color.a)
 }
 
 fn window_snapshot_requires_rebuild(
@@ -8066,17 +7768,7 @@ fn runtime_dirty_damage_rects(
                 item.stable_key.clone(),
                 (
                     item.rect,
-                    format!(
-                        "{:?}:{:?}:{}:{}:{:?}:{}:{:?}:{}",
-                        item.color,
-                        item.source_kind,
-                        item.radius,
-                        item.border_width,
-                        item.hole_rect,
-                        item.hole_radius,
-                        item.clip_rect,
-                        item.clip_radius
-                    ),
+                    format!("{:?}", item.paint),
                 ),
             )
         }),
@@ -8085,17 +7777,7 @@ fn runtime_dirty_damage_rects(
                 item.stable_key.clone(),
                 (
                     item.rect,
-                    format!(
-                        "{:?}:{:?}:{}:{}:{:?}:{}:{:?}:{}",
-                        item.color,
-                        item.source_kind,
-                        item.radius,
-                        item.border_width,
-                        item.hole_rect,
-                        item.hole_radius,
-                        item.clip_rect,
-                        item.clip_radius
-                    ),
+                    format!("{:?}", item.paint),
                 ),
             )
         }),
@@ -8542,18 +8224,84 @@ mod tests {
         }
         for buffer in &buffers {
             eprintln!(
-                "buffer {} kind={} rect={:?} clip_rect_precise={:?} clip_radius_precise={:?}",
+                "buffer {} kind={} rect={:?} clip={:?} rounded_clip={:?}",
                 buffer.stable_key,
                 buffer.source_kind,
                 buffer.rect,
-                buffer.clip_rect_precise,
-                buffer.clip_radius_precise,
+                buffer.paint.geometry.clip,
+                buffer.paint.geometry.rounded_clip,
             );
         }
     }
 
     /// 120 Hz frames are 8.33 ms apart; whole-millisecond sampling stepped a linear
     /// 250 ms animation by 3.2 % and 3.6 % of its distance in turn.
+    /// A `<ShaderEffect>` inside a rounded `<WindowBorder>` reports its own
+    /// shape plus the border's inner clip, in layout pixels.
+    #[test]
+    fn shader_effect_node_shape_carries_radius_border_and_clip() {
+        let mut titlebar = DecorationNode::new(DecorationNodeKind::ShaderEffect(
+            crate::ssd::ShaderEffectNode {
+                direction: LayoutDirection::Row,
+                shader: crate::ssd::CompiledEffect {
+                    input: crate::ssd::EffectInput::Backdrop,
+                    capture_padding: 0,
+                    invalidate: crate::ssd::EffectInvalidationPolicy::Always,
+                    pipeline: Vec::new(),
+                    alpha: crate::ssd::EffectAlphaMode::Opaque,
+                },
+            },
+        ))
+        .with_style(DecorationStyle {
+            height: Some(30.0),
+            border_radius: Some(4.0),
+            border_bottom: Some(BorderStyle {
+                width: 1.0,
+                color: Color::WHITE,
+            }),
+            ..Default::default()
+        });
+        titlebar.stable_id = Some("titlebar".into());
+        let inner = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Column,
+        }))
+        .with_children(vec![
+            titlebar,
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+        ]);
+        let root = DecorationNode::new(DecorationNodeKind::WindowBorder)
+            .with_style(DecorationStyle {
+                border: Some(BorderStyle {
+                    width: 2.0,
+                    color: Color::WHITE,
+                }),
+                border_radius: Some(10.0),
+                ..Default::default()
+            })
+            .with_children(vec![inner]);
+        let layout = DecorationTree::new(root)
+            .layout_for_client_with_scale(LogicalRect::new(100, 100, 400, 300), 1.5)
+            .expect("layout should succeed");
+        let order = build_render_order_map(&layout);
+        let shared = build_node_geometry_map(&layout);
+        let (_, shaders) = build_cached_buffers_and_shaders(&layout, &order, None, &shared);
+        let shape = shaders[0].node_shape;
+
+        assert_eq!(shape.layout_scale, 1.5);
+        assert_eq!(shape.radius, [6; 4], "4 logical px at 1.5x");
+        assert_eq!(shape.border, [0, 0, 2, 0], "bottom border only");
+        let (clip_rect, clip_radius) = shape.clip.expect("inside the rounded border");
+        // The border's inner edge: 3px border at 1.5x, radius (10 - 2) * 1.5.
+        assert_eq!(clip_radius, [12; 4]);
+        assert_eq!(&clip_rect[..2], &[0, 0], "the titlebar starts at the inner edge");
+
+        let frame = shape.effect_frame(None, 1.5);
+        assert_eq!(frame.radius, [6.0; 4]);
+        assert_eq!(frame.scale, 1.5);
+        // On an output at another scale, pixels follow that output.
+        assert_eq!(shape.effect_frame(None, 3.0).radius, [12.0; 4]);
+    }
+
     #[test]
     fn managed_animation_progress_keeps_fractional_frame_times() {
         let animation = test_rect_animation(
@@ -8874,6 +8622,7 @@ mod tests {
         let update = apply_shader_uniform_fast_update(
             &mut tree,
             &mut layout,
+            &mut [],
             &mut shader_buffers,
             &[CompositionPatch::ShaderUniform {
                 node_id: "root.ShaderEffect[0]".into(),

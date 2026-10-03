@@ -93,16 +93,17 @@ pub mod prelude {
             OutputContext, Sender, SurfaceRef,
         },
         effect::{
-            Effect, Include, Invalidate, Source, Stage, StateTexture, SurfaceEffect,
+            Effect, Include, Invalidate, PaintShader, Source, Stage, StateTexture, SurfaceEffect,
             SurfaceEffects, Uniform, backdrop_source, blend, dual_kawase_blur, image_source,
-            layer_source, noise, popup_source, render_to, render_to_if_dirty, save, saved, shader_input,
-            shader_stage, state_source, state_texture, unit, window_source, xray_backdrop_source,
+            layer_source, noise, paint_shader, popup_source, render_to, render_to_if_dirty, save,
+            saved, shader_input, shader_stage, state_source, state_texture, unit, window_source,
+            xray_backdrop_source,
         },
         reactive::{
             Get, Memo, Prop, ReadSignal, Scope, Signal, batch, derive, effect, memo, on_cleanup,
             signal, untrack,
         },
-        style::{Border, FontWeight, Style, Transform2D, hex, rgba},
+        style::{Border, FontWeight, Style, Transform2D, hex, inset_shadow, rgba, shadow},
         view::{
             AppIcon, Button, Child, ClientWindow, Composition, Direction, Element, Flex, Image,
             Label, ManagedTransform, ManagedWindow, Rect, ShaderEffect, WindowBorder,
@@ -111,7 +112,7 @@ pub mod prelude {
         window_stack::{Placement, WindowStack},
     };
     pub use shojiwm_lib::ssd::{
-        AlignItems, BlendMode, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
+        AlignItems, BlendMode, BoxShadow, Color, EffectRegion, ImageFit, JustifyContent, Overflow,
         PointerEvents, StylePosition, WindowAction,
     };
 }

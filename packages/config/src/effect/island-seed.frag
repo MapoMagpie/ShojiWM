@@ -8,7 +8,7 @@ float maskAt(vec2 uv) {
 
 vec4 shader_main(EffectContext effect) {
     vec2 uv = effect.texture_uv;
-    vec2 pixel = 1.0 / effect.texture_size_px;
+    vec2 pixel = 1.0 / effect.texture_size_phy_px;
     float center = maskAt(uv);
     float left = maskAt(uv - vec2(pixel.x, 0.0));
     float right = maskAt(uv + vec2(pixel.x, 0.0));

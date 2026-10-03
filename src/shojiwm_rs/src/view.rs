@@ -38,7 +38,7 @@ use shojiwm_lib::{
 
 use crate::{
     assets,
-    effect::Effect,
+    effect::{Effect, PaintShader, Uniform},
     reactive::{Observer, Prop, Scope, untrack},
     style::Style,
 };
@@ -164,6 +164,8 @@ pub struct Element {
     on_click: Option<ClickAction>,
     on_hover_change: Option<Rc<dyn Fn(bool)>>,
     on_active_change: Option<Rc<dyn Fn(bool)>>,
+    paint: Option<Box<PaintShader>>,
+    overlay: Option<Box<PaintShader>>,
     children: Vec<Child>,
 }
 
@@ -176,8 +178,33 @@ impl Element {
             on_click: None,
             on_hover_change: None,
             on_active_change: None,
+            paint: None,
+            overlay: None,
             children: Vec::new(),
         }
+    }
+
+    /// Replace the built-in background/border painting with a paint shader
+    /// (the `paint` prop). On a [`ShaderEffect`] it is drawn over the effect.
+    pub fn paint(mut self, shader: PaintShader) -> Self {
+        self.paint = Some(Box::new(shader));
+        self
+    }
+
+    /// A paint shader drawn above the children (the `overlay` prop).
+    pub fn overlay(mut self, shader: PaintShader) -> Self {
+        self.overlay = Some(Box::new(shader));
+        self
+    }
+
+    /// The paint shaders of this element with their patch stage indices.
+    fn paint_shaders(&self) -> impl Iterator<Item = (usize, &PaintShader)> {
+        [
+            (shojiwm_lib::runtime_api::PAINT_STAGE_INDEX, self.paint.as_deref()),
+            (shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX, self.overlay.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(index, shader)| shader.map(|shader| (index, shader)))
     }
 
     pub fn style(mut self, style: Style) -> Self {
@@ -661,30 +688,38 @@ impl MountedNode {
         }
 
         let mut uniforms = Vec::new();
+        let mut bind = |stage_index: usize, name: &str, value: &Prop<Uniform>| {
+            if value.is_static() {
+                return;
+            }
+            let binding_observer = {
+                let context = context.clone();
+                let key = (id.clone(), stage_index, name.to_owned());
+                Observer::new(move || {
+                    let key = key.clone();
+                    context.mark(|dirty| {
+                        dirty.uniforms.insert(key);
+                    });
+                })
+            };
+            crate::reactive::on_cleanup(move || binding_observer.dispose());
+            uniforms.push(UniformBinding {
+                stage_index,
+                name: name.to_owned(),
+                observer: binding_observer,
+                last: RefCell::new(None),
+            });
+        };
         if let ElementKind::ShaderEffect { effect, .. } = &element.kind {
             for (stage_index, stage) in effect.shader_stages() {
                 for (name, value) in stage.uniform_props() {
-                    if value.is_static() {
-                        continue;
-                    }
-                    let binding_observer = {
-                        let context = context.clone();
-                        let key = (id.clone(), stage_index, name.to_owned());
-                        Observer::new(move || {
-                            let key = key.clone();
-                            context.mark(|dirty| {
-                                dirty.uniforms.insert(key);
-                            });
-                        })
-                    };
-                    crate::reactive::on_cleanup(move || binding_observer.dispose());
-                    uniforms.push(UniformBinding {
-                        stage_index,
-                        name: name.to_owned(),
-                        observer: binding_observer,
-                        last: RefCell::new(None),
-                    });
+                    bind(stage_index, name, value);
                 }
+            }
+        }
+        for (stage_index, shader) in element.paint_shaders() {
+            for (name, value) in shader.uniform_props() {
+                bind(stage_index, name, value);
             }
         }
 
@@ -741,7 +776,30 @@ impl MountedNode {
         let element = &self.element;
         let uniforms = &self.uniforms;
         let (kind, style) = self.observer.track(|| {
-            let style = element.style.resolve();
+            // Reactive uniforms are tracked by their own binding (patched
+            // alone); everything else belongs to the node.
+            let mut read = |stage_index: usize, name: &str, value: &Prop<Uniform>| {
+                match uniforms
+                    .iter()
+                    .find(|binding| binding.stage_index == stage_index && binding.name == name)
+                {
+                    Some(binding) => {
+                        let value: ShaderUniformValue = binding.observer.track(|| value.get()).into();
+                        *binding.last.borrow_mut() = Some(value.clone());
+                        value
+                    }
+                    None => untrack(|| value.get()).into(),
+                }
+            };
+            let mut style = element.style.resolve();
+            style.paint = element
+                .paint
+                .as_ref()
+                .map(|shader| shader.compile(&mut read, shojiwm_lib::runtime_api::PAINT_STAGE_INDEX));
+            style.overlay = element
+                .overlay
+                .as_ref()
+                .map(|shader| shader.compile(&mut read, shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX));
             let kind = match &element.kind {
                 ElementKind::Box { direction } => DecorationNodeKind::Box(BoxNode {
                     direction: direction.get(),
@@ -760,19 +818,7 @@ impl MountedNode {
                     fit: *fit,
                 }),
                 ElementKind::ShaderEffect { direction, effect } => {
-                    let shader = effect.compile_with(&mut |stage_index, name, value| {
-                        match uniforms
-                            .iter()
-                            .find(|binding| binding.stage_index == stage_index && binding.name == name)
-                        {
-                            Some(binding) => {
-                                let value: ShaderUniformValue = binding.observer.track(|| value.get()).into();
-                                *binding.last.borrow_mut() = Some(value.clone());
-                                value
-                            }
-                            None => untrack(|| value.get()).into(),
-                        }
-                    });
+                    let shader = effect.compile_with(&mut read);
                     DecorationNodeKind::ShaderEffect(ShaderEffectNode {
                         direction: direction.get(),
                         shader,
@@ -870,17 +916,26 @@ impl MountedNode {
 
     /// Current value of a reactive uniform, if its shape is unchanged.
     fn read_uniform(&self, stage_index: usize, name: &str) -> Option<ShaderUniformValue> {
-        let ElementKind::ShaderEffect { effect, .. } = &self.element.kind else {
-            return None;
-        };
         let binding = self
             .uniforms
             .iter()
             .find(|binding| binding.stage_index == stage_index && binding.name == name)?;
-        let (_, stage) = effect
-            .shader_stages()
-            .find(|(index, _)| *index == stage_index)?;
-        let (_, prop) = stage.uniform_props().find(|(candidate, _)| *candidate == name)?;
+        let prop = match self
+            .element
+            .paint_shaders()
+            .find(|(index, _)| *index == stage_index)
+        {
+            Some((_, shader)) => shader.uniform_props().find(|(candidate, _)| *candidate == name)?.1,
+            None => {
+                let ElementKind::ShaderEffect { effect, .. } = &self.element.kind else {
+                    return None;
+                };
+                let (_, stage) = effect
+                    .shader_stages()
+                    .find(|(index, _)| *index == stage_index)?;
+                stage.uniform_props().find(|(candidate, _)| *candidate == name)?.1
+            }
+        };
         let value: ShaderUniformValue = binding.observer.track(|| prop.get()).into();
         let mut last = binding.last.borrow_mut();
         if !last.as_ref().is_some_and(|last| last.shape_matches(&value)) {
@@ -1011,6 +1066,17 @@ fn replace_uniform(
     value: &ShaderUniformValue,
 ) {
     if tree.stable_id.as_deref() == Some(id) {
+        let paint = match stage_index {
+            shojiwm_lib::runtime_api::PAINT_STAGE_INDEX => Some(&mut tree.style.paint),
+            shojiwm_lib::runtime_api::OVERLAY_STAGE_INDEX => Some(&mut tree.style.overlay),
+            _ => None,
+        };
+        if let Some(paint) = paint {
+            if let Some(paint) = paint {
+                paint.uniforms.insert(name.to_owned(), value.clone());
+            }
+            return;
+        }
         if let DecorationNodeKind::ShaderEffect(node) = &mut tree.kind {
             let stage = if stage_index == shojiwm_lib::runtime_api::SHADER_INPUT_STAGE_INDEX {
                 match &mut node.shader.input {

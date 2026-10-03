@@ -6526,6 +6526,99 @@ COMPOSITOR.window.composition = (window) => {
     }
 
     #[test]
+    fn embedded_runtime_sends_paint_shaders_and_patches_their_uniforms() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-paint-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        std::fs::write(
+            test_dir.join("glow.frag"),
+            "uniform float strength;\nvec4 paint_main(PaintContext ctx) { return vec4(strength); }\n",
+        )
+        .expect("test shader should be written");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import {
+  animationVariable,
+  Box,
+  ClientWindow,
+  COMPOSITOR,
+  paintShader,
+} from "shoji_wm";
+
+const phase = animationVariable("paint-uniform-patch-test");
+COMPOSITOR.window.composition = (window) => {
+  const value = window.animation.variable(phase);
+  if (!window.animation.running(phase)) {
+    window.animation.start(phase, { duration: 1000, from: 0, to: 1 });
+  }
+  const glow = paintShader("./glow.frag", { uniforms: { strength: value }, outsets: 6 });
+  return (
+    <Box
+      paint={glow}
+      overlay={paintShader("./glow.frag", { uniforms: { strength: 1 } })}
+      style={{
+        boxShadow: [{ y: 4, blur: 12, color: "#00000080" }, { blur: 2, spread: -1, color: "#fff", inset: true }],
+      }}
+    >
+      <ClientWindow />
+    </Box>
+  );
+};
+"##,
+        )
+        .expect("test config should be written");
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let window = make_window(false);
+        let tree = evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        let style = &tree.node.style;
+        let paint = style.paint.as_ref().expect("paint shader decoded");
+        assert!(paint.shader.path.ends_with("glow.frag"));
+        assert_eq!(paint.outsets, shojiwm_lib::ssd::Edges::all(6.0));
+        assert!(paint.uniforms.contains_key("strength"));
+        assert!(style.overlay.is_some());
+        assert_eq!(style.box_shadow.len(), 2);
+        assert_eq!(style.box_shadow[0].offset_y, 4.0);
+        assert!(style.box_shadow[1].inset);
+
+        evaluator
+            .scheduler_tick(16.0)
+            .expect("animation scheduler should advance");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 16, false)
+            .expect("cached composition should evaluate");
+        assert!(
+            cached.node_patches.iter().any(|patch| matches!(
+                patch,
+                shojiwm_lib::runtime_api::CompositionPatch::ShaderUniform {
+                    name,
+                    stage_index: shojiwm_lib::runtime_api::PAINT_STAGE_INDEX,
+                    ..
+                } if name == "strength"
+            )),
+            "paint uniforms take the uniform fast path: {:?}",
+            cached.node_patches
+        );
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
     fn embedded_runtime_uses_direct_effect_uniform_patches_for_animation() {
         let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")

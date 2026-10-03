@@ -25,6 +25,8 @@ import {Box, Label, Button, AppIcon, Image, ShaderEffect, WindowBorder} from 'sh
 | `id` | `string` | ターゲット無効化のための安定したノード id |
 | `onHoverChange` | `(hovered: boolean) => void` | ポインターの出入り |
 | `onActiveChange` | `(active: boolean) => void` | 押下／解放 |
+| `paint` | `PaintShaderHandle` | 組み込みの背景・枠を置き換え。[ペイントシェーダー](./paint.md)を参照 |
+| `overlay` | `PaintShaderHandle` | 子要素より上に描画。[ペイントシェーダー](./paint.md)を参照 |
 
 すべての `style` 値（および多くの prop）は、素の値かシグナルのどちらも受け付けるので、
 リアクティブに更新されます。
@@ -191,6 +193,13 @@ const [hover, setHover] = useState(false);
 
 ボーダー: `border`・`borderTop`・`borderRight`・`borderBottom`・`borderLeft`（各
 `{px, color}`）に加えて `borderFit`（`"normal" | "fit-children"`）。
+辺ごとの指定はその辺について `border` を上書きし、幅（コンテンツ領域もそれに合わせて
+ずれます）と色の両方に効きます。0 でない幅は最低でも物理 1px になります。
+
+影: `boxShadow` — `{x, y, blur, spread, color, inset}` 1 つ、またはその配列。CSS と
+同じ意味です。[ペイントシェーダー](./paint.md#影-boxshadow)を参照。
+
+色は `#RGB`・`#RGBA`・`#RRGGBB`・`#RRGGBBAA` で指定します。
 
 ### テキスト（`<Label/>` 用）
 

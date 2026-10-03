@@ -830,6 +830,12 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const borderColor = window.isFocused((focused) =>
     focused ? "#d7ba7d" : "#4f5666",
   );
+  // A soft drop shadow under the frame; the focused window floats a bit higher.
+  const windowShadow = window.isFocused((focused) =>
+    focused
+      ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
+      : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
+  );
   const titlebarBackground = window.isFocused((focused) =>
     focused ? "#1f243080" : "#2a2f3a80",
   );
@@ -853,7 +859,8 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
       dualKawaseBlur({ radius: 4, passes: 2 }),
       shaderStage(loadShader("./src/effect/liquid-glass.frag"), {
         uniforms: {
-          glass_radius_px: 10.0,
+          // Follow the window's rounded corners.
+          glass_radius_px: -1.0,
           distortion_depth: 0.2,
           distortion_strength: 0.15,
           chromatic_shift_px: 3.0,
@@ -969,6 +976,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
           style={{
             border: { px: WINDOW_BORDER_PX, color: borderColor },
             borderRadius: 10,
+            boxShadow: windowShadow,
             background: "#10131900",
             padding: 0,
             paddingX: 0,
@@ -1003,6 +1011,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
         style={{
           border: { px: WINDOW_BORDER_PX, color: borderColor },
           borderRadius: 10,
+          boxShadow: windowShadow,
           background: "#10131900",
           padding: 0,
           paddingX: 0,

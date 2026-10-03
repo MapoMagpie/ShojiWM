@@ -67,6 +67,8 @@ export interface NumericShaderUniformSnapshot {
 }
 
 const SHADER_INPUT_STAGE_INDEX = 0xffff_ffff;
+const PAINT_STAGE_INDEX = 0xffff_fffe;
+const OVERLAY_STAGE_INDEX = 0xffff_fffd;
 
 export function serializeCompositionTree(
   node: CompositionChild,
@@ -171,6 +173,17 @@ function serializeProps(
       continue;
     }
 
+    if (key === "paint" || key === "overlay") {
+      serialized[key] = serializeShaderUniformContainer(
+        value,
+        context,
+        path,
+        key === "paint" ? PAINT_STAGE_INDEX : OVERLAY_STAGE_INDEX,
+        "paint-shader",
+      );
+      continue;
+    }
+
     if (isSignal(value)) {
       serialized[key] = serializeValue(value);
       continue;
@@ -256,7 +269,7 @@ function serializeShaderUniformContainer(
   context: CompositionSerializationContext | undefined,
   nodeId: string,
   stageIndex: number,
-  expectedKind: "shader-input" | "shader-stage",
+  expectedKind: "shader-input" | "shader-stage" | "paint-shader",
 ): unknown {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return serializeValue(value);

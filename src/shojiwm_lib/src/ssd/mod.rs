@@ -13,6 +13,7 @@ pub mod bridge;
 mod evaluator;
 mod integration;
 mod interaction;
+pub mod paint;
 pub mod window_model;
 
 use smithay::utils::Logical;
@@ -38,6 +39,8 @@ pub use integration::{
     CachedDecorationBuffer, ContentClip, EffectEvaluationCacheEntry,
     WindowDecorationState,
 };
+#[cfg(test)]
+pub(crate) use integration::paint_buffers_for_layout;
 pub use interaction::DecorationInteractionSnapshot;
 pub use window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
@@ -254,6 +257,9 @@ pub struct ComputedDecorationNode {
     pub effective_clip: Option<DecorationClip>,
     pub(crate) resolved_effective_clip: Option<ResolvedDecorationClip>,
     pub(crate) frame: LayoutFrame,
+    /// Accumulated `transform` scale of this node and its ancestors. Rects
+    /// are already transformed; painted lengths (border, radius) use this.
+    pub(crate) transform_scale: (f64, f64),
     pub children: Vec<ComputedDecorationNode>,
 }
 
@@ -299,7 +305,12 @@ impl ComputedDecorationNode {
 
     fn window_border_style(&self) -> Option<BorderStyle> {
         if matches!(self.kind, DecorationNodeKind::WindowBorder) {
-            return self.style.border;
+            return self.style.border.or_else(|| {
+                self.style
+                    .has_border()
+                    .then(|| self.style.border_sides().into_iter().flatten().next())
+                    .flatten()
+            });
         }
 
         self.children.iter().find_map(Self::window_border_style)
@@ -1263,6 +1274,12 @@ pub struct DecorationStyle {
     pub font_family: Option<Vec<String>>,
     pub text_align: Option<String>,
     pub line_height: Option<f64>,
+    /// CSS-like shadows; the first entry is painted on top.
+    pub box_shadow: Vec<BoxShadow>,
+    /// Replaces the built-in background/border painting of the node.
+    pub paint: Option<PaintShader>,
+    /// Painted above the node's children.
+    pub overlay: Option<PaintShader>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1376,6 +1393,33 @@ pub struct BorderStyle {
     /// Logical width; any non-zero width covers at least one physical pixel.
     pub width: f64,
     pub color: Color,
+}
+
+/// One CSS-like `box-shadow` layer. Lengths are logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f64,
+    pub offset_y: f64,
+    /// Blur radius (CSS semantics: the Gaussian sigma is half of it).
+    pub blur: f64,
+    /// Grows (positive) or shrinks (negative) the shadow shape.
+    pub spread: f64,
+    pub color: Color,
+    /// Drawn inside the padding box instead of around the border box.
+    pub inset: bool,
+}
+
+/// A user paint shader: a GLSL file defining `vec4 paint_main(PaintContext)`.
+/// It replaces a node's built-in background/border painting (`paint`) or is
+/// drawn above its children (`overlay`). All geometry handed to the shader is
+/// in whole physical pixels, resolved by the layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PaintShader {
+    pub shader: ShaderModule,
+    pub uniforms: std::collections::BTreeMap<String, ShaderUniformValue>,
+    /// Logical area drawn around the node in addition to its own rect, for
+    /// glows and custom shadows.
+    pub outsets: Edges,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1659,14 +1703,6 @@ impl ResolvedLayoutEdges {
         }
     }
 
-    pub(crate) fn all(value: ResolvedLayoutValue) -> Self {
-        Self {
-            top: value,
-            right: value,
-            bottom: value,
-            left: value,
-        }
-    }
 }
 
 /// A rect in root-local physical pixels (see `LayoutFrame`).
@@ -1873,6 +1909,7 @@ fn layout_node_resolved(
         effective_clip: effective_clip.map(|clip| clip.to_logical_clip(frame)),
         resolved_effective_clip: effective_clip,
         frame,
+        transform_scale: (1.0, 1.0),
         children,
     };
 
@@ -2301,6 +2338,10 @@ fn transform_subtree(
     node.effective_clip = node
         .resolved_effective_clip
         .map(|clip| clip.to_logical_clip(frame));
+    node.transform_scale = (
+        node.transform_scale.0 * transform.scale_x.abs() as f64,
+        node.transform_scale.1 * transform.scale_y.abs() as f64,
+    );
 
     for child in &mut node.children {
         transform_subtree(child, origin, transform);
@@ -2583,25 +2624,61 @@ impl DecorationStyle {
         })
     }
 
+    /// The widest side of the border (the single width used where a uniform
+    /// border is assumed, e.g. the inner radius of a clip).
     pub(crate) fn resolved_border_width(&self, scale: f64) -> ResolvedLayoutValue {
-        self.border
-            .map(|border| ResolvedLayoutValue::border_width(border.width, scale))
-            .unwrap_or(ResolvedLayoutValue::ZERO)
+        let edges = self.resolved_border_edges(scale);
+        edges.top.max(edges.right).max(edges.bottom).max(edges.left)
     }
 
     pub(crate) fn resolved_border_radius(&self, scale: f64) -> ResolvedLayoutValue {
         ResolvedLayoutValue::from_logical(self.border_radius.unwrap_or(0.0).max(0.0), scale)
     }
 
+    /// The border of one side: `borderTop` etc. override `border`.
+    pub(crate) fn border_sides(&self) -> [Option<BorderStyle>; 4] {
+        [
+            self.border_top.or(self.border),
+            self.border_right.or(self.border),
+            self.border_bottom.or(self.border),
+            self.border_left.or(self.border),
+        ]
+    }
+
+    pub(crate) fn has_border(&self) -> bool {
+        self.border_sides()
+            .iter()
+            .any(|side| side.is_some_and(|border| border.width > 0.0))
+    }
+
+    /// Per-side border widths on the physical grid.
+    pub(crate) fn resolved_border_edges(&self, scale: f64) -> ResolvedLayoutEdges {
+        let [top, right, bottom, left] = self.border_sides().map(|side| {
+            side.map(|border| ResolvedLayoutValue::border_width(border.width, scale))
+                .unwrap_or(ResolvedLayoutValue::ZERO)
+        });
+        ResolvedLayoutEdges {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
     fn resolved_content_inset(&self, scale: f64) -> ResolvedLayoutEdges {
-        let border = self.resolved_border_width(scale);
+        let border = self.resolved_border_edges(scale);
         let padding = ResolvedLayoutEdges::from_edges(self.padding, scale);
         ResolvedLayoutEdges {
-            top: padding.top + border,
-            right: padding.right + border,
-            bottom: padding.bottom + border,
-            left: padding.left + border,
+            top: padding.top + border.top,
+            right: padding.right + border.right,
+            bottom: padding.bottom + border.bottom,
+            left: padding.left + border.left,
         }
+    }
+
+    /// Resolved padding on the physical grid.
+    pub(crate) fn resolved_padding(&self, scale: f64) -> ResolvedLayoutEdges {
+        ResolvedLayoutEdges::from_edges(self.padding, scale)
     }
 
     fn resolved_margin(&self, scale: f64) -> ResolvedLayoutEdges {
@@ -3090,7 +3167,7 @@ fn node_clips_children(node: &DecorationNode) -> bool {
     // separately when the client-surface clip is derived, because it is a leaf
     // placement marker rather than an SSD container.
     node.style.clips_children()
-        || (node.style.border.is_some() && !matches!(node.style.overflow, Some(Overflow::Visible)))
+        || (node.style.has_border() && !matches!(node.style.overflow, Some(Overflow::Visible)))
 }
 
 fn intersect_resolved_decoration_clips(

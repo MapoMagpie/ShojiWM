@@ -2,6 +2,7 @@ use serde::Deserialize;
 
 use super::{
     AlignItems, BackdropBlur, BackgroundEffectConfig, BlendMode, BorderFit, BorderStyle, BoxNode,
+    BoxShadow, PaintShader,
     ButtonNode, Color, CompiledEffect, DecorationInteractionHandlers, DecorationNode,
     DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectAlphaMode,
     EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectRegion, EffectStage, ImageNode, JustifyContent,
@@ -39,6 +40,8 @@ pub struct WireProps {
     pub text: Option<String>,
     pub icon: Option<serde_json::Value>,
     pub shader: Option<WireCompiledEffect>,
+    pub paint: Option<WirePaintShader>,
+    pub overlay: Option<WirePaintShader>,
     pub src: Option<String>,
     pub fit: Option<String>,
     pub id: Option<String>,
@@ -84,6 +87,51 @@ pub struct WireShaderStageFields {
     pub uniforms: std::collections::BTreeMap<String, WireShaderUniformValue>,
     #[serde(default)]
     pub textures: std::collections::BTreeMap<String, WireEffectInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePaintShader {
+    pub kind: String,
+    pub shader: WireShaderModule,
+    #[serde(default)]
+    pub uniforms: std::collections::BTreeMap<String, WireShaderUniformValue>,
+    pub outsets: Option<WirePaintOutsets>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum WirePaintOutsets {
+    Uniform(f64),
+    Edges {
+        left: Option<f64>,
+        right: Option<f64>,
+        top: Option<f64>,
+        bottom: Option<f64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireBoxShadow {
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default)]
+    pub blur: f64,
+    #[serde(default)]
+    pub spread: f64,
+    pub color: String,
+    #[serde(default)]
+    pub inset: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum WireBoxShadowValue {
+    Single(WireBoxShadow),
+    List(Vec<WireBoxShadow>),
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -328,6 +376,7 @@ pub struct WireStyle {
     pub font_family: Option<WireFontFamily>,
     pub text_align: Option<String>,
     pub line_height: Option<f64>,
+    pub box_shadow: Option<WireBoxShadowValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
@@ -475,7 +524,9 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
         } else {
             WindowBorderInteraction::default()
         };
-        let style = DecorationStyle::try_from(value.props.style)?;
+        let mut style = DecorationStyle::try_from(value.props.style)?;
+        style.paint = value.props.paint.map(decode_paint_shader).transpose()?;
+        style.overlay = value.props.overlay.map(decode_paint_shader).transpose()?;
         let children = value
             .children
             .into_iter()
@@ -1092,7 +1143,19 @@ fn is_reserved_effect_binding_name(name: &str) -> bool {
     name.is_empty()
         || matches!(
             name,
-            "tex" | "effect_texture_size_px" | "effect_content_rect_px" | "effect_frame_rect_px"
+            "tex"
+                | "effect_texture_size_px"
+                | "effect_content_rect_px"
+                | "effect_frame_rect_px"
+                | "effect_texture_size_phy_px"
+                | "effect_content_rect_phy_px"
+                | "effect_frame_rect_phy_px"
+                | "effect_frame_radius_phy_px"
+                | "effect_frame_border_phy_px"
+                | "effect_clip_rect_phy_px"
+                | "effect_clip_radius_phy_px"
+                | "effect_has_clip"
+                | "effect_scale"
         )
 }
 
@@ -1206,8 +1269,76 @@ impl TryFrom<WireStyle> for DecorationStyle {
             }),
             text_align: value.text_align,
             line_height: value.line_height,
+            box_shadow: match value.box_shadow {
+                None => Vec::new(),
+                Some(WireBoxShadowValue::Single(shadow)) => vec![parse_box_shadow(shadow)?],
+                Some(WireBoxShadowValue::List(shadows)) => shadows
+                    .into_iter()
+                    .map(parse_box_shadow)
+                    .collect::<Result<_, _>>()?,
+            },
+            paint: None,
+            overlay: None,
         })
     }
+}
+
+fn parse_box_shadow(input: WireBoxShadow) -> Result<BoxShadow, DecorationBridgeError> {
+    let finite = |value: f64| if value.is_finite() { value } else { 0.0 };
+    Ok(BoxShadow {
+        offset_x: finite(input.x),
+        offset_y: finite(input.y),
+        blur: finite(input.blur).max(0.0),
+        spread: finite(input.spread),
+        color: parse_color(&input.color)?,
+        inset: input.inset,
+    })
+}
+
+/// Uniform names the paint shader wrapper binds itself.
+pub(crate) fn is_reserved_paint_uniform_name(name: &str) -> bool {
+    name.is_empty() || name.starts_with("shoji_") || matches!(name, "alpha" | "size" | "tex")
+}
+
+fn decode_paint_shader(value: WirePaintShader) -> Result<PaintShader, DecorationBridgeError> {
+    if value.kind != "paint-shader"
+        || value.shader.kind != "shader-module"
+        || value.shader.path.is_empty()
+    {
+        return Err(DecorationBridgeError::InvalidShaderDescriptor);
+    }
+    let mut uniforms = std::collections::BTreeMap::new();
+    for (name, uniform) in value.uniforms {
+        if is_reserved_paint_uniform_name(&name) {
+            return Err(DecorationBridgeError::InvalidShaderDescriptor);
+        }
+        let uniform =
+            decode_shader_uniform(uniform).ok_or(DecorationBridgeError::InvalidShaderDescriptor)?;
+        uniforms.insert(name, uniform);
+    }
+    let clamp = |value: Option<f64>| value.filter(|value| value.is_finite()).unwrap_or(0.0).max(0.0);
+    let outsets = match value.outsets {
+        None => Edges::default(),
+        Some(WirePaintOutsets::Uniform(value)) => Edges::all(clamp(Some(value))),
+        Some(WirePaintOutsets::Edges {
+            left,
+            right,
+            top,
+            bottom,
+        }) => Edges {
+            top: clamp(top),
+            right: clamp(right),
+            bottom: clamp(bottom),
+            left: clamp(left),
+        },
+    };
+    Ok(PaintShader {
+        shader: ShaderModule {
+            path: value.shader.path,
+        },
+        uniforms,
+        outsets,
+    })
 }
 
 fn parse_border_fit(input: String) -> Result<BorderFit, DecorationBridgeError> {
@@ -1350,7 +1481,15 @@ fn parse_color(input: &str) -> Result<Color, DecorationBridgeError> {
         .strip_prefix('#')
         .ok_or_else(|| DecorationBridgeError::InvalidColor(trimmed.to_string()))?;
 
+    let short = |index: usize| {
+        u8::from_str_radix(&hex[index..index + 1], 16)
+            .map(|value| value * 17)
+            .map_err(|_| DecorationBridgeError::InvalidColor(trimmed.to_string()))
+    };
     match hex.len() {
+        // CSS short forms: #rgb / #rgba.
+        3 => Ok(Color::rgba(short(0)?, short(1)?, short(2)?, 255)),
+        4 => Ok(Color::rgba(short(0)?, short(1)?, short(2)?, short(3)?)),
         6 => {
             let r = u8::from_str_radix(&hex[0..2], 16)
                 .map_err(|_| DecorationBridgeError::InvalidColor(trimmed.to_string()))?;

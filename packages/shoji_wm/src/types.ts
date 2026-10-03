@@ -490,6 +490,18 @@ export type CompositionNodeType =
  */
 export interface ComponentProps {
   children?: CompositionRenderable | CompositionRenderable[];
+  /**
+   * Replaces the node's built-in background/border painting with a paint
+   * shader (see {@link paintShader}). On `<ShaderEffect/>` it is drawn over
+   * the effect output.
+   * ノード組み込みの背景・枠描画をペイントシェーダーで置き換えます。
+   */
+  paint?: PaintShaderHandle;
+  /**
+   * A paint shader drawn above the node's children (focus rings, sheens).
+   * 子要素より上に描くペイントシェーダー（フォーカスリング等）。
+   */
+  overlay?: PaintShaderHandle;
   /** Called with `true` when the pointer enters, `false` when it leaves. / ポインターが入ったとき `true`、出たとき `false` で呼ばれます。 */
   onHoverChange?: InteractionChangeHandler;
   /** Called with `true` when pressed, `false` when released. / 押下で `true`、離したとき `false` で呼ばれます。 */
@@ -579,6 +591,27 @@ export interface BackdropBlurOptions {
 export interface ShaderModuleHandle {
   kind: "shader-module";
   path: string;
+}
+
+/**
+ * Extra logical pixels a paint shader draws around its node (glows, custom
+ * shadows): one value for every side, or per side.
+ * ペイントシェーダーがノードの外側に描く論理ピクセル量。
+ */
+export type PaintOutsets =
+  | number
+  | { top?: number; right?: number; bottom?: number; left?: number };
+
+/**
+ * A paint shader: a GLSL file defining `vec4 paint_main(PaintContext ctx)`.
+ * Create it with {@link paintShader}.
+ * `vec4 paint_main(PaintContext ctx)` を定義した GLSL ファイル。
+ */
+export interface PaintShaderHandle {
+  kind: "paint-shader";
+  shader: ShaderModuleHandle;
+  uniforms?: ShaderUniformMap;
+  outsets?: PaintOutsets;
 }
 
 export interface ShaderStageHandle {
@@ -1789,6 +1822,24 @@ export interface BorderValue {
   color: MaybeSignal<string>;
 }
 
+/**
+ * One CSS `box-shadow` layer. Lengths are logical pixels.
+ * CSS の `box-shadow` 1 層分。長さは論理ピクセル。
+ */
+export interface BoxShadowValue {
+  /** Horizontal offset. / 水平オフセット。 */
+  x?: MaybeSignal<number>;
+  /** Vertical offset. / 垂直オフセット。 */
+  y?: MaybeSignal<number>;
+  /** Blur radius (CSS semantics). / ぼかし半径（CSS と同じ意味）。 */
+  blur?: MaybeSignal<number>;
+  /** Grows (positive) or shrinks (negative) the shadow. / 影の拡大・縮小。 */
+  spread?: MaybeSignal<number>;
+  color: MaybeSignal<string>;
+  /** Draw inside the padding box. / パディングボックスの内側に描く。 */
+  inset?: MaybeSignal<boolean>;
+}
+
 export interface WindowResizeHitArea {
   edgePx?: MaybeSignal<number>;
   cornerPx?: MaybeSignal<number>;
@@ -1856,6 +1907,11 @@ export interface SSDStyle {
   borderLeft?: MaybeSignal<BorderValue>;
   borderFit?: MaybeSignal<"normal" | "fit-children">;
   borderRadius?: MaybeSignal<number>;
+  /**
+   * CSS-like shadows; the first entry is painted on top.
+   * CSS 風の影。先頭の要素が最前面に描かれます。
+   */
+  boxShadow?: MaybeSignal<BoxShadowValue | BoxShadowValue[]>;
   visible?: MaybeSignal<boolean>;
   cursor?: MaybeSignal<string>;
   fontSize?: MaybeSignal<number>;
