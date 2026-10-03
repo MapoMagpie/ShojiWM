@@ -1538,6 +1538,16 @@ pub struct BackendData {
     >,
 }
 
+fn driver_load_error(path: &Path, step: &str, error: &dyn std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!(
+        "failed to {step} for {}: {error}. The GPU driver could not be loaded; look for \
+         MESA-LOADER or libglvnd messages on stderr. On NixOS this usually means ShojiWM and \
+         the system graphics drivers (/run/opengl-driver) come from different nixpkgs \
+         revisions (e.g. a glibc version mismatch).",
+        path.display()
+    ))
+}
+
 pub fn device_added(
     state: &mut ShojiWM,
     loop_handle: &LoopHandle<'_, ShojiWM>,
@@ -1553,9 +1563,15 @@ pub fn device_added(
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
 
     let (drm, drm_events) = DrmDevice::new(fd.clone(), true)?;
-    let gbm = Device::new(fd.clone())?;
+    // Both steps load the GPU driver's userspace (GBM backend, EGL vendor library). When that
+    // fails the bare errno says nothing, while the real reason is usually on stderr from
+    // MESA-LOADER / libglvnd: a driver that cannot be loaded into this process.
+    let gbm = Device::new(fd.clone()).map_err(|error| {
+        driver_load_error(path, "create a GBM device", &error)
+    })?;
 
-    let egl = unsafe { EGLDisplay::new(gbm.clone())? };
+    let egl = unsafe { EGLDisplay::new(gbm.clone()) }
+        .map_err(|error| driver_load_error(path, "initialize EGL", &error))?;
     let ctx = EGLContext::new_with_priority(&egl, ContextPriority::High)?;
     let mut renderer = unsafe { GlesRenderer::new(ctx)? };
     match renderer.bind_wl_display(&state.display_handle) {

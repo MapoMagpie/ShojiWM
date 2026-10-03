@@ -130,6 +130,11 @@ fn run_with_args(
     let boot = RuntimeBoot::new(launcher, &args);
     let result = backend.run(boot);
     profiler::dump_if_enabled("shutdown");
+    if let Err(error) = &result {
+        // `run` prints it to stderr too, but only after the log writer is gone; a session
+        // started from a display manager rarely has its stderr anywhere the user looks.
+        error!(error = %error, "shoji_wm exited with a fatal error");
+    }
     result?;
 
     Ok(())

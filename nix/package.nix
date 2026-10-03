@@ -93,9 +93,20 @@ let
     libdrm
   ];
 
-  gbmBackendsPath = "${addDriverRunpath.driverLink}/lib/gbm";
-  driDriversPath = "${addDriverRunpath.driverLink}/lib/dri";
-  eglVendorLibraryDirs = "${addDriverRunpath.driverLink}/share/glvnd/egl_vendor.d";
+  # The system driver comes first: it matches the running kernel and covers proprietary
+  # drivers. The bundled mesa is the fallback for when the system driver cannot be loaded
+  # into this binary, e.g. a system built from a newer nixpkgs whose mesa needs a newer
+  # glibc than ShojiWM was built against. The GBM and DRI loaders try each path in turn;
+  # libglvnd skips EGL vendors whose library does not load.
+  driverSearchPath =
+    subdir:
+    lib.concatStringsSep ":" [
+      "${addDriverRunpath.driverLink}/${subdir}"
+      "${mesa}/${subdir}"
+    ];
+  gbmBackendsPath = driverSearchPath "lib/gbm";
+  driDriversPath = driverSearchPath "lib/dri";
+  eglVendorLibraryDirs = driverSearchPath "share/glvnd/egl_vendor.d";
 in
 rustPlatform.buildRustPackage {
   pname = "shojiwm";

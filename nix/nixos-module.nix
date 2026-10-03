@@ -9,8 +9,12 @@
 
 let
   cfg = config.programs.shojiwm;
-  system = pkgs.stdenv.hostPlatform.system;
-  defaultPackage = self.packages.${system}.default;
+  # Built from the system's nixpkgs, not the one pinned in ShojiWM's flake.lock: the
+  # compositor loads the system graphics driver (/run/opengl-driver), and a driver from a
+  # newer nixpkgs can need a newer glibc than a binary built from an older pin provides.
+  defaultPackage = pkgs.callPackage ./package.nix {
+    libgbm = pkgs.libgbm or pkgs.mesa;
+  };
   defaultXwayland = pkgs.xwayland or (pkgs.xorg.xwayland or null);
   defaultSatellite = pkgs.xwayland-satellite or null;
   gtkPortal = pkgs.xdg-desktop-portal-gtk or null;
@@ -33,8 +37,13 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = defaultPackage;
-      defaultText = "ShojiWM flake default package";
-      description = "ShojiWM package to install.";
+      defaultText = lib.literalExpression "pkgs.callPackage \"\${shojiwm}/nix/package.nix\" { }";
+      description = ''
+        ShojiWM package to install. The default builds ShojiWM from the system's nixpkgs so
+        that it can load the system graphics driver. Setting this to the flake's
+        `packages.''${system}.default` uses the nixpkgs pinned by ShojiWM instead; that package
+        falls back to its own mesa when the system driver cannot be loaded.
+      '';
     };
 
     portal.enable = lib.mkOption {
