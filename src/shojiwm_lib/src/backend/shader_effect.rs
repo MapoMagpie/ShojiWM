@@ -953,7 +953,7 @@ struct EffectPipelineCache {
 }
 
 #[derive(Debug, Default)]
-struct EffectInstancePipelineCache {
+pub(crate) struct EffectInstancePipelineCache {
     renderer_context_id: Option<ContextId<GlesTexture>>,
     pipeline: EffectPipelineCache,
 }
@@ -1665,6 +1665,8 @@ struct SolidWhiteTextureCache(Mutex<Option<GlesTexture>>);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShaderEffectError {
+    #[error("output overlay shader failed to compile; see the compositor shader error report")]
+    OverlayShaderFailed,
     #[error("failed to read shader source at {path}: {source}")]
     ReadShader {
         path: String,
@@ -4303,6 +4305,48 @@ fn apply_effect_pipeline_cached_with_finish_mode(
         Some(cache),
         finish_mode,
     )
+}
+
+pub(crate) fn apply_overlay_effect(
+    renderer: &mut GlesRenderer,
+    snapshot: Option<GlesTexture>,
+    backdrop: Option<GlesTexture>,
+    size: (i32, i32),
+    scale: f64,
+    effect: &CompiledEffect,
+    cache: &mut EffectInstancePipelineCache,
+) -> Result<GlesTexture, ShaderEffectError> {
+    let mut named = HashMap::new();
+    if let Some(snapshot) = snapshot {
+        named.insert(super::overlay::SNAPSHOT_NAME.to_owned(), snapshot);
+    }
+    let backdrop = match backdrop {
+        Some(texture) => texture,
+        None => solid_white_texture(renderer)?,
+    };
+    let rect = Rectangle::from_size(size.into());
+    let mut ctx = EffectExecutionContext {
+        backdrop,
+        xray_backdrop: None,
+        layer_source: None,
+        popup_source: None,
+        size,
+        state_base_size: size,
+        content_rect: rect,
+        frame: ResolvedEffectFrame::new(EffectFrame::plain(None, scale), rect),
+        named,
+        source_signatures: EffectSourceSignatures::default(),
+    };
+    let cache = cache.begin_frame(renderer);
+    // Window effects intentionally degrade to their unprocessed input. An overlay must
+    // reject instead: a failed transition must never freeze an unchanged screenshot.
+    let old_depth = EFFECT_PIPELINE_DEPTH.with(|depth| depth.replace(1));
+    let old_stand_in = STAND_IN_SHADER_USED.with(|used| used.replace(false));
+    let result = run_effect_pipeline_inner(renderer, effect, &mut ctx, None, Some(size),
+        Some(cache), BackdropFinishMode::Materialize);
+    let failed_shader = STAND_IN_SHADER_USED.with(|used| used.replace(old_stand_in));
+    EFFECT_PIPELINE_DEPTH.with(|depth| depth.set(old_depth));
+    if failed_shader { Err(ShaderEffectError::OverlayShaderFailed) } else { result }
 }
 
 fn apply_effect_pipeline_with_cache(

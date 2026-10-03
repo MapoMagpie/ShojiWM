@@ -1158,6 +1158,8 @@ struct SurfaceDmabufFeedback {
 }
 
 pub fn pause_tty_session(state: &mut ShojiWM) {
+    crate::backend::overlay::close_all("Session paused");
+    state.output_overlays.clear();
     for backend in state.tty_backends.values_mut() {
         backend.drm_output_manager.pause();
         for surface in backend.surfaces.values_mut() {
@@ -3894,8 +3896,10 @@ fn render_surface(
             )?
         };
         let mut fullscreen_overlay_visible =
-            fullscreen_window.is_some() && !upper_layer_elements.is_empty();
+            fullscreen_window.is_some() && (!upper_layer_elements.is_empty()
+                || crate::backend::overlay::has_output(&output.name()));
         scene_elements.extend(upper_layer_elements);
+        let mut overlay_below_layers = scene_elements.len();
         if fullscreen_window.is_none() {
             timescope::scope!("tty ssd popups");
             scene_elements.extend(ssd_popup_scene_elements(
@@ -6412,6 +6416,7 @@ fn render_surface(
         };
         fullscreen_overlay_visible |=
             fullscreen_window.is_some() && !layer_popup_elements.is_empty();
+        overlay_below_layers += layer_popup_elements.len();
         let mut front_to_back_scene = layer_popup_elements;
         front_to_back_scene.append(&mut scene_elements);
         scene_elements = front_to_back_scene;
@@ -6457,6 +6462,7 @@ fn render_surface(
                     .map(TtyRenderElements::Damage),
             );
         }
+        overlay_below_layers += content_elements.len();
         content_elements.extend(scene_elements);
 
         let cursor_status_for_log = cursor_override
@@ -6484,7 +6490,13 @@ fn render_surface(
                 .map(TtyRenderElements::Window),
             );
         }
+        overlay_below_layers += content_for_capture.len();
         content_for_capture.extend(content_elements);
+        if !state.session_lock_active {
+            state.output_overlays.render(&mut backend.renderer, &output,
+                (output_geo.size.w, output_geo.size.h), scale, &mut content_for_capture,
+                overlay_below_layers, TtyRenderElements::Snapshot);
+        }
         // The element count for diagnostics — final elements is built below
         // after capture has run against the by-reference slices.
         timing.render_element_count = cursor_pointer_elements.len() + content_for_capture.len();

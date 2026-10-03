@@ -238,6 +238,7 @@ pub enum WireAutomaticEffectInvalidationPolicy {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum WireEffectInput {
+    SnapshotSource,
     BackdropSource,
     XrayBackdropSource,
     WindowSource { include: Option<String> },
@@ -880,6 +881,7 @@ fn decode_effect_outsets(value: Option<WireEffectOutsets>) -> EffectOutsets {
 
 fn decode_effect_input(value: WireEffectInput) -> Result<EffectInput, DecorationBridgeError> {
     Ok(match value {
+        WireEffectInput::SnapshotSource => EffectInput::Named(crate::backend::overlay::SNAPSHOT_NAME.into()),
         WireEffectInput::BackdropSource => EffectInput::Backdrop,
         WireEffectInput::XrayBackdropSource => EffectInput::XrayBackdrop,
         WireEffectInput::WindowSource { include } => {

@@ -456,6 +456,8 @@ pub struct ShojiWM {
     pub popup_framebuffer_effect_states:
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
     pub output_capture_mirrors: HashMap<String, crate::backend::tty::OutputCaptureMirror>,
+    pub(crate) output_overlays: crate::backend::overlay::OutputOverlays,
+    output_overlay_timer_active: bool,
     pub pointer_contents: PointerContents,
     /// Hovered decoration nodes: one, or a chain while the pointer is inside an
     /// interactive `<Popup>` (see `ssd::popup`).
@@ -1751,6 +1753,8 @@ impl ShojiWM {
             popup_effect_cache: HashMap::new(),
             popup_framebuffer_effect_states: HashMap::new(),
             output_capture_mirrors: HashMap::new(),
+            output_overlays: crate::backend::overlay::OutputOverlays::default(),
+            output_overlay_timer_active: false,
             pointer_contents: PointerContents::default(),
             decoration_hover_targets: Vec::new(),
             popup_input: Default::default(),
@@ -2652,6 +2656,8 @@ impl ShojiWM {
             .insert_source(ping_source, |_, _, state| {
                 state.record_event_source_wake("runtime-host");
                 state.drain_runtime_host_messages();
+                state.tick_output_overlays();
+                state.schedule_output_overlay_tick();
                 if state.config_runtime.host().take_wake_request() {
                     let _ = state.tick_runtime_scheduler_with(true);
                 }
@@ -2704,6 +2710,37 @@ impl ShojiWM {
         if let Some(result) = reload_ready {
             self.loop_handle
                 .insert_idle(move |state| state.finish_prepared_reload(result));
+        }
+    }
+
+    fn tick_output_overlays(&mut self) -> u64 {
+        let outputs: Vec<_> = self.space.outputs()
+            .filter(|output| self.runtime_output_render_enabled(&output.name())).cloned().collect();
+        let unavailable = self.session_lock_active || (!self.tty_backends.is_empty() && !self.tty_session_active);
+        if self.output_overlays.tick(&outputs, unavailable) {
+            self.schedule_redraw();
+            self.runtime_frame_sync_interval_ms().min(crate::backend::overlay::deadline_interval_ms())
+        } else { crate::backend::overlay::deadline_interval_ms() }
+    }
+
+    fn schedule_output_overlay_tick(&mut self) {
+        if self.output_overlay_timer_active || !crate::backend::overlay::any() { return; }
+        let interval = self.runtime_frame_sync_interval_ms();
+        let result = self.loop_handle.insert_source(Timer::from_duration(Duration::from_millis(interval)), |_, _, state| {
+            let interval = state.tick_output_overlays();
+            if crate::backend::overlay::any() {
+                TimeoutAction::ToDuration(Duration::from_millis(interval))
+            } else {
+                state.output_overlay_timer_active = false;
+                TimeoutAction::Drop
+            }
+        });
+        match result {
+            Ok(_) => self.output_overlay_timer_active = true,
+            Err(error) => {
+                crate::backend::overlay::close_all("Cannot schedule output effects");
+                warn!(?error, "failed to schedule output overlay timer");
+            }
         }
     }
 
@@ -2842,6 +2879,8 @@ impl ShojiWM {
     }
 
     fn swap_reloaded_decoration_runtime(&mut self) {
+        crate::backend::overlay::close_all("Config reloaded");
+        self.output_overlays.clear();
         // Windows that are mid-close hold GPU snapshots whose release depends
         // on the current config's close handshake (`closePoll` →
         // `finalizeClose`). The reloaded config knows nothing about them, so

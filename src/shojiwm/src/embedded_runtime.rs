@@ -20,6 +20,33 @@ thread_local! {
     );
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RUNTIME_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct TestRuntimeDir(PathBuf);
+
+#[cfg(test)]
+impl TestRuntimeDir {
+    fn new(bridge_id: u32) -> std::io::Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let path = std::env::temp_dir().join(format!("shoji-test-{}-{bridge_id}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        TEST_RUNTIME_DIR.with(|dir| *dir.borrow_mut() = Some(path.clone()));
+        Ok(Self(path))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestRuntimeDir {
+    fn drop(&mut self) {
+        TEST_RUNTIME_DIR.with(|dir| *dir.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 use rustyscript::{
     Module, Runtime, RuntimeOptions,
     deno_core::{
@@ -509,7 +536,20 @@ struct WireNativeCompositionPatch {
 #[op2]
 #[serde]
 fn op_shoji_environment() -> HashMap<String, String> {
-    std::env::vars().collect()
+    let environment = std::env::vars().collect();
+    #[cfg(test)]
+    let environment = {
+        let mut environment: HashMap<String, String> = environment;
+        TEST_RUNTIME_DIR.with(|dir| {
+            let dir = dir.borrow();
+            let dir = dir.as_ref().expect("test runtime must isolate its IPC environment");
+            environment.insert("XDG_RUNTIME_DIR".into(), dir.to_string_lossy().into_owned());
+            environment.insert("WAYLAND_DISPLAY".into(), "test".into());
+            environment.remove("SHOJI_RUNTIME_WAKE_PID");
+        });
+        environment
+    };
+    environment
 }
 
 #[op2]
@@ -585,6 +625,7 @@ fn op_shoji_wake_compositor() {
 }
 
 struct BridgeRegistration {
+    overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>,
     responses: Sender<EmbeddedRuntimeResponse>,
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
@@ -648,6 +689,7 @@ struct ShojiIpcConnection {
 
 #[repr(C)]
 struct ShojiRuntimeBridge {
+    overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>>,
     responses: Sender<EmbeddedRuntimeResponse>,
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
@@ -974,6 +1016,7 @@ impl ShojiRuntimeBridge {
             .remove(&bridge_id)
             .ok_or_else(|| std::io::Error::other("runtime bridge registration is missing"))?;
         Ok(ShojiRuntimeBridge {
+            overlay_owner: registration.overlay_owner,
             requests: tokio::sync::Mutex::new(registration.requests),
             responses: registration.responses,
             composition_updates: registration.composition_updates,
@@ -983,6 +1026,39 @@ impl ShojiRuntimeBridge {
             effect_uniform_patch_count: registration.effect_uniform_patch_count,
             pending_native_response: Mutex::new(None),
         })
+    }
+
+    fn create_overlay(&self, #[string] output: String, #[string] placement: String,
+        max_duration: f64, #[serde] effect: WireCompiledEffect, persistent: bool) -> Result<u32, std::io::Error>
+    {
+        let effect = effect.try_into().map_err(|error| std::io::Error::other(format!("{error}")))?;
+        let host = WAKE_HOST.lock().ok().and_then(|host| host.clone()).unwrap_or_default();
+        shojiwm_lib::backend::overlay::create(&self.overlay_owner, output, placement, max_duration, effect, persistent, host)
+    }
+
+    #[async_method]
+    async fn wait_overlay(&self, id: u32) -> Result<(), std::io::Error> {
+        shojiwm_lib::backend::overlay::get(&self.overlay_owner, id)?.wait(false).await
+    }
+
+    #[async_method]
+    async fn wait_overlay_closed(&self, id: u32) -> Result<(), std::io::Error> {
+        if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
+            control.wait(true).await?;
+        }
+        Ok(())
+    }
+
+    fn update_overlay(&self, id: u32, #[serde] effect: WireCompiledEffect) -> Result<(), std::io::Error> {
+        if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
+            control.update(effect.try_into().map_err(|error| std::io::Error::other(format!("{error}")))?)?;
+        }
+        Ok(())
+    }
+
+    #[fast]
+    fn dispose_overlay(&self, id: u32) {
+        if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) { control.dispose(); }
     }
 
     #[async_method]
@@ -2309,6 +2385,7 @@ impl ImportProvider for ShojiImportProvider {
 }
 
 pub struct EmbeddedRuntime {
+    overlay_owner: Arc<AtomicBool>,
     requests: Option<tokio::sync::mpsc::UnboundedSender<BridgeRequest>>,
     responses: Receiver<EmbeddedRuntimeResponse>,
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
@@ -2598,6 +2675,8 @@ impl EmbeddedRuntime {
         let composition_updates = Arc::new(Mutex::new(HashMap::new()));
         let effect_updates = Arc::new(Mutex::new(HashMap::new()));
         let effect_uniform_patch_count = Arc::new(AtomicU32::new(0));
+        let overlay_owner = Arc::new(AtomicBool::new(true));
+        let overlay_owner_for_thread = overlay_owner.clone();
 
         bridge_registrations()
             .lock()
@@ -2605,6 +2684,7 @@ impl EmbeddedRuntime {
             .insert(
                 bridge_id,
                 BridgeRegistration {
+                    overlay_owner: overlay_owner.clone(),
                     requests: request_rx,
                     responses: response_tx,
                     composition_updates: Arc::clone(&composition_updates),
@@ -2623,6 +2703,7 @@ impl EmbeddedRuntime {
                     working_dir.as_deref(),
                     &ready_tx,
                 );
+                shojiwm_lib::backend::overlay::close_owner(&overlay_owner_for_thread);
                 if let Err(error) = result {
                     if let Ok(mut registrations) = bridge_registrations().lock() {
                         registrations.remove(&bridge_id);
@@ -2644,6 +2725,7 @@ impl EmbeddedRuntime {
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
+                overlay_owner,
                 requests: Some(request_tx),
                 responses: response_rx,
                 composition_updates,
@@ -2808,11 +2890,13 @@ impl EmbeddedRuntime {
     }
 
     pub fn kill(&mut self) -> std::io::Result<()> {
+        shojiwm_lib::backend::overlay::close_owner(&self.overlay_owner);
         self.requests.take();
         Ok(())
     }
 
     pub fn wait(&mut self) -> std::io::Result<EmbeddedRuntimeExitStatus> {
+        shojiwm_lib::backend::overlay::close_owner(&self.overlay_owner);
         self.requests.take();
         let code = self
             .worker
@@ -2833,6 +2917,7 @@ impl EmbeddedRuntime {
 
 impl Drop for EmbeddedRuntime {
     fn drop(&mut self) {
+        shojiwm_lib::backend::overlay::close_owner(&self.overlay_owner);
         self.requests.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -2847,6 +2932,9 @@ fn run_runtime(
     working_dir: Option<&std::path::Path>,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    let _test_dir = TestRuntimeDir::new(bridge_id)
+        .map_err(|error| format!("failed to isolate test runtime: {error}"))?;
     let runtime_working_dir = working_dir
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
