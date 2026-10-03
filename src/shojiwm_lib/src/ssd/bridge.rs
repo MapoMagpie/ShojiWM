@@ -448,6 +448,8 @@ pub enum DecorationBridgeError {
     InvalidShaderType(String),
     #[error("invalid effect input")]
     InvalidEffectInput,
+    #[error("snapshotSource() is only available in output overlays")]
+    SnapshotSourceOutsideOverlay,
     #[error("invalid renderToIfDirty dependency: {0}")]
     InvalidRenderToDependency(String),
     #[error(
@@ -612,183 +614,197 @@ impl TryFrom<WireCompiledEffect> for CompiledEffect {
     type Error = DecorationBridgeError;
 
     fn try_from(value: WireCompiledEffect) -> Result<Self, Self::Error> {
-        if value.kind != "compiled-effect" {
-            return Err(DecorationBridgeError::InvalidShaderDescriptor);
+        let effect = decode_compiled_effect(value)?;
+        if crate::backend::overlay::uses_snapshot(&effect) {
+            return Err(DecorationBridgeError::SnapshotSourceOutsideOverlay);
         }
-
-        let input = decode_effect_input(value.input.unwrap_or(WireEffectInput::BackdropSource))?;
-
-        let mut stages = Vec::with_capacity(value.pipeline.len());
-        for stage in value.pipeline {
-            match stage {
-                WireEffectStage::ShaderStage(stage) => {
-                    if stage.shader.kind != "shader-module" || stage.shader.path.is_empty() {
-                        return Err(DecorationBridgeError::InvalidShaderDescriptor);
-                    }
-                    if stage.textures.len() > 7
-                        || stage
-                            .textures
-                            .keys()
-                            .any(|name| is_reserved_effect_binding_name(name))
-                        || stage
-                            .uniforms
-                            .keys()
-                            .any(|name| is_reserved_effect_binding_name(name))
-                        || stage
-                            .textures
-                            .keys()
-                            .any(|name| stage.uniforms.contains_key(name))
-                    {
-                        return Err(DecorationBridgeError::InvalidShaderDescriptor);
-                    }
-                    let mut uniforms = std::collections::BTreeMap::new();
-                    for (name, value) in stage.uniforms {
-                        let value = decode_shader_uniform(value)
-                            .ok_or(DecorationBridgeError::InvalidShaderDescriptor)?;
-                        uniforms.insert(name, value);
-                    }
-                    let textures = stage
-                        .textures
-                        .into_iter()
-                        .map(|(name, input)| Ok((name, decode_effect_input(input)?)))
-                        .collect::<Result<_, DecorationBridgeError>>()?;
-                    stages.push(EffectStage::Shader(ShaderStage {
-                        shader: ShaderModule {
-                            path: stage.shader.path,
-                        },
-                        uniforms,
-                        textures,
-                    }));
-                }
-                WireEffectStage::DualKawaseBlur(stage) => {
-                    stages.push(EffectStage::DualKawaseBlur(BackdropBlur {
-                        radius: stage.radius.unwrap_or(8).max(0),
-                        passes: stage.passes.unwrap_or(2).clamp(0, 8),
-                    }));
-                }
-                WireEffectStage::Noise(stage) => {
-                    let kind = match stage.noise_kind.as_deref().unwrap_or("salt") {
-                        "salt" => NoiseKind::Salt,
-                        other => {
-                            return Err(DecorationBridgeError::InvalidShaderType(
-                                other.to_string(),
-                            ));
-                        }
-                    };
-                    stages.push(EffectStage::Noise(NoiseStage {
-                        kind,
-                        amount: stage.amount.unwrap_or(0.01).clamp(0.0, 1.0),
-                    }));
-                }
-                WireEffectStage::Save(stage) => {
-                    if stage.name.is_empty() {
-                        return Err(DecorationBridgeError::InvalidShaderDescriptor);
-                    }
-                    stages.push(EffectStage::Save(stage.name));
-                }
-                WireEffectStage::Blend(stage) => {
-                    let input = decode_effect_input(stage.input)?;
-                    let mode = match stage.mode.as_deref().unwrap_or("normal") {
-                        "normal" => BlendMode::Normal,
-                        "add" => BlendMode::Add,
-                        "screen" => BlendMode::Screen,
-                        "multiply" => BlendMode::Multiply,
-                        other => {
-                            return Err(DecorationBridgeError::InvalidShaderType(
-                                other.to_string(),
-                            ));
-                        }
-                    };
-                    stages.push(EffectStage::Blend {
-                        input,
-                        mode,
-                        alpha: stage.alpha.unwrap_or(1.0).clamp(0.0, 1.0),
-                    });
-                }
-                WireEffectStage::Unit(stage) => {
-                    stages.push(EffectStage::Unit(Box::new(stage.effect.try_into()?)));
-                }
-                WireEffectStage::RenderTo(stage) => {
-                    let depends_on = match stage.depends_on {
-                        None => None,
-                        Some(dependencies) => {
-                            if dependencies.is_empty() {
-                                return Err(DecorationBridgeError::InvalidRenderToDependency(
-                                    "dependsOn must list at least one source".into(),
-                                ));
-                            }
-                            Some(
-                                dependencies
-                                    .into_iter()
-                                    .map(|dependency| match dependency {
-                                        WireEffectInput::WindowSource { .. } => {
-                                            Ok(crate::ssd::EffectDependency::WindowSource)
-                                        }
-                                        WireEffectInput::LayerSource { .. } => {
-                                            Ok(crate::ssd::EffectDependency::LayerSource)
-                                        }
-                                        WireEffectInput::PopupSource { .. } => {
-                                            Ok(crate::ssd::EffectDependency::PopupSource)
-                                        }
-                                        _ => Err(DecorationBridgeError::InvalidRenderToDependency(
-                                            "dependsOn accepts windowSource(), layerSource() \
-                                             and popupSource() only"
-                                                .into(),
-                                        )),
-                                    })
-                                    .collect::<Result<Vec<_>, _>>()?,
-                            )
-                        }
-                    };
-                    stages.push(EffectStage::RenderTo {
-                        target: decode_state_texture(stage.target)?,
-                        effect: Box::new(stage.effect.try_into()?),
-                        depends_on,
-                    });
-                }
-            }
-        }
-
-        if stages.is_empty() && !matches!(input, EffectInput::Shader(_)) {
-            return Err(DecorationBridgeError::InvalidShaderDescriptor);
-        }
-
-        let invalidate = match value
-            .invalidate
-            .unwrap_or(WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding: 0 })
-        {
-            WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding } => {
-                EffectInvalidationPolicy::OnSourceDamageBox {
-                    damage_padding: damage_padding.max(0),
-                }
-            }
-            WireEffectInvalidationPolicy::Always => EffectInvalidationPolicy::Always,
-            WireEffectInvalidationPolicy::Manual { dirty_when, base } => {
-                EffectInvalidationPolicy::Manual {
-                    dirty_when,
-                    base: base
-                        .map(|policy| Box::new(decode_automatic_invalidation_policy(*policy))),
-                }
-            }
-        };
-
-        let alpha = match value.alpha.as_deref() {
-            None | Some("opaque") => EffectAlphaMode::Opaque,
-            Some("preserve") => EffectAlphaMode::Preserve,
-            Some(_) => return Err(DecorationBridgeError::InvalidShaderDescriptor),
-        };
-
-        let effect = CompiledEffect {
-            input,
-            capture_padding: value.capture_padding.max(0),
-            invalidate,
-            pipeline: stages,
-            alpha,
-        };
-        validate_effect_state_descriptors(&effect)?;
-        validate_conditional_render_to_names(&effect)?;
         Ok(effect)
     }
+}
+
+/// Decodes an output overlay effect, the only place `snapshotSource()` may appear.
+pub fn decode_overlay_effect(
+    value: WireCompiledEffect,
+) -> Result<CompiledEffect, DecorationBridgeError> {
+    decode_compiled_effect(value)
+}
+
+fn decode_compiled_effect(
+    value: WireCompiledEffect,
+) -> Result<CompiledEffect, DecorationBridgeError> {
+    if value.kind != "compiled-effect" {
+        return Err(DecorationBridgeError::InvalidShaderDescriptor);
+    }
+
+    let input = decode_effect_input(value.input.unwrap_or(WireEffectInput::BackdropSource))?;
+
+    let mut stages = Vec::with_capacity(value.pipeline.len());
+    for stage in value.pipeline {
+        match stage {
+            WireEffectStage::ShaderStage(stage) => {
+                if stage.shader.kind != "shader-module" || stage.shader.path.is_empty() {
+                    return Err(DecorationBridgeError::InvalidShaderDescriptor);
+                }
+                if stage.textures.len() > 7
+                    || stage
+                        .textures
+                        .keys()
+                        .any(|name| is_reserved_effect_binding_name(name))
+                    || stage
+                        .uniforms
+                        .keys()
+                        .any(|name| is_reserved_effect_binding_name(name))
+                    || stage
+                        .textures
+                        .keys()
+                        .any(|name| stage.uniforms.contains_key(name))
+                {
+                    return Err(DecorationBridgeError::InvalidShaderDescriptor);
+                }
+                let mut uniforms = std::collections::BTreeMap::new();
+                for (name, value) in stage.uniforms {
+                    let value = decode_shader_uniform(value)
+                        .ok_or(DecorationBridgeError::InvalidShaderDescriptor)?;
+                    uniforms.insert(name, value);
+                }
+                let textures = stage
+                    .textures
+                    .into_iter()
+                    .map(|(name, input)| Ok((name, decode_effect_input(input)?)))
+                    .collect::<Result<_, DecorationBridgeError>>()?;
+                stages.push(EffectStage::Shader(ShaderStage {
+                    shader: ShaderModule {
+                        path: stage.shader.path,
+                    },
+                    uniforms,
+                    textures,
+                }));
+            }
+            WireEffectStage::DualKawaseBlur(stage) => {
+                stages.push(EffectStage::DualKawaseBlur(BackdropBlur {
+                    radius: stage.radius.unwrap_or(8).max(0),
+                    passes: stage.passes.unwrap_or(2).clamp(0, 8),
+                }));
+            }
+            WireEffectStage::Noise(stage) => {
+                let kind = match stage.noise_kind.as_deref().unwrap_or("salt") {
+                    "salt" => NoiseKind::Salt,
+                    other => {
+                        return Err(DecorationBridgeError::InvalidShaderType(other.to_string()));
+                    }
+                };
+                stages.push(EffectStage::Noise(NoiseStage {
+                    kind,
+                    amount: stage.amount.unwrap_or(0.01).clamp(0.0, 1.0),
+                }));
+            }
+            WireEffectStage::Save(stage) => {
+                if stage.name.is_empty() {
+                    return Err(DecorationBridgeError::InvalidShaderDescriptor);
+                }
+                stages.push(EffectStage::Save(stage.name));
+            }
+            WireEffectStage::Blend(stage) => {
+                let input = decode_effect_input(stage.input)?;
+                let mode = match stage.mode.as_deref().unwrap_or("normal") {
+                    "normal" => BlendMode::Normal,
+                    "add" => BlendMode::Add,
+                    "screen" => BlendMode::Screen,
+                    "multiply" => BlendMode::Multiply,
+                    other => {
+                        return Err(DecorationBridgeError::InvalidShaderType(other.to_string()));
+                    }
+                };
+                stages.push(EffectStage::Blend {
+                    input,
+                    mode,
+                    alpha: stage.alpha.unwrap_or(1.0).clamp(0.0, 1.0),
+                });
+            }
+            WireEffectStage::Unit(stage) => {
+                stages.push(EffectStage::Unit(Box::new(decode_compiled_effect(
+                    stage.effect,
+                )?)));
+            }
+            WireEffectStage::RenderTo(stage) => {
+                let depends_on = match stage.depends_on {
+                    None => None,
+                    Some(dependencies) => {
+                        if dependencies.is_empty() {
+                            return Err(DecorationBridgeError::InvalidRenderToDependency(
+                                "dependsOn must list at least one source".into(),
+                            ));
+                        }
+                        Some(
+                            dependencies
+                                .into_iter()
+                                .map(|dependency| match dependency {
+                                    WireEffectInput::WindowSource { .. } => {
+                                        Ok(crate::ssd::EffectDependency::WindowSource)
+                                    }
+                                    WireEffectInput::LayerSource { .. } => {
+                                        Ok(crate::ssd::EffectDependency::LayerSource)
+                                    }
+                                    WireEffectInput::PopupSource { .. } => {
+                                        Ok(crate::ssd::EffectDependency::PopupSource)
+                                    }
+                                    _ => Err(DecorationBridgeError::InvalidRenderToDependency(
+                                        "dependsOn accepts windowSource(), layerSource() \
+                                         and popupSource() only"
+                                            .into(),
+                                    )),
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )
+                    }
+                };
+                stages.push(EffectStage::RenderTo {
+                    target: decode_state_texture(stage.target)?,
+                    effect: Box::new(decode_compiled_effect(stage.effect)?),
+                    depends_on,
+                });
+            }
+        }
+    }
+
+    if stages.is_empty() && !matches!(input, EffectInput::Shader(_)) {
+        return Err(DecorationBridgeError::InvalidShaderDescriptor);
+    }
+
+    let invalidate = match value
+        .invalidate
+        .unwrap_or(WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding: 0 })
+    {
+        WireEffectInvalidationPolicy::OnSourceDamageBox { damage_padding } => {
+            EffectInvalidationPolicy::OnSourceDamageBox {
+                damage_padding: damage_padding.max(0),
+            }
+        }
+        WireEffectInvalidationPolicy::Always => EffectInvalidationPolicy::Always,
+        WireEffectInvalidationPolicy::Manual { dirty_when, base } => {
+            EffectInvalidationPolicy::Manual {
+                dirty_when,
+                base: base.map(|policy| Box::new(decode_automatic_invalidation_policy(*policy))),
+            }
+        }
+    };
+
+    let alpha = match value.alpha.as_deref() {
+        None | Some("opaque") => EffectAlphaMode::Opaque,
+        Some("preserve") => EffectAlphaMode::Preserve,
+        Some(_) => return Err(DecorationBridgeError::InvalidShaderDescriptor),
+    };
+
+    let effect = CompiledEffect {
+        input,
+        capture_padding: value.capture_padding.max(0),
+        invalidate,
+        pipeline: stages,
+        alpha,
+    };
+    validate_effect_state_descriptors(&effect)?;
+    validate_conditional_render_to_names(&effect)?;
+    Ok(effect)
 }
 
 impl TryFrom<WireBackgroundEffectConfig> for BackgroundEffectConfig {
@@ -1916,6 +1932,31 @@ mod tests {
             stage.textures.get("layer_mask"),
             Some(EffectInput::LayerSource(WindowSourceInclude::Full))
         ));
+    }
+
+    #[test]
+    fn snapshot_source_is_only_decoded_for_output_overlays() {
+        let wire = || -> WireCompiledEffect {
+            serde_json::from_str(
+                r#"{
+                    "kind": "compiled-effect",
+                    "input": { "kind": "backdrop-source" },
+                    "pipeline": [{
+                        "kind": "shader-stage",
+                        "shader": { "kind": "shader-module", "path": "/tmp/fade.frag" },
+                        "textures": { "frozen": { "kind": "snapshot-source" } }
+                    }]
+                }"#,
+            )
+            .expect("snapshot effect should deserialize")
+        };
+
+        assert!(matches!(
+            CompiledEffect::try_from(wire()),
+            Err(DecorationBridgeError::SnapshotSourceOutsideOverlay)
+        ));
+        let effect = decode_overlay_effect(wire()).expect("overlays accept snapshotSource()");
+        assert!(crate::backend::overlay::uses_snapshot(&effect));
     }
 
     #[test]

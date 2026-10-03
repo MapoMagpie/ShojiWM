@@ -615,6 +615,11 @@ pub fn set_wake_host(host: shojiwm_lib::runtime_api::RuntimeHost) {
     }
 }
 
+fn decode_overlay_effect(effect: WireCompiledEffect) -> std::io::Result<CompiledEffect> {
+    shojiwm_lib::ssd::bridge::decode_overlay_effect(effect)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
 #[op2(fast)]
 fn op_shoji_wake_compositor() {
     if let Ok(slot) = WAKE_HOST.lock()
@@ -1031,7 +1036,7 @@ impl ShojiRuntimeBridge {
     fn create_overlay(&self, #[string] output: String, #[string] placement: String,
         max_duration: f64, #[serde] effect: WireCompiledEffect, persistent: bool) -> Result<u32, std::io::Error>
     {
-        let effect = effect.try_into().map_err(|error| std::io::Error::other(format!("{error}")))?;
+        let effect = decode_overlay_effect(effect)?;
         let host = WAKE_HOST.lock().ok().and_then(|host| host.clone()).unwrap_or_default();
         shojiwm_lib::backend::overlay::create(&self.overlay_owner, output, placement, max_duration, effect, persistent, host)
     }
@@ -1051,7 +1056,7 @@ impl ShojiRuntimeBridge {
 
     fn update_overlay(&self, id: u32, #[serde] effect: WireCompiledEffect) -> Result<(), std::io::Error> {
         if let Ok(control) = shojiwm_lib::backend::overlay::get(&self.overlay_owner, id) {
-            control.update(effect.try_into().map_err(|error| std::io::Error::other(format!("{error}")))?)?;
+            control.update(decode_overlay_effect(effect)?)?;
         }
         Ok(())
     }

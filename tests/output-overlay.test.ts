@@ -122,12 +122,25 @@ test("capture failure rejects and explicit disposal is idempotent", async () => 
 
 test("awaited compositor callbacks fail before queuing capture; detached tasks proceed", async () => {
   const host = native();
-  let handling = true;
-  installOverlayBridge(host.bridge, () => !handling);
+  let request: number | null = 1;
+  installOverlayBridge(host.bridge, () => request);
   await assert.rejects(overlay("DP-1", options()), /detached task/);
   assert.equal(host.creates, 0);
   const pending = overlay("DP-1", options());
-  handling = false; // synchronous handler returns to the compositor
+  request = null; // synchronous handler returns to the compositor
+  host.ready.resolve();
+  const handle = await pending;
+  assert.equal(host.creates, 1);
+  handle.dispose();
+  await handle.closed;
+});
+
+test("a detached task is not rejected while an unrelated request is being handled", async () => {
+  const host = native();
+  let request: number | null = 1;
+  installOverlayBridge(host.bridge, () => request);
+  const pending = overlay("DP-1", options());
+  request = 2; // e.g. an async pointer handler still awaiting when the timer fires
   host.ready.resolve();
   const handle = await pending;
   assert.equal(host.creates, 1);

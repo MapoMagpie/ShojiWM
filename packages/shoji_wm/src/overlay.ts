@@ -45,11 +45,18 @@ export interface OverlayBridge {
 }
 
 let bridge: OverlayBridge | undefined;
-let canCapture = () => true;
+let activeRequest: () => number | null = () => null;
 
-export function installOverlayBridge(value: OverlayBridge, captureAllowed = () => true): void {
+/**
+ * `currentRequest` returns the id of the compositor request being handled, or
+ * `null` between requests.
+ */
+export function installOverlayBridge(
+  value: OverlayBridge,
+  currentRequest: () => number | null = () => null,
+): void {
   bridge = value;
-  canCapture = captureAllowed;
+  activeRequest = currentRequest;
 }
 
 function resolve(value: unknown): unknown {
@@ -77,9 +84,11 @@ export async function overlay(
     throw new RangeError("maxDuration must be a positive finite number of milliseconds <= 2147483647");
   }
   // Let a detached event task return its response before requesting a frame. If the
-  // handler instead awaits this Promise, fail rather than deadlock the render thread.
+  // handler instead awaits this Promise, its request is still open: fail rather than
+  // deadlock the render thread. Another request being handled by then is unrelated.
+  const caller = activeRequest();
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  if (!canCapture()) {
+  if (caller !== null && activeRequest() === caller) {
     throw new Error("Cannot await an output overlay from a compositor callback; launch a detached task");
   }
   const id = native.createOverlay(

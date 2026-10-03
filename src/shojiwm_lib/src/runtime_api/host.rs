@@ -164,6 +164,12 @@ impl RuntimeHost {
         self.ping();
     }
 
+    /// Wake the compositor's event loop without asking for a scheduler tick,
+    /// for compositor-side state such as output overlays.
+    pub fn notify(&self) {
+        self.ping();
+    }
+
     /// Next queued message, oldest first. Compositor side.
     pub fn pop(&self) -> Option<HostMessage> {
         self.inner.queue.lock().ok()?.pop_front()

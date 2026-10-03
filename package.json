@@ -6,7 +6,8 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "tsc -p packages/shoji_wm/tsconfig.json && tsc -p packages/config/tsconfig.json"
+    "typecheck": "tsc -p packages/shoji_wm/tsconfig.json && tsc -p packages/config/tsconfig.json",
+    "test:overlays": "node --import tsx --test tests/output-overlay.test.ts && tsc -p tests/tsconfig.overlays.json"
   },
   "devDependencies": {
     "tsx": "^4.20.3",

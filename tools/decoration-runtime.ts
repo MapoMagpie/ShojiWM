@@ -1407,7 +1407,9 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
   let composition: WindowCompositionFunction | null = null;
   let events: CompositorEventController | null = null;
   let effectConfig: RuntimeEffectConfig | null = null;
-  let handlingRequest = false;
+  // Id of the compositor request being handled; overlays awaited inside it must fail.
+  let activeRequest: number | null = null;
+  let requestSerial = 0;
 
   async function loadRuntimeConfig(): Promise<{
     composition: WindowCompositionFunction;
@@ -1432,7 +1434,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
       composition = resolveComposition(loadedConfig);
       events = resolveEvents(loadedConfig);
       effectConfig = resolveEffectConfig(loadedConfig);
-      installOverlayBridge(embeddedBridge, () => !handlingRequest);
+      installOverlayBridge(embeddedBridge, () => activeRequest);
     }
     return {
       composition: composition!,
@@ -1442,7 +1444,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
   }
 
   for await (const request of readEmbeddedMessages(embeddedBridge)) {
-    handlingRequest = true;
+    activeRequest = ++requestSerial;
     try {
       if ("displayState" in request) {
         updateOutputState(request.displayState);
@@ -2268,7 +2270,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
         workspaceConfig: pendingWorkspaceConfigPayload(),
       });
     } finally {
-      handlingRequest = false;
+      activeRequest = null;
     }
   }
 }

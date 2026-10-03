@@ -57,11 +57,11 @@ fn controls() -> &'static Mutex<BTreeMap<u32, Arc<Control>>> {
 pub(crate) fn wake() {
     DIRTY.store(true, Ordering::Release);
     for control in controls().lock().unwrap().values() {
-        control.host.wake();
+        control.host.notify();
     }
 }
 
-fn uses_snapshot(effect: &CompiledEffect) -> bool {
+pub(crate) fn uses_snapshot(effect: &CompiledEffect) -> bool {
     fn input(value: &EffectInput) -> bool {
         match value {
             EffectInput::Named(name) => name == SNAPSHOT_NAME,
@@ -274,6 +274,11 @@ fn source_signature<E: RenderElement<GlesRenderer>>(elements: &[E], scale: Scale
 
 impl OutputOverlays {
     pub(crate) fn clear(&mut self) { self.slots.clear(); }
+
+    /// Nothing to tick: no requests, no GPU slots and no pending cleanup redraw.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.slots.is_empty() && !any() && !DIRTY.load(Ordering::Acquire)
+    }
 
     /// Runs independently of the JS scheduler, including idle desktop deadlines.
     pub(crate) fn tick(&mut self, outputs: &[Output], locked: bool) -> bool {

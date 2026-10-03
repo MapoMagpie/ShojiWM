@@ -1,5 +1,5 @@
 ---
-sidebar_position: 11
+sidebar_position: 10.5
 ---
 
 # Output overlays
@@ -31,16 +31,17 @@ handle.dispose();
 The complete, self-contained dissolve example is in
 `examples/output-overlay/`. Copy its two files into your config's `src/effect/`
 directory, then call `void transition(outputName, changeScene).catch(console.error)`
-from a synchronous key/event callback. The generic `animate()` in the upstream
-proposal is pseudocode; this example uses signals and native timers available today.
+from a synchronous key/event callback. The example drives `progress` with a signal
+and a plain timer loop.
 
 **Do not await an overlay at module scope or return its Promise from a callback
 the compositor awaits**, such as `onPointerMoveAsync` or `onGestureSwipeAsync`.
 The main thread must return to rendering to make the next frame. Overlay creation
 yields one timer turn to let detached callbacks finish, then rejects if the runtime
-is still handling a compositor request. Module initialization also rejects calls.
-The native deadline runs independently of rendering as an additional safeguard.
-Launch the transition as a detached task as shown above.
+is still handling the compositor request it was called from. Module
+initialization also rejects calls. The native deadline runs independently of
+rendering as an additional safeguard. Launch the transition as a detached task as
+shown above.
 
 ## Sources and placement
 
@@ -50,7 +51,7 @@ Launch the transition as a detached task as shown above.
 | `backdropSource()` | Live scene behind this slot. Captured only when referenced and the pipeline needs evaluation; excludes this slot's old output to avoid feedback. |
 | `shaderInput()`, `imageSource()`, state textures | Existing generator and multipass inputs; no screen capture unless the pipeline also references a screen source. |
 | `top` (default) | Above desktop windows and layer-shell surfaces, below the cursor. Compositor diagnostics may remain in front. |
-| `below-layers` | Above windows, below Top/Overlay layer-shell surfaces and layer popups. Bottom/Background layers remain behind windows. |
+| `below-layers` | Above windows (and their decoration popups), below Top/Overlay layer-shell surfaces and layer popups. Bottom/Background layers remain behind windows. |
 
 `below-layers` does **not** mean below windows. A below-window slot is not
 included.
@@ -150,19 +151,9 @@ no overlay capture or animation timer runs while there are no overlay requests.
 For a cancelled gesture, animate progress back to zero and dispose. Restoring the
 workspace or other scene state is the caller's responsibility.
 
-## Validation status
+## Limitations
 
-This branch ports the local implementation to the compositor/runtime crate split
-at upstream commit `76c8cf2`. Tests, typechecking, builds and session checks have
-not been run on this extracted branch. The SDK and native regression checks are
-included for review; reproduction commands are in `tests/README.md`.
-
-Overlay control lives in `shojiwm_lib`; the TypeScript bridge decodes effects and
-uses the existing `RuntimeHost` ping to wake the compositor. Updates do not travel
-through workspace configuration. The Rust config SDK has no overlay convenience
-API in this draft.
-
-Real TTY/Winit presentation, hardware-driver timing, monitor rotation/hotplug and
-existing user shaders require validation before this draft is ready to merge.
-
-Proposal: [bea4dev's comment on PR #109](https://github.com/bea4dev/ShojiWM/pull/109#issuecomment-5889104745).
+- `snapshotSource()` is accepted only by `COMPOSITOR.effect.overlay`; window, layer,
+  popup and `<ShaderEffect/>` effects that use it are rejected.
+- Overlays need the TypeScript runtime. The Rust config SDK has no overlay API yet.
+- An overlay is not drawn while the session is locked, and it never covers the cursor.

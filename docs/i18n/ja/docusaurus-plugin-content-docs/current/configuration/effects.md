@@ -4,7 +4,7 @@ sidebar_position: 10
 
 # エフェクト
 
-ShojiWM は GPU シェーダーエフェクトを4箇所で実行でき、`COMPOSITOR.effect` で設定します。
+ShojiWM は GPU シェーダーエフェクトを次の場所で実行でき、`COMPOSITOR.effect` で設定します。
 
 | フィールド | 型 | 適用先 |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ ShojiWM は GPU シェーダーエフェクトを4箇所で実行でき、`COMPO
 | `window` | `(window) => WindowEffectAssignment \| null` | トップレベルウィンドウごと |
 | `layer` | `(layer) => LayerEffectAssignment \| null` | レイヤーシェルサーフェスごと（バー・ドック） |
 | `popup` | `(popup) => PopupEffectAssignment \| null` | ポップアップごと（メニュー・ツールチップ） |
+| [`overlay`](./output-overlays.md) | `(output, options) => Promise<OverlayHandle>` | 一時的または常駐する出力全体のエフェクト |
 
 合成内の領域にエフェクトを適用することもできます
 （[`<ShaderEffect/>`](./components.md#shadereffect)）。
