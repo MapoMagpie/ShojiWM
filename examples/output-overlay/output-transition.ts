@@ -21,9 +21,9 @@ export async function transition(output: string, changeScene: () => void): Promi
   void handle.closed.then(() => { active = false; });
   try {
     changeScene();
-    const start = performance.now();
+    const start = Date.now();
     while (active) {
-      const value = Math.min(1, (performance.now() - start) / 450);
+      const value = Math.min(1, (Date.now() - start) / 450);
       progress.value = value;
       if (value === 1) break;
       await new Promise<void>((resolve) => setTimeout(resolve, 8));
