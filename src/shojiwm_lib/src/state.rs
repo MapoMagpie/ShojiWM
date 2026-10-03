@@ -287,6 +287,9 @@ pub struct ShojiWM {
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     pub screencopy_state: crate::protocols::screencopy::ScreencopyManagerState,
     pub tearing_control_state: crate::protocols::tearing_control::TearingControlManagerState,
+    pub output_power_manager_state: crate::protocols::output_power::OutputPowerManagerState,
+    /// Outputs whose panel is switched off (DPMS), by name; see [`crate::output_power`].
+    pub powered_off_outputs: HashMap<String, crate::output_power::PoweredOffOutput>,
     pub foreign_toplevel_list_state:
         smithay::wayland::foreign_toplevel_list::ForeignToplevelListState,
     pub wlr_foreign_toplevel_manager_state:
@@ -503,6 +506,9 @@ pub struct ShojiWM {
     /// `window.focus()` the config issues from a key binding, which is
     /// dispatched from inside that call — is traceable to the user.
     pub user_input_in_flight: bool,
+    /// The input event being processed switched outputs back on (`wake_on_input`). A toggle
+    /// requested by that same event (its key binding) must not switch them straight off again.
+    pub input_woke_outputs: bool,
     pub mapped_on_demand_layer_surfaces: HashSet<u32>,
     /// Debug flag (`--force-full-damage`): redraw every output fully on every frame.
     pub force_full_damage: bool,
@@ -1482,6 +1488,8 @@ impl ShojiWM {
             crate::protocols::screencopy::ScreencopyManagerState::new::<Self, _>(&dh, |_| true);
         let tearing_control_state =
             crate::protocols::tearing_control::TearingControlManagerState::new::<Self>(&dh);
+        let output_power_manager_state =
+            crate::protocols::output_power::OutputPowerManagerState::new::<Self>(&dh);
         let foreign_toplevel_list_state =
             smithay::wayland::foreign_toplevel_list::ForeignToplevelListState::new::<Self>(&dh);
         let wlr_foreign_toplevel_manager_state =
@@ -1635,6 +1643,8 @@ impl ShojiWM {
             fractional_scale_manager_state,
             screencopy_state,
             tearing_control_state,
+            output_power_manager_state,
+            powered_off_outputs: HashMap::new(),
             foreign_toplevel_list_state,
             wlr_foreign_toplevel_manager_state,
             ext_workspace_manager_state,
@@ -1768,6 +1778,7 @@ impl ShojiWM {
             window_keyboard_focus: None,
             focus_chain: Vec::new(),
             user_input_in_flight: false,
+            input_woke_outputs: false,
             mapped_on_demand_layer_surfaces: Default::default(),
             force_full_damage,
             full_damage_pending_outputs: HashSet::new(),
@@ -1858,6 +1869,7 @@ impl ShojiWM {
     }
 
     pub(crate) fn remove_output_global(&mut self, output: &Output) {
+        self.forget_output_power(output);
         let output_name = output.name();
         let Some(global) = self.runtime_output_globals.remove(&output_name) else {
             return;
@@ -2698,6 +2710,9 @@ impl ShojiWM {
                 }
                 HostMessage::Debug(update) => self.consume_runtime_debug_config(Some(update)),
                 HostMessage::Cursor(update) => self.apply_runtime_cursor_config_update(update),
+                HostMessage::OutputPower(request) => {
+                    self.apply_runtime_output_power_request(request);
+                }
                 HostMessage::PointerHookResult(invocation) => {
                     let loop_handle = self.loop_handle.clone();
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);

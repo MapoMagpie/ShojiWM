@@ -26,6 +26,8 @@ use shojiwm_lib::{
     config::RuntimeOutputConfig,
     cursor::RuntimeCursorConfigUpdate,
     keyboard_layout::KeyboardLayoutSnapshot,
+    output_power::RuntimeOutputPowerRequest,
+    runtime_api::HostMessage,
     runtime_input::{RuntimeInputConfig, RuntimeInputDeviceSnapshot},
     runtime_key_binding::{RuntimeKeyBindingEntry, RuntimeKeyBindingPhase},
     runtime_process::{
@@ -545,6 +547,28 @@ impl OutputController {
         let output = self.get(name)?;
         output_logical_rect(&output)
     }
+
+    /// `setPower(power, options)`: switch panels on or off (DPMS) without
+    /// changing the layout. Only the TTY backend has panels to switch.
+    pub fn set_power(&self, power: OutputPower, options: OutputPowerOptions) {
+        runtime::send(HostMessage::OutputPower(RuntimeOutputPowerRequest {
+            mode: power,
+            output: options.output,
+            wake_on_input: options.wake_on_input,
+        }));
+    }
+}
+
+pub use shojiwm_lib::output_power::OutputPowerMode as OutputPower;
+
+/// Options of [`OutputController::set_power`].
+#[derive(Debug, Clone, Default)]
+pub struct OutputPowerOptions {
+    /// Output name; every output when `None`.
+    pub output: Option<String>,
+    /// Only when switching off: switch back on at the next key press, click,
+    /// pointer motion, scroll or touch.
+    pub wake_on_input: bool,
 }
 
 pub(crate) fn output_logical_rect(output: &WaylandOutputSnapshot) -> Option<Rect> {

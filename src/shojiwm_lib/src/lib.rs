@@ -42,6 +42,7 @@ pub mod grabs;
 pub mod handlers;
 pub mod input;
 pub mod keyboard_layout;
+pub mod output_power;
 pub mod presentation;
 pub mod process_env;
 pub mod profiler;

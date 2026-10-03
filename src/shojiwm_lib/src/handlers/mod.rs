@@ -388,7 +388,7 @@ impl ImageCopyCaptureHandler for ShojiWM {
                 frame.fail(CaptureFailureReason::Unknown);
                 return;
             };
-            if !self.runtime_output_render_enabled(&output.name()) {
+            if !self.output_capturable(&output.name()) {
                 frame.fail(CaptureFailureReason::Unknown);
                 return;
             }
@@ -1029,7 +1029,7 @@ impl crate::protocols::screencopy::ScreencopyHandler for ShojiWM {
     }
 
     fn screencopy_output_enabled(&self, output: &Output) -> bool {
-        self.runtime_output_render_enabled(&output.name())
+        self.output_capturable(&output.name())
     }
 
     fn screencopy_state(&mut self) -> &mut crate::protocols::screencopy::ScreencopyManagerState {
@@ -1039,5 +1039,6 @@ impl crate::protocols::screencopy::ScreencopyHandler for ShojiWM {
 
 crate::delegate_screencopy!(ShojiWM);
 crate::delegate_tearing_control!(ShojiWM);
+crate::delegate_output_power!(ShojiWM);
 crate::delegate_wlr_foreign_toplevel!(ShojiWM);
 crate::workspace_manager::delegate_ext_workspace_manager!(ShojiWM);

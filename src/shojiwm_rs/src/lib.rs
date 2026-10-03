@@ -90,7 +90,7 @@ pub mod prelude {
         },
         compositor::{
             Command, DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, OutputConfig,
-            OutputContext, Sender, SurfaceRef,
+            OutputContext, OutputPower, OutputPowerOptions, Sender, SurfaceRef,
         },
         effect::{
             Effect, Include, Invalidate, PaintShader, Source, Stage, StateTexture, SurfaceEffect,

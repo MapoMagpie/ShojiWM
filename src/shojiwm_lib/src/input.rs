@@ -241,6 +241,27 @@ impl ShojiWM {
         )
     }
 
+    /// Input that switches back on the outputs powered off with `wake_on_input`. Releases are
+    /// left out: the key binding that switched the outputs off would otherwise switch them
+    /// straight back on when its keys are let go.
+    fn input_event_wakes_outputs<I: InputBackend>(event: &InputEvent<I>) -> bool {
+        match event {
+            InputEvent::Keyboard { event } => event.state() == KeyState::Pressed,
+            InputEvent::PointerButton { event } => event.state() == ButtonState::Pressed,
+            InputEvent::PointerMotion { .. }
+            | InputEvent::PointerMotionAbsolute { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TouchDown { .. }
+            | InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GesturePinchBegin { .. }
+            | InputEvent::GestureHoldBegin { .. }
+            | InputEvent::TabletToolProximity { .. }
+            | InputEvent::TabletToolTip { .. }
+            | InputEvent::TabletToolButton { .. } => true,
+            _ => false,
+        }
+    }
+
     fn notify_idle_activity(&mut self) {
         self.refresh_idle_inhibit_state();
         let seat = self.seat.clone();
@@ -473,11 +494,17 @@ impl ShojiWM {
         let previous = std::mem::replace(&mut self.user_input_in_flight, true);
         self.process_input_event_inner(event);
         self.user_input_in_flight = previous;
+        if !previous {
+            self.input_woke_outputs = false;
+        }
     }
 
     fn process_input_event_inner<I: InputBackend>(&mut self, event: InputEvent<I>) {
         if Self::input_event_counts_as_idle_activity(&event) {
             self.notify_idle_activity();
+        }
+        if Self::input_event_wakes_outputs(&event) {
+            self.wake_outputs_on_input();
         }
 
         match event {

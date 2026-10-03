@@ -164,6 +164,58 @@ display['eDP-1'] = {
 - 反映は即時です。バインド済みの `wl_output` すべてに新しい `geometry` イベントが
   送られるため、設定のリロードだけで反映され、再接続は不要です。
 
+## パネルの電源を切る（DPMS）
+
+`mode: 'disabled'` は出力をデスクトップから外すので、そこにあったウィンドウは別の
+出力へ移動します。離席中に画面を消したいだけなら、代わりに**電源**を切り替えます。
+出力はレイアウトに残り、ウィンドウもそのままで、パネルだけが消灯します。TTY
+セッションが必要です。ネスト実行にはパネルがないので無視されます。
+
+### アイドルデーモンから
+
+ShojiWM は `wlr-output-power-management` を実装しているので、
+[`wlopm`](https://git.sr.ht/~leon_plickat/wlopm) が使えます。swayidle と組み合わせる例:
+
+```sh
+swayidle -w \
+  timeout 300 'swaylock -f' \
+  timeout 600 'wlopm --off "*"' resume 'wlopm --on "*"'
+```
+
+### 設定から
+
+```ts
+// 次のキー押下・クリック・ポインター移動まで、すべてのパネルを消灯する。
+COMPOSITOR.key.bind('screen-off', 'Super+Shift+O', () =>
+  COMPOSITOR.output.setPower('off', {wakeOnInput: true}),
+);
+
+COMPOSITOR.output.setPower('off', {output: 'HDMI-A-1'}); // 1 つの出力だけ
+COMPOSITOR.output.setPower('toggle'); // 対象のどれかが点灯中なら消灯、そうでなければ点灯
+COMPOSITOR.output.setPower('on');
+```
+
+`setPower` は設定のどこからでも呼べます。キーバインド、タイマー、IPC のハンドラー
+（`shoji_wm/ipc` の `createIpcServer`）からも使えるので、自前の IPC メソッドを
+用意すれば外部スクリプトからも切り替えられます。Rust の設定では
+`COMPOSITOR.output.set_power(OutputPower::Off, OutputPowerOptions { wake_on_input: true, ..Default::default() })`
+です。
+
+電源状態のふるまい:
+
+- `wakeOnInput` なしで消した出力は、明示的に点けるまで消えたままです
+  （`setPower('on')`、`wlopm --on`）。`wakeOnInput` 付きなら、キー押下・クリック・
+  ポインター移動・スクロール・タッチで点灯します。キーを離す操作は数えないので、
+  消灯したキーバインド自体ですぐ点灯してしまうことはありません。消灯中に
+  `'toggle'` のキーバインドを押すと、点灯するだけです。
+- 別の VT に切り替えて戻ると、すべての出力が点灯します。アイドルデーモンが
+  落ちていても、消えた画面の前に取り残されることはありません。
+- 出力を抜く・無効にすると電源状態は忘れられ、戻ってきたときは点灯しています。
+- 消灯中のパネルには何も描画しません。そこにいるクライアントには 1 秒に 1 回
+  フレームコールバックを送るので、止まったままにはなりません。その出力の
+  スクリーンショットや画面共有は、点灯するまで失敗します（画面共有ポータルは
+  再試行します）。
+
 ## 出力の状態を読む
 
 このコントローラは読み取り専用ビューでもあり、イベントハンドラや合成関数の中で
@@ -179,6 +231,7 @@ display['eDP-1'] = {
 | `availableModes(name)` | ドライバーが報告する `OutputMode[]` |
 | `configure(factory)` | レイアウトファクトリーを登録（前述） |
 | `reconfigure()` | 登録済みファクトリーを即時再実行 |
+| `setPower(power, options?)` | パネルの電源を切り替える（前述） |
 
 `OutputInfo` には `name`・`enabled`・`resolution`（`{width, height, refreshRate}`）・
 `position`（`{x, y}`）・`scale`・`transform`・`subpixel`・`detectedSubpixel`・

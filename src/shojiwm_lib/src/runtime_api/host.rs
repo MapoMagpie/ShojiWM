@@ -22,6 +22,7 @@ use crate::{
     activation_environment::RuntimeEnvUpdates,
     config::RuntimeDisplayConfigUpdate,
     cursor::RuntimeCursorConfigUpdate,
+    output_power::RuntimeOutputPowerRequest,
     runtime_debug::RuntimeDebugConfigUpdate,
     runtime_input::RuntimeInputConfigUpdate,
     runtime_key_binding::RuntimeKeyBindingConfigUpdate,
@@ -47,6 +48,8 @@ pub enum HostMessage {
     ProcessActions(Vec<RuntimeProcessAction>),
     Debug(RuntimeDebugConfigUpdate),
     Cursor(RuntimeCursorConfigUpdate),
+    /// Switch outputs on or off (`COMPOSITOR.output.setPower`).
+    OutputPower(RuntimeOutputPowerRequest),
     /// Result of a posted (fire-and-forget) pointer or gesture hook.
     PointerHookResult(DecorationPointerMoveAsyncInvocation),
     /// A hot reload prepared in the background is done. `Ok` makes the

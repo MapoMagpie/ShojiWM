@@ -629,6 +629,36 @@ fn op_shoji_wake_compositor() {
     }
 }
 
+/// `COMPOSITOR.output.setPower`: sent to the compositor like any other host side effect, so
+/// it works from key bindings, IPC handlers and timers alike. `output` is empty for "every
+/// output".
+#[op2(fast)]
+fn op_shoji_output_power(
+    #[string] mode: &str,
+    #[string] output: &str,
+    wake_on_input: bool,
+) -> Result<(), std::io::Error> {
+    use shojiwm_lib::output_power::{OutputPowerMode, RuntimeOutputPowerRequest};
+    let mode = OutputPowerMode::parse(mode).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unknown output power mode `{mode}`; expected on, off or toggle"),
+        )
+    })?;
+    if let Ok(slot) = WAKE_HOST.lock()
+        && let Some(host) = slot.as_ref()
+    {
+        host.send(shojiwm_lib::runtime_api::HostMessage::OutputPower(
+            RuntimeOutputPowerRequest {
+                mode,
+                output: (!output.is_empty()).then(|| output.to_string()),
+                wake_on_input,
+            },
+        ));
+    }
+    Ok(())
+}
+
 struct BridgeRegistration {
     overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>,
@@ -2258,6 +2288,7 @@ extension!(
         op_shoji_ipc_listen,
         op_shoji_process_id,
         op_shoji_wake_compositor,
+        op_shoji_output_power,
     ],
     objects = [
         ShojiRuntimeBridge,
