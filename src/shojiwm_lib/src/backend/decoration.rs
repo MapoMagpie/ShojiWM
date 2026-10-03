@@ -18,7 +18,7 @@ use crate::{
         relative_physical_rect_from_root_snapped_edges, snapped_logical_rect_for_element,
         snapped_precise_logical_rect_in_root_frame_area_space,
     },
-    ssd::{LogicalRect, WindowDecorationState},
+    ssd::{DecorationPart, LogicalRect, PopupLayer, WindowDecorationState},
 };
 
 smithay::render_elements! {
@@ -100,15 +100,14 @@ pub fn ordered_background_elements_for_window_with_framebuffer_backdrops(
     alpha: f32,
     include_framebuffer_backdrops: bool,
 ) -> Result<Vec<(usize, DecorationSceneElements)>, DecorationSceneError> {
-    let mut items = Vec::new();
-
-    for cached in decoration.buffers.clone() {
-        if let Some(element) = crate::backend::paint::paint_element(
-            renderer, decoration, &cached, output_geo, scale, alpha,
-        )? {
-            items.push((cached.order, DecorationSceneElements::Paint(element)));
-        }
-    }
+    let mut items = ordered_paint_elements(
+        renderer,
+        decoration,
+        DecorationPart::Window,
+        output_geo,
+        scale,
+        alpha,
+    )?;
 
     for cached in decoration.shader_buffers.clone() {
         if cached.shader.supports_framebuffer_backdrop() {
@@ -141,6 +140,62 @@ pub fn ordered_background_elements_for_window_with_framebuffer_backdrops(
 
     items.sort_by_key(|(order, _)| *order);
     Ok(items)
+}
+
+fn ordered_paint_elements(
+    renderer: &mut GlesRenderer,
+    decoration: &mut WindowDecorationState,
+    part: DecorationPart,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<Vec<(usize, DecorationSceneElements)>, DecorationSceneError> {
+    let scopes = decoration.popup_scopes();
+    let mut items = Vec::new();
+    for cached in decoration.buffers.clone() {
+        if !scopes.includes(part, &cached.stable_key) {
+            continue;
+        }
+        if let Some(element) = crate::backend::paint::paint_element(
+            renderer, decoration, &cached, output_geo, scale, alpha,
+        )? {
+            items.push((cached.order, DecorationSceneElements::Paint(element)));
+        }
+    }
+    Ok(items)
+}
+
+/// The elements of the open `<Popup>`s of one layer, positioned relative to
+/// the root's physical origin like every decoration element, front to back.
+pub fn popup_elements_for_decoration(
+    renderer: &mut GlesRenderer,
+    decoration: &mut WindowDecorationState,
+    layer: PopupLayer,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    alpha: f32,
+) -> Result<Vec<PopupSceneElement>, DecorationSceneError> {
+    let part = DecorationPart::Popups(layer);
+    let mut items = ordered_paint_elements(renderer, decoration, part, output_geo, scale, alpha)?
+        .into_iter()
+        .map(|(order, element)| (order, PopupSceneElement::Decoration(element)))
+        .collect::<Vec<_>>();
+    let textures = text::ordered_text_elements_for_part(
+        renderer, decoration, part, output_geo, scale, alpha,
+    )?
+    .into_iter()
+    .chain(crate::backend::icon::ordered_icon_elements_for_part(
+        renderer, decoration, part, output_geo, scale, alpha,
+    )?);
+    items.extend(textures.map(|(order, element)| (order, PopupSceneElement::Texture(element))));
+    items.sort_by_key(|(order, _)| *order);
+    Ok(items.into_iter().map(|(_, element)| element).collect())
+}
+
+/// One element of a popup pass; the backend relocates it onto the output.
+pub enum PopupSceneElement {
+    Decoration(DecorationSceneElements),
+    Texture(text::DecorationTextureElements),
 }
 
 pub fn framebuffer_backdrop_element_for_window_rect(

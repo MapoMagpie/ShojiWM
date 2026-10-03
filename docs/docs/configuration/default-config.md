@@ -91,6 +91,8 @@ they keep working even if your config is broken.
 Each window gets a title bar with the app icon, the window title, and
 minimize / maximize / close buttons. The border is **gold when focused**
 (`#d7ba7d`) and gray otherwise (`#4f5666`), with rounded corners.
+Resting the pointer on the minimize or maximize button for half a second shows a
+tooltip under it ([`<Popup/>`](./components.md#popup)).
 
 - **Terminals** (kitty, ghostty) get a translucent *liquid-glass* blurred
   background instead of a solid title bar.

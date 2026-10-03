@@ -47,6 +47,8 @@ enum KeyboardAction {
     RuntimeKeyBinding(String),
     LogMarker(u8),
     ChangeVt(i32),
+    /// Escape closes the most recent `Auto` SSD popup.
+    DismissPopup,
 }
 
 fn compositor_pointer_grab_start_data(
@@ -567,6 +569,22 @@ impl ShojiWM {
                                 }
                             }
 
+                            // An open `Auto` popup takes Escape before the
+                            // focused client (light dismiss).
+                            if matches!(
+                                key_phase,
+                                crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+                            ) && !modifiers.ctrl
+                                && !modifiers.alt
+                                && !modifiers.logo
+                                && handle
+                                    .raw_latin_sym_or_raw_current_sym()
+                                    .is_some_and(|raw| raw.raw() == keysyms::KEY_Escape)
+                                && data.popup_takes_escape()
+                            {
+                                return FilterResult::Intercept(KeyboardAction::DismissPopup);
+                            }
+
                             if let Some(binding_id) = runtime_key_bindings
                                 .iter()
                                 .find(|binding| binding.matches(key_phase, modifiers, &handle))
@@ -656,6 +674,7 @@ impl ShojiWM {
 
                 match action {
                     KeyboardAction::Quit => self.shutdown(),
+                    KeyboardAction::DismissPopup => self.dismiss_popup_on_escape(),
                     KeyboardAction::ReloadConfig => self.reload_decoration_runtime(),
                     KeyboardAction::RuntimeKeyBinding(binding_id) => {
                         self.run_runtime_key_binding(&binding_id);
@@ -922,6 +941,12 @@ impl ShojiWM {
                         event.time_msec(),
                     );
                     return;
+                }
+
+                // SSD `<Popup>`s hear about every press: anchors pressed
+                // (`trigger="click"`) and light dismiss of `Auto` popups.
+                if button_state == ButtonState::Pressed {
+                    self.handle_popup_press(pointer.current_location());
                 }
 
                 // A locked-pointer client already owns pointer focus. Re-running compositor hit
@@ -1426,6 +1451,7 @@ impl ShojiWM {
                                 );
                             }
                             DecorationHitTestResult::Outside => {}
+                            DecorationHitTestResult::Popup => {}
                         }
 
                         pointer.frame(self);
@@ -2377,7 +2403,7 @@ impl ShojiWM {
         false
     }
 
-    fn pointer_allows_window_interaction(
+    pub(crate) fn pointer_allows_window_interaction(
         &self,
         pointer_surface: Option<
             &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -2610,42 +2636,73 @@ impl ShojiWM {
         })
     }
 
+    /// The hovered decoration nodes at `pos`: the innermost node with
+    /// handlers, or the whole chain inside an interactive `<Popup>`.
+    fn tracked_decoration_hover_targets_under(
+        &self,
+        pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    ) -> Vec<TrackedDecorationInteractionTarget> {
+        let pointer_contents = self.pointer_contents_at(pos);
+        if pointer_contents.layer.is_some() {
+            return Vec::new();
+        }
+        let Some((window, targets)) = self.decoration_interaction_targets_under(pos) else {
+            return Vec::new();
+        };
+        if !self.pointer_allows_window_interaction(
+            pointer_contents
+                .surface
+                .as_ref()
+                .map(|(surface, _)| surface),
+            &window,
+        ) {
+            return Vec::new();
+        }
+        let window_id = self.snapshot_window(&window).id;
+        targets
+            .into_iter()
+            .filter(|target| target.handlers.hover_change.is_some())
+            .map(|target| TrackedDecorationInteractionTarget {
+                window: window.clone(),
+                window_id: window_id.clone(),
+                target,
+            })
+            .collect()
+    }
+
     fn update_decoration_hover_target(
         &mut self,
         pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     ) {
-        let next = self
-            .tracked_decoration_interaction_target_under(pos)
-            .filter(|target| target.target.handlers.hover_change.is_some());
-        if self
-            .decoration_hover_target
-            .as_ref()
-            .zip(next.as_ref())
-            .is_some_and(|(current, next)| current.same_node(next))
+        let next = self.tracked_decoration_hover_targets_under(pos);
+        let previous = std::mem::take(&mut self.decoration_hover_targets);
+        // Leaves first, then enters, like DOM mouseleave / mouseenter.
+        for left in previous
+            .iter()
+            .filter(|old| !next.iter().any(|new| new.same_node(old)))
         {
-            return;
-        }
-
-        if let Some(previous) = self.decoration_hover_target.take()
-            && let Some(handler) = previous.target.handlers.hover_change.as_ref()
-        {
-            self.invoke_decoration_runtime_handler(
-                &previous.window,
-                &previous.window_id,
-                handler.handler_for(false),
-            );
-        }
-
-        if let Some(next_target) = next {
-            if let Some(handler) = next_target.target.handlers.hover_change.as_ref() {
+            if let Some(handler) = left.target.handlers.hover_change.as_ref() {
                 self.invoke_decoration_runtime_handler(
-                    &next_target.window,
-                    &next_target.window_id,
+                    &left.window,
+                    &left.window_id,
+                    handler.handler_for(false),
+                );
+            }
+        }
+        for entered in next
+            .iter()
+            .filter(|new| !previous.iter().any(|old| old.same_node(new)))
+        {
+            if let Some(handler) = entered.target.handlers.hover_change.as_ref() {
+                self.invoke_decoration_runtime_handler(
+                    &entered.window,
+                    &entered.window_id,
                     handler.handler_for(true),
                 );
             }
-            self.decoration_hover_target = Some(next_target);
         }
+        self.decoration_hover_targets = next;
+        self.update_popup_interest(pos);
     }
 
     fn press_decoration_active_target(
@@ -2690,7 +2747,7 @@ impl ShojiWM {
         }
     }
 
-    fn invoke_decoration_runtime_handler(
+    pub(crate) fn invoke_decoration_runtime_handler(
         &mut self,
         window: &Window,
         window_id: &str,
@@ -2745,7 +2802,7 @@ impl ShojiWM {
                     }
                     DecorationHitTestResult::Move
                     | DecorationHitTestResult::Action(_)
-                    | DecorationHitTestResult::Outside => Some(CursorIcon::Default),
+                    | DecorationHitTestResult::Popup                    | DecorationHitTestResult::Outside => Some(CursorIcon::Default),
                     DecorationHitTestResult::ClientArea => None,
                 })
             })

@@ -5,7 +5,10 @@
 use shojiwm_rs::{
     HostMessage, RuntimeBoot, RuntimeHandle, RuntimeHost, cli::CommonArgs, prelude::*,
     runtime_api::CompositionPatch,
-    ssd::{DecorationNode, DecorationNodeKind, WaylandWindowAction, WaylandWindowSnapshot, WindowAction},
+    ssd::{
+        DecorationNode, DecorationNodeKind, PopupNode, WaylandWindowAction, WaylandWindowSnapshot,
+        WindowAction,
+    },
 };
 
 static WIDTH: WindowStateKey<f64> = WindowStateKey::new("width", |_| 400.0);
@@ -252,4 +255,128 @@ fn timers_and_animations_drive_the_scheduler() {
     assert!((cached.transform.opacity - 0.5).abs() < 1e-6);
     let tick = runtime.scheduler_tick(1100.0).unwrap();
     assert_eq!(tick.next_poll_in_ms, None);
+}
+
+#[test]
+fn hovering_a_button_opens_its_popup() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(ConfigBuilder::new(|| {
+            COMPOSITOR.window.composition(|_| {
+                let hover = signal(false);
+                ManagedWindow::new().child(
+                    Flex::column()
+                        .child(
+                            Button::new().on_hover_change(move |on| hover.set(on)).child(
+                                Popup::new()
+                                    .open(hover)
+                                    .placement(PopupPlacement::Top)
+                                    .offset(6.0)
+                                    .layer(PopupLayer::Window)
+                                    .child(Label::new("Maximize")),
+                            ),
+                        )
+                        .child(ClientWindow::new()),
+                )
+            });
+        })),
+        &args,
+    )
+    .launch(host);
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+
+    let popup_of = |node: &DecorationNode| -> PopupNode {
+        match find(node, &|node| matches!(node.kind, DecorationNodeKind::Popup(_))).map(|node| &node.kind) {
+            Some(DecorationNodeKind::Popup(popup)) => *popup,
+            _ => panic!("no popup in {node:?}"),
+        }
+    };
+    let evaluation = runtime.evaluate_window(&snapshot("w1", "a", true), 1).unwrap();
+    let popup = popup_of(&evaluation.node);
+    assert_eq!(
+        popup,
+        PopupNode {
+            open: false,
+            placement: PopupPlacement::Top,
+            offset: 6.0,
+            layer: PopupLayer::Window,
+            ..PopupNode::default()
+        }
+    );
+    let button = find(&evaluation.node, &|node| matches!(node.kind, DecorationNodeKind::Button(_))).unwrap();
+    let hover = button.interaction.hover_change.clone().unwrap();
+
+    runtime.invoke_handler("w1", &hover.true_handler, 2).unwrap();
+    let cached = runtime.evaluate_cached_window("w1", None, 3, false).unwrap();
+    assert_eq!(cached.node_patches.len(), 1, "{:?}", cached.node_patches);
+    let patched = cached.node_patches[0].replacement_node().expect("node patch");
+    assert!(popup_of(patched).open);
+}
+
+#[test]
+fn popup_triggers_follow_compositor_events() {
+    let host = RuntimeHost::detached();
+    let args = CommonArgs::parse(&[], &[]);
+    let mut runtime = RuntimeBoot::new(
+        Box::new(ConfigBuilder::new(|| {
+            COMPOSITOR.window.composition(|_| {
+                ManagedWindow::new().child(
+                    Flex::column()
+                        .child(
+                            Button::new().child(
+                                Popup::new()
+                                    .mode(PopupMode::Auto)
+                                    .trigger(PopupTrigger::hover(300.0, 100.0))
+                                    .child(Button::new().on_click(|| {})),
+                            ),
+                        )
+                        .child(ClientWindow::new()),
+                )
+            });
+        })),
+        &args,
+    )
+    .launch(host);
+    runtime.preload().unwrap();
+    runtime.enable().unwrap();
+
+    fn popup_state(node: &DecorationNode) -> Option<(PopupNode, shojiwm_rs::ssd::PopupHandlers)> {
+        find(node, &|node| matches!(node.kind, DecorationNodeKind::Popup(_))).map(|node| match &node.kind {
+            DecorationNodeKind::Popup(popup) => (*popup, node.interaction.popup.as_deref().cloned().unwrap_or_default()),
+            _ => unreachable!(),
+        })
+    }
+    let open_after = |runtime: &mut RuntimeHandle, now: u64| {
+        runtime.scheduler_tick(now as f64).unwrap();
+        let cached = runtime.evaluate_cached_window("w1", None, now, false).unwrap();
+        cached
+            .node
+            .iter()
+            .chain(cached.node_patches.iter().filter_map(|patch| patch.replacement_node()))
+            .find_map(popup_state)
+            .map(|(popup, _)| popup.open)
+    };
+
+    let evaluation = runtime.evaluate_window(&snapshot("w1", "a", true), 1000).unwrap();
+    let (popup, handlers) = popup_state(&evaluation.node).unwrap();
+    assert_eq!((popup.mode, popup.open), (PopupMode::Auto, false));
+    let interest = handlers.interest_change.expect("hover trigger listens to interest");
+    let dismiss = handlers.dismiss.expect("auto popups listen to close requests");
+
+    runtime.invoke_handler("w1", &interest.true_handler, 1000).unwrap();
+    assert_ne!(open_after(&mut runtime, 1200), Some(true), "opened before the delay");
+    assert_eq!(open_after(&mut runtime, 1300), Some(true));
+
+    // Leaving and coming back within the close delay keeps it open.
+    runtime.invoke_handler("w1", &interest.false_handler, 1400).unwrap();
+    runtime.invoke_handler("w1", &interest.true_handler, 1450).unwrap();
+    assert_ne!(open_after(&mut runtime, 1600), Some(false));
+
+    // A close request closes it at once.
+    runtime
+        .invoke_handler("w1", dismiss.handler_for(PopupDismissReason::Escape), 1700)
+        .unwrap();
+    assert_eq!(open_after(&mut runtime, 1700), Some(false));
 }

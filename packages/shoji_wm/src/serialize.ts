@@ -158,7 +158,21 @@ function serializeProps(
       continue;
     }
 
-    if (key === "onHoverChange" || key === "onActiveChange") {
+    if (kind === "Popup" && key === "onAnchorPress") {
+      serialized[key] = serializeRuntimeHandler(value, context, `${path}.${key}`, key);
+      continue;
+    }
+
+    if (kind === "Popup" && key === "onOpenChange") {
+      serialized[key] = serializePopupOpenChange(value, context, `${path}.${key}`);
+      continue;
+    }
+
+    if (
+      key === "onHoverChange" ||
+      key === "onActiveChange" ||
+      (kind === "Popup" && key === "onInterestChange")
+    ) {
       serialized[key] = serializeInteractionChangeHandler(
         value,
         context,
@@ -416,6 +430,64 @@ function serializeInteractionChangeHandler(
   throw new CompositionSerializationError(
     `${propName} must be a function handler`,
   );
+}
+
+function serializeRuntimeHandler(
+  value: unknown,
+  context: CompositionSerializationContext | undefined,
+  handlerKey: string,
+  propName: string,
+): unknown {
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "function") {
+    throw new CompositionSerializationError(`${propName} must be a function handler`);
+  }
+  if (!context) {
+    throw new CompositionSerializationError(
+      `${propName} function handlers require a serialization context`,
+    );
+  }
+  return {
+    kind: "runtime-handler",
+    id: context.registerInteractionHandler(handlerKey, value as () => void),
+  };
+}
+
+const POPUP_CLOSE_REASONS = [
+  ["outsidePress", "outside-press"],
+  ["escape", "escape"],
+  ["anchorGone", "anchor-gone"],
+  ["otherPopup", "other-popup"],
+] as const;
+
+/** `onOpenChange` of a `<Popup>`: one handler per close reason. */
+function serializePopupOpenChange(
+  value: unknown,
+  context: CompositionSerializationContext | undefined,
+  handlerKey: string,
+): unknown {
+  if (value == null) {
+    return undefined;
+  }
+  if (typeof value !== "function") {
+    throw new CompositionSerializationError("onOpenChange must be a function handler");
+  }
+  if (!context) {
+    throw new CompositionSerializationError(
+      "onOpenChange function handlers require a serialization context",
+    );
+  }
+  const handler = value as (open: boolean, reason: string) => void;
+  const serialized: Record<string, string> = { kind: "runtime-popup-dismiss" };
+  for (const [field, reason] of POPUP_CLOSE_REASONS) {
+    serialized[field] = context.registerInteractionHandler(
+      `${handlerKey}.${reason}`,
+      () => handler(false, reason),
+    );
+  }
+  return serialized;
 }
 
 function serializeOnClick(

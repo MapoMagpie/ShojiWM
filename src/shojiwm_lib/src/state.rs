@@ -457,7 +457,10 @@ pub struct ShojiWM {
         HashMap<String, crate::backend::shader_effect::ShaderEffectElementState>,
     pub output_capture_mirrors: HashMap<String, crate::backend::tty::OutputCaptureMirror>,
     pub pointer_contents: PointerContents,
-    pub decoration_hover_target: Option<TrackedDecorationInteractionTarget>,
+    /// Hovered decoration nodes: one, or a chain while the pointer is inside an
+    /// interactive `<Popup>` (see `ssd::popup`).
+    pub decoration_hover_targets: Vec<TrackedDecorationInteractionTarget>,
+    pub(crate) popup_input: crate::ssd::PopupInputState,
     pub decoration_active_target: Option<TrackedDecorationInteractionTarget>,
     pub layer_shell_on_demand_focus: Option<LayerSurface>,
     pub pending_layer_surfaces: Vec<PendingLayerSurface>,
@@ -1749,7 +1752,8 @@ impl ShojiWM {
             popup_framebuffer_effect_states: HashMap::new(),
             output_capture_mirrors: HashMap::new(),
             pointer_contents: PointerContents::default(),
-            decoration_hover_target: None,
+            decoration_hover_targets: Vec::new(),
+            popup_input: Default::default(),
             decoration_active_target: None,
             layer_shell_on_demand_focus: None,
             pending_layer_surfaces: Vec::new(),
@@ -3945,6 +3949,12 @@ impl ShojiWM {
             })
         {
             return Some(focus);
+        }
+
+        // An interactive SSD `<Popup>` covers the windows and their client
+        // popups below it; the decoration takes the pointer there.
+        if self.ssd_popup_window_under(pos).is_some() {
+            return None;
         }
 
         if let Some(focus) = self.window_popup_surface_under(pos) {

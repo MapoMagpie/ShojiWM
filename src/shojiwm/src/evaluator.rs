@@ -6619,6 +6619,324 @@ COMPOSITOR.window.composition = (window) => {
     }
 
     #[test]
+    fn embedded_runtime_sends_popups_with_their_placement() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-popup-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import { Box, Button, ClientWindow, COMPOSITOR, Label, Popup, useState } from "shoji_wm";
+
+COMPOSITOR.window.composition = (window) => {
+  const [hover, setHover] = useState(false);
+  return (
+    <Box direction="column">
+      <Button onHoverChange={setHover}>
+        <Popup open={hover} placement="top" align="end" offset={6} collision="none" layer="window">
+          <Label text="Maximize" />
+        </Popup>
+      </Button>
+      <Button>
+        <Popup>
+          <Label text="Close" />
+        </Popup>
+      </Button>
+      <ClientWindow />
+    </Box>
+  );
+};
+"##,
+        )
+        .expect("test config should be written");
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let window = make_window(false);
+        let tree = evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        let popups = tree
+            .node
+            .children
+            .iter()
+            .filter_map(|button| button.children.first())
+            .map(|popup| match &popup.kind {
+                DecorationNodeKind::Popup(popup) => *popup,
+                other => panic!("expected a popup, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            popups,
+            vec![
+                shojiwm_lib::ssd::PopupNode {
+                    open: false,
+                    placement: shojiwm_lib::ssd::PopupPlacement::Top,
+                    align: shojiwm_lib::ssd::PopupAlign::End,
+                    offset: 6.0,
+                    collision: shojiwm_lib::ssd::PopupCollision::None,
+                    layer: shojiwm_lib::ssd::PopupLayer::Window,
+                    ..shojiwm_lib::ssd::PopupNode::default()
+                },
+                shojiwm_lib::ssd::PopupNode::default(),
+            ]
+        );
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// `trigger` popups open and close themselves from the compositor's
+    /// interest / anchor-press / dismiss events.
+    #[test]
+    fn embedded_runtime_popup_triggers_follow_compositor_events() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-popup-trigger-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import { Box, Button, ClientWindow, COMPOSITOR, Label, Popup } from "shoji_wm";
+
+COMPOSITOR.window.composition = () => (
+  <Box direction="column">
+    <Button>
+      <Popup trigger="hover" mode="auto" openDelay={300} closeDelay={100}>
+        <Button onClick={() => {}} />
+      </Popup>
+    </Button>
+    <Button>
+      <Popup trigger="click" mode="auto" closeOnEscape={false}>
+        <Label text="menu" />
+      </Popup>
+    </Button>
+    <ClientWindow />
+  </Box>
+);
+"##,
+        )
+        .expect("test config should be written");
+
+        use shojiwm_lib::ssd::{PopupHandlers, PopupMode, PopupNode};
+        fn popups(node: &shojiwm_lib::ssd::DecorationNode, out: &mut Vec<(PopupNode, PopupHandlers)>) {
+            if let DecorationNodeKind::Popup(popup) = &node.kind {
+                out.push((*popup, node.interaction.popup.as_deref().cloned().unwrap_or_default()));
+            }
+            for child in &node.children {
+                popups(child, out);
+            }
+        }
+        let open_states = |cached: &DecorationCachedEvaluationResult| {
+            let mut found = Vec::new();
+            for node in cached
+                .node
+                .iter()
+                .chain(cached.node_patches.iter().filter_map(|patch| patch.replacement_node()))
+            {
+                popups(node, &mut found);
+            }
+            found.into_iter().map(|(popup, _)| popup.open).collect::<Vec<_>>()
+        };
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let window = make_window(false);
+        let tree = evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        let mut found = Vec::new();
+        popups(&tree.node, &mut found);
+        let [(hover_popup, hover), (click_popup, click)] = found.as_slice() else {
+            panic!("two popups expected: {found:?}");
+        };
+        assert_eq!((hover_popup.mode, hover_popup.open), (PopupMode::Auto, false));
+        assert!(!click_popup.close_on_escape && click_popup.close_on_outside_press);
+        let interest = hover.interest_change.clone().expect("hover trigger listens to interest");
+        let dismiss = hover.dismiss.clone().expect("auto popups listen to close requests");
+        let press = click.anchor_press.clone().expect("click trigger listens to anchor presses");
+        assert!(hover.anchor_press.is_none() && click.interest_change.is_none());
+
+        // Hover: opens after the delay.
+        evaluator
+            .invoke_handler(&window.id, &interest.true_handler, 1000)
+            .expect("interest handler");
+        evaluator.scheduler_tick(1200.0).expect("tick");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 1200, false)
+            .expect("evaluate");
+        assert!(!open_states(&cached).contains(&true), "opened before the delay");
+        evaluator.scheduler_tick(1300.0).expect("tick");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 1300, false)
+            .expect("evaluate");
+        assert_eq!(open_states(&cached), [true]);
+
+        // A close request closes it at once.
+        evaluator
+            .invoke_handler(
+                &window.id,
+                dismiss.handler_for(shojiwm_lib::ssd::PopupDismissReason::OutsidePress),
+                1400,
+            )
+            .expect("dismiss handler");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 1400, false)
+            .expect("evaluate");
+        assert!(!open_states(&cached).contains(&true));
+
+        // Click: each anchor press toggles (the hover popup stays closed).
+        for (now, open) in [(1500, true), (1600, false)] {
+            evaluator.invoke_handler(&window.id, &press, now).expect("anchor press");
+            let cached = evaluator
+                .evaluate_cached_window(&window.id, None, now, false)
+                .expect("evaluate");
+            assert_eq!(open_states(&cached).contains(&true), open);
+        }
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// The default config's delayed tooltip: a poll started from a hover
+    /// opens the popup only once the pointer has rested long enough.
+    #[test]
+    fn embedded_runtime_opens_a_popup_after_a_resting_hover() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-popup-delay-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import { Box, Button, ClientWindow, COMPOSITOR, createPoll, Label, Popup, useEffect, useState } from "shoji_wm";
+
+const useRestingHover = (hovered: boolean) => {
+  const [rested, setRested] = useState(false);
+  useEffect(() => {
+    if (!hovered) {
+      setRested(false);
+      return;
+    }
+    const timer = createPoll(2000, (handle) => {
+      handle.cancel();
+      setRested(true);
+    });
+    return () => timer.cancel();
+  }, [hovered]);
+  return rested;
+};
+
+const MinimizeButton = () => {
+  const [hover, setHover] = useState(false);
+  const open = useRestingHover(hover());
+  return (
+    <Box>
+      <Button onHoverChange={setHover} />
+      <Popup open={open}>
+        <Label text="Minimize" />
+      </Popup>
+    </Box>
+  );
+};
+
+COMPOSITOR.window.composition = () => (
+  <Box direction="column">
+    <MinimizeButton />
+    <ClientWindow />
+  </Box>
+);
+"##,
+        )
+        .expect("test config should be written");
+
+        fn popup_open(node: &shojiwm_lib::ssd::DecorationNode) -> Option<bool> {
+            if let DecorationNodeKind::Popup(popup) = &node.kind {
+                return Some(popup.open);
+            }
+            node.children.iter().find_map(popup_open)
+        }
+        fn find_hover(node: &shojiwm_lib::ssd::DecorationNode) -> Option<String> {
+            if let Some(hover) = &node.interaction.hover_change {
+                return Some(hover.true_handler.clone());
+            }
+            node.children.iter().find_map(find_hover)
+        }
+        fn opened_by(cached: &DecorationCachedEvaluationResult) -> Option<bool> {
+            cached.node.as_ref().and_then(popup_open).or_else(|| {
+                cached
+                    .node_patches
+                    .iter()
+                    .filter_map(|patch| patch.replacement_node())
+                    .find_map(popup_open)
+            })
+        }
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let window = make_window(false);
+        let tree = evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        assert_eq!(popup_open(&tree.node), Some(false));
+        let hover = find_hover(&tree.node).expect("hover handler");
+
+        evaluator
+            .invoke_handler(&window.id, &hover, 1000)
+            .expect("hover handler should run");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 1000, false)
+            .expect("hovered composition should evaluate");
+        assert_ne!(opened_by(&cached), Some(true), "opened without a delay");
+        assert!(cached.next_poll_in_ms.is_some(), "the delay must wake the compositor");
+
+        for now_ms in [1001, 1500, 2900] {
+            evaluator.scheduler_tick(now_ms as f64).expect("tick");
+            let cached = evaluator
+                .evaluate_cached_window(&window.id, None, now_ms, false)
+                .expect("composition should evaluate");
+            assert_ne!(opened_by(&cached), Some(true), "opened early at {now_ms} ms");
+        }
+
+        evaluator.scheduler_tick(3000.0).expect("tick");
+        let cached = evaluator
+            .evaluate_cached_window(&window.id, None, 3000, false)
+            .expect("rested composition should evaluate");
+        assert_eq!(opened_by(&cached), Some(true));
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
     fn embedded_runtime_uses_direct_effect_uniform_patches_for_animation() {
         let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")

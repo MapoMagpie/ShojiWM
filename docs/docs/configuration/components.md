@@ -9,7 +9,7 @@ These are the building blocks you assemble inside
 decorations. They are imported from `shoji_wm`:
 
 ```tsx
-import {Box, Label, Button, AppIcon, Image, ShaderEffect, WindowBorder} from 'shoji_wm';
+import {Box, Label, Button, AppIcon, Image, Popup, ShaderEffect, WindowBorder} from 'shoji_wm';
 ```
 
 `<ManagedWindow/>` and `<ClientWindow/>` are documented on the
@@ -162,6 +162,160 @@ the border and provides interactive resize hit areas.
   <ClientWindow />
 </WindowBorder>
 ```
+
+## `<Popup/>`
+
+Content shown next to its parent but drawn **outside the window**: a tooltip
+for a title bar button, a menu with buttons. It is written inside the
+component it belongs to (its parent is its *anchor*), so it shares that
+component's signals. The model follows the browser's
+[popover API](https://developer.mozilla.org/en-US/docs/Web/API/Popover_API).
+
+### A tooltip
+
+```tsx
+import {Box, Button, Label, Popup, windowAction} from 'shoji_wm';
+
+<Button onClick={windowAction('maximize')} style={{width: 16, height: 16}}>
+  <Popup trigger="hover" openDelay={500} placement="bottom" offset={6}>
+    <Box style={{background: '#1e1e2ef0', borderRadius: 6, paddingX: 10, paddingY: 4}}>
+      <Label text="Maximize" style={{fontSize: 12, color: '#f5f7fa'}} />
+    </Box>
+  </Popup>
+</Button>
+```
+
+`trigger="hover"` opens it once the pointer has rested `openDelay` ms on the
+button and closes it `closeDelay` ms after the pointer left.
+
+### A menu with buttons
+
+```tsx
+<Button onClick={toggleMaximize}>
+  <Popup trigger="hover" mode="auto" openDelay={500} closeDelay={200}>
+    <Box direction="row" style={{gap: 6, padding: 6}}>
+      <Button onClick={() => snap(window, 'left')}>…</Button>
+      <Button onClick={() => snap(window, 'right')}>…</Button>
+    </Box>
+  </Popup>
+</Button>
+```
+
+With `mode="auto"` the popup takes pointer input, so its buttons work. The
+pointer can move from the anchor into the popup: inside the popup the anchor
+still counts as hovered, and `closeDelay` covers the gap between them. A press
+outside, Escape, or opening another `"auto"` popup closes it.
+
+### A menu that opens on click, with your own state
+
+```tsx
+const [open, setOpen] = useState(false);
+
+<Button onClick={() => setOpen(!open())}>
+  <AppIcon icon={window.icon} />
+  <Popup mode="auto" open={open} onOpenChange={(next, reason) => setOpen(next)}>
+    <Button onClick={() => { window.close(); setOpen(false); }}>…</Button>
+  </Popup>
+</Button>
+```
+
+The same with less code is `<Popup trigger="click" mode="auto">`.
+
+### Props
+
+| Prop | Type | Meaning |
+| --- | --- | --- |
+| `open` | `boolean` (or signal) | Whether it is shown (default `true`); not used with `trigger` |
+| `trigger` | `"hover" \| "click"` | Let the popup open and close itself (see below) |
+| `openDelay` | `number` | `trigger="hover"`: ms on the anchor before it opens (default `500`) |
+| `closeDelay` | `number` | `trigger="hover"`: ms after the pointer left before it closes (default `200`) |
+| `mode` | `"hint" \| "auto" \| "manual"` | How it takes part in input (default `"hint"`, see below) |
+| `onOpenChange` | `(open, reason) => void` | `"auto"`: the compositor asks it to close |
+| `closeOnEscape` | `boolean` | `"auto"`: Escape closes it (default `true`) |
+| `closeOnOutsidePress` | `boolean` | `"auto"`: a press outside it and its anchor closes it (default `true`) |
+| `onInterestChange` | `(interested) => void` | The pointer entered / left the anchor or, unless `"hint"`, the popup |
+| `onAnchorPress` | `() => void` | The anchor was pressed |
+| `placement` | `"top" \| "bottom" \| "left" \| "right"` | The side of the anchor it goes to (default `"bottom"`) |
+| `align` | `"start" \| "center" \| "end"` | Alignment along that side (default `"center"`) |
+| `offset` | `number` | Distance from the anchor in logical pixels (default `0`) |
+| `collision` | `"flip" \| "none"` | `"flip"` (default) moves it to the opposite side when that has more room on the output and slides it along the side to stay on the output |
+| `layer` | `"top" \| "window"` | `"top"` (default): above every window. `"window"`: right above its own window, so windows stacked higher cover it |
+| `style` | `SSDStyle` | Styling of the popup box itself |
+
+### Modes
+
+| `mode` | Pointer input | Closed by the compositor |
+| --- | --- | --- |
+| `"hint"` (default) | Falls through to whatever is below | Never |
+| `"auto"` | Taken, also above other windows' clients | On a press outside, Escape, its window hidden, another `"auto"` popup opening |
+| `"manual"` | Taken | Never |
+
+The compositor never changes `open` itself: it calls `onOpenChange(false,
+reason)` and your config decides. An `"auto"` popup without `onOpenChange` or
+`trigger` gets no close requests (and leaves Escape to the window). `reason` is one of:
+
+| `reason` | When |
+| --- | --- |
+| `"outside-press"` | A press outside the popup (and the popups nested in it) and outside its anchor |
+| `"escape"` | Escape, for the most recently opened `"auto"` popup. While one is open, Escape does not reach the focused window; set `closeOnEscape={false}` to keep Escape for the window |
+| `"anchor-gone"` | Its window was hidden (minimized, moved to another workspace) |
+| `"other-popup"` | Another `"auto"` popup opened that is not nested in this one |
+
+### Triggers
+
+`trigger` keeps the open state for you, like `interestfor` / `popovertarget`
+in browsers:
+
+- `"hover"`: opens after the pointer rested `openDelay` ms on the anchor and
+  closes `closeDelay` ms after it left both the anchor and (unless `"hint"`) the
+  popup. Coming back within `closeDelay` keeps it open.
+- `"click"`: each press of the anchor toggles it.
+
+A `trigger` popup also closes on `onOpenChange` requests; your own
+`onOpenChange` is still called. Set `trigger` once and do not switch it on and
+off.
+
+### Hover inside a popup
+
+Outside popups, hover goes to the innermost node with `onHoverChange` only.
+Inside an `"auto"` / `"manual"` popup it covers the whole ancestor chain, like
+the DOM's `:hover`: the buttons in the popup, the popup, its anchor and the
+anchor's ancestors all count as hovered. So `open={hover}` driven by the
+anchor's `onHoverChange` keeps a menu open while the pointer is on it.
+
+### How a popup differs from an ordinary child
+
+- **Position**: it is sized by its content (its children are laid out as a
+  column) and takes no space in the parent's layout.
+- **Not clipped**: the rounded corners of the window and `overflow: 'hidden'`
+  ancestors do not cut it.
+- **Stacking**: drawn in its own pass, above every window (`layer="top"`) and
+  below layer-shell bars and overlays. A popup nested in a popup is drawn with
+  its outer popup.
+- **Painting**: it is an ordinary decoration subtree: `style`, `boxShadow`,
+  [paint shaders](./paint.md), labels, images and signal-driven `opacity` all
+  work. A `<ShaderEffect/>` inside a popup draws its children but not its
+  effect.
+- **Window animations**: while its window is drawn with an animated transform
+  (open / close, minimize, scaling), the popup is neither drawn nor hit.
+  Dragging a window moves its popups with it.
+- `open` only toggles visibility: a closed popup keeps its layout, so opening it
+  is cheap.
+
+### Rust
+
+```rust
+Button::new().child(
+    Popup::new()
+        .mode(PopupMode::Auto)
+        .trigger(PopupTrigger::hover(500.0, 200.0))
+        .on_open_change(|open, reason| eprintln!("open: {open} ({reason:?})"))
+        .child(Label::new("Maximize")),
+)
+```
+
+`Popup::new().open(signal)`, `.close_on_escape(false)`,
+`.on_interest_change(...)` and `.on_anchor_press(...)` match the props above.
 
 ---
 

@@ -482,6 +482,7 @@ export type CompositionNodeType =
   | "ManagedWindow"
   | "Window"
   | "WindowBorder"
+  | "Popup"
   | "Fragment";
 
 /**
@@ -1919,6 +1920,132 @@ export interface SSDStyle {
   fontFamily?: MaybeSignal<FontFamily>;
   textAlign?: MaybeSignal<"start" | "center" | "end">;
   lineHeight?: MaybeSignal<number>;
+}
+
+/** The side of the anchor a `<Popup>` goes to. / `<Popup>` を出す基準の辺。 */
+export type PopupPlacement = "top" | "bottom" | "left" | "right";
+/** Alignment of a `<Popup>` along that side. / その辺に沿った揃え位置。 */
+export type PopupAlign = "start" | "center" | "end";
+/**
+ * What a `<Popup>` does when it would leave the output.
+ * `<Popup>` が出力からはみ出すときの挙動。
+ */
+export type PopupCollision = "flip" | "none";
+/** Stacking layer of a `<Popup>`. / `<Popup>` の重なり順レイヤー。 */
+export type PopupLayer = "top" | "window";
+/**
+ * How a `<Popup>` takes part in input, like the HTML `popover` attribute.
+ * `<Popup>` の入力への関わり方（HTML の `popover` 属性に相当）。
+ *
+ * - `"hint"`: a tooltip; pointer input falls through. / ツールチップ。入力は素通り。
+ * - `"auto"`: takes input and is light-dismissed (`onOpenChange`). /
+ *   入力を受け、外側クリック等で閉じる要求が来る。
+ * - `"manual"`: takes input; only the config closes it. / 入力を受け、閉じるのは設定側だけ。
+ */
+export type PopupMode = "hint" | "auto" | "manual";
+/**
+ * Why the compositor asks an `"auto"` popup to close (or, with `trigger`,
+ * why it closed by itself).
+ * `"auto"` のポップアップに閉じる要求が来た理由。
+ */
+export type PopupOpenChangeReason =
+  | "outside-press"
+  | "escape"
+  | "anchor-gone"
+  | "other-popup";
+/** What opens a `<Popup>` by itself. / `<Popup>` を自動で開くきっかけ。 */
+export type PopupTrigger = "hover" | "click";
+
+/**
+ * Props of {@link Popup}. The children are laid out as a column, sized by
+ * their content.
+ * {@link Popup} の props。子要素は縦に並び、中身の大きさに合わせます。
+ */
+export interface PopupProps extends ComponentProps {
+  /**
+   * Whether the popup is shown (default `true`). Toggling it does not lay the
+   * window out again.
+   * 表示するかどうか（既定 `true`）。切り替えてもウィンドウの再レイアウトは起きません。
+   */
+  open?: MaybeSignal<boolean>;
+  /**
+   * The side of the parent (the anchor) to show the popup on. Default
+   * `"bottom"`.
+   * 親（基準）のどちら側に出すか。既定 `"bottom"`。
+   */
+  placement?: MaybeSignal<PopupPlacement>;
+  /** Alignment along that side. Default `"center"`. / その辺での揃え位置。既定 `"center"`。 */
+  align?: MaybeSignal<PopupAlign>;
+  /** Distance from the anchor in logical pixels. Default `0`. / 基準からの距離（論理 px）。既定 `0`。 */
+  offset?: MaybeSignal<number>;
+  /**
+   * `"flip"` (default): move to the opposite side when that has more room on
+   * the output, and slide along the side to stay on it. `"none"`: keep the
+   * requested position.
+   * `"flip"`（既定）: 出力内の余白が反対側の方が大きければそちらへ移り、辺に沿って
+   * 画面内に収まるようずらします。`"none"`: 指定位置のまま。
+   */
+  collision?: MaybeSignal<PopupCollision>;
+  /**
+   * `"top"` (default): above every window, below layer-shell bars.
+   * `"window"`: right above its own window, so higher windows cover it.
+   * `"top"`（既定）: 全ウィンドウの上、レイヤーシェルのバーの下。
+   * `"window"`: 自分のウィンドウのすぐ上（上にあるウィンドウには隠れます）。
+   */
+  layer?: MaybeSignal<PopupLayer>;
+  /**
+   * How the popup takes part in input. Default `"hint"`.
+   * 入力への関わり方。既定 `"hint"`。
+   */
+  mode?: MaybeSignal<PopupMode>;
+  /**
+   * `"auto"` only: Escape asks it to close, and does not reach the focused
+   * window while it is open. Default `true`.
+   * `"auto"` のみ: Esc で閉じる要求を出し、開いている間 Esc はウィンドウに届かない。既定 `true`。
+   */
+  closeOnEscape?: MaybeSignal<boolean>;
+  /**
+   * `"auto"` only: a press outside the popup and its parent asks it to
+   * close. Default `true`.
+   * `"auto"` のみ: ポップアップと親の外を押すと閉じる要求を出す。既定 `true`。
+   */
+  closeOnOutsidePress?: MaybeSignal<boolean>;
+  /**
+   * Called with `(false, reason)` when the compositor asks an `"auto"`
+   * popup to close. Set your `open` signal to follow it, or keep it open.
+   * `"auto"` のポップアップに閉じる要求が来たとき `(false, reason)` で呼ばれます。
+   */
+  onOpenChange?: (open: boolean, reason: PopupOpenChangeReason) => void;
+  /**
+   * Called when the pointer enters / leaves the parent (the anchor) or, for
+   * an interactive popup, the popup itself (like HTML `interestfor`).
+   * ポインターが親（基準）に、対話型なら自身にも、出入りしたとき呼ばれます。
+   */
+  onInterestChange?: (interested: boolean) => void;
+  /** Called when the parent (the anchor) is pressed. / 親（基準）が押されたとき呼ばれます。 */
+  onAnchorPress?: () => void;
+  /**
+   * Let the popup open and close itself instead of `open`: `"hover"` opens
+   * after the pointer rested `openDelay` ms on the parent and closes
+   * `closeDelay` ms after it left both the parent and the popup; `"click"`
+   * toggles on a press of the parent. Close requests (`onOpenChange`) close
+   * it. Set once; do not switch it on and off.
+   * `open` の代わりに自分で開閉します。`"hover"`: 親に `openDelay` ms 置くと開き、
+   * 親とポップアップの両方から離れて `closeDelay` ms で閉じる。`"click"`: 親を押すたびに開閉。
+   */
+  trigger?: PopupTrigger;
+  /** `trigger="hover"`: delay before opening, ms. Default `500`. / 開くまでの待ち時間（ms、既定 `500`）。 */
+  openDelay?: number;
+  /**
+   * `trigger="hover"`: delay before closing, ms; lets the pointer cross the
+   * gap between the parent and the popup. Default `200`.
+   * 閉じるまでの猶予（ms、既定 `200`）。親とポップアップの隙間を渡れるようにします。
+   */
+  closeDelay?: number;
+  /** Visual styling of the popup box itself. / ポップアップ自体のスタイル。 */
+  style?: SSDStyle;
+  /** Stable node id for targeted invalidation. / ターゲット無効化のための安定したノード ID。 */
+  id?: string;
 }
 
 /**

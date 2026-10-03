@@ -7,6 +7,8 @@ use super::{
     DecorationNodeKind, DecorationStateChangeHandler, DecorationStyle, Edges, EffectAlphaMode,
     EffectInput, EffectInvalidationPolicy, EffectOutsets, EffectRegion, EffectStage, ImageNode, JustifyContent,
     LabelNode, LayoutDirection, NodeTransform, NoiseKind, NoiseStage, Overflow, PointerEvents,
+    PopupAlign, PopupCollision, PopupDismissHandlers, PopupHandlers, PopupLayer, PopupMode,
+    PopupNode, PopupPlacement,
     PositionOffsets, ShaderEffectNode, ShaderModule, ShaderStage, ShaderUniformValue,
     StylePosition, WindowAction, WindowBorderInteraction, WindowEffectConfig, WindowEffectSlot,
     WindowResizeHitArea, WindowSourceInclude,
@@ -50,6 +52,19 @@ pub struct WireProps {
     pub on_hover_change: Option<WireStateChangeHandler>,
     pub on_active_change: Option<WireStateChangeHandler>,
     pub interaction: Option<WireWindowBorderInteraction>,
+    // <Popup>
+    pub open: Option<bool>,
+    pub placement: Option<String>,
+    pub align: Option<String>,
+    pub offset: Option<f64>,
+    pub collision: Option<String>,
+    pub layer: Option<String>,
+    pub mode: Option<String>,
+    pub close_on_escape: Option<bool>,
+    pub close_on_outside_press: Option<bool>,
+    pub on_open_change: Option<WirePopupDismissHandlers>,
+    pub on_interest_change: Option<WireStateChangeHandler>,
+    pub on_anchor_press: Option<WireRuntimeHandler>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -460,6 +475,8 @@ pub enum DecorationBridgeError {
     InvalidColor(String),
     #[error("invalid image fit value: {0}")]
     InvalidImageFit(String),
+    #[error("invalid popup {0} value: {1}")]
+    InvalidPopupOption(&'static str, String),
 }
 
 pub fn decode_tree_json(input: &str) -> Result<DecorationNode, DecorationBridgeError> {
@@ -471,7 +488,7 @@ pub fn decode_tree_json(input: &str) -> Result<DecorationNode, DecorationBridgeE
 impl TryFrom<WireDecorationNode> for DecorationNode {
     type Error = DecorationBridgeError;
 
-    fn try_from(value: WireDecorationNode) -> Result<Self, Self::Error> {
+    fn try_from(mut value: WireDecorationNode) -> Result<Self, Self::Error> {
         let kind = match value.kind.as_str() {
             "Box" => DecorationNodeKind::Box(BoxNode {
                 direction: parse_direction(value.props.direction.or(value.props.split))?,
@@ -500,6 +517,7 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
                     .try_into()?,
             }),
             "Window" => DecorationNodeKind::WindowSlot,
+            "Popup" => DecorationNodeKind::Popup(parse_popup(&value.props)?),
             "WindowBorder" => DecorationNodeKind::WindowBorder,
             "ManagedWindow" => DecorationNodeKind::Box(BoxNode {
                 direction: LayoutDirection::Column,
@@ -524,6 +542,15 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
         } else {
             WindowBorderInteraction::default()
         };
+        let popup_handlers = if matches!(kind, DecorationNodeKind::Popup(_)) {
+            decode_popup_handlers(
+                value.props.on_interest_change.take(),
+                value.props.on_anchor_press.take(),
+                value.props.on_open_change.take(),
+            )?
+        } else {
+            None
+        };
         let mut style = DecorationStyle::try_from(value.props.style)?;
         style.paint = value.props.paint.map(decode_paint_shader).transpose()?;
         style.overlay = value.props.overlay.map(decode_paint_shader).transpose()?;
@@ -546,6 +573,7 @@ impl TryFrom<WireDecorationNode> for DecorationNode {
                     .on_active_change
                     .map(TryInto::try_into)
                     .transpose()?,
+                popup: popup_handlers,
             },
             window_border_interaction,
             kind,
@@ -1390,6 +1418,103 @@ fn parse_image_fit(input: Option<&str>) -> Result<crate::ssd::ImageFit, Decorati
         "fill" => Ok(crate::ssd::ImageFit::Fill),
         other => Err(DecorationBridgeError::InvalidImageFit(other.to_string())),
     }
+}
+
+fn parse_popup(props: &WireProps) -> Result<PopupNode, DecorationBridgeError> {
+    fn option<T>(
+        name: &'static str,
+        value: Option<&str>,
+        parse: impl Fn(&str) -> Option<T>,
+    ) -> Result<Option<T>, DecorationBridgeError> {
+        value
+            .map(|value| {
+                parse(value)
+                    .ok_or_else(|| DecorationBridgeError::InvalidPopupOption(name, value.to_string()))
+            })
+            .transpose()
+    }
+    let defaults = PopupNode::default();
+    Ok(PopupNode {
+        open: props.open.unwrap_or(defaults.open),
+        placement: option("placement", props.placement.as_deref(), |value| match value {
+            "top" => Some(PopupPlacement::Top),
+            "bottom" => Some(PopupPlacement::Bottom),
+            "left" => Some(PopupPlacement::Left),
+            "right" => Some(PopupPlacement::Right),
+            _ => None,
+        })?
+        .unwrap_or(defaults.placement),
+        align: option("align", props.align.as_deref(), |value| match value {
+            "start" => Some(PopupAlign::Start),
+            "center" => Some(PopupAlign::Center),
+            "end" => Some(PopupAlign::End),
+            _ => None,
+        })?
+        .unwrap_or(defaults.align),
+        offset: props.offset.filter(|offset| offset.is_finite()).unwrap_or(defaults.offset),
+        collision: option("collision", props.collision.as_deref(), |value| match value {
+            "flip" => Some(PopupCollision::Flip),
+            "none" => Some(PopupCollision::None),
+            _ => None,
+        })?
+        .unwrap_or(defaults.collision),
+        layer: option("layer", props.layer.as_deref(), |value| match value {
+            "top" => Some(PopupLayer::Top),
+            "window" => Some(PopupLayer::Window),
+            _ => None,
+        })?
+        .unwrap_or(defaults.layer),
+        mode: option("mode", props.mode.as_deref(), |value| match value {
+            "hint" => Some(PopupMode::Hint),
+            "auto" => Some(PopupMode::Auto),
+            "manual" => Some(PopupMode::Manual),
+            _ => None,
+        })?
+        .unwrap_or(defaults.mode),
+        close_on_escape: props.close_on_escape.unwrap_or(defaults.close_on_escape),
+        close_on_outside_press: props
+            .close_on_outside_press
+            .unwrap_or(defaults.close_on_outside_press),
+    })
+}
+
+/// `onOpenChange` of a `<Popup>`: one runtime handler per close reason.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePopupDismissHandlers {
+    pub kind: String,
+    pub outside_press: String,
+    pub escape: String,
+    pub anchor_gone: String,
+    pub other_popup: String,
+}
+
+fn decode_popup_handlers(
+    interest: Option<WireStateChangeHandler>,
+    anchor_press: Option<WireRuntimeHandler>,
+    dismiss: Option<WirePopupDismissHandlers>,
+) -> Result<Option<Box<PopupHandlers>>, DecorationBridgeError> {
+    let handlers = PopupHandlers {
+        interest_change: interest.map(TryInto::try_into).transpose()?,
+        anchor_press: anchor_press
+            .map(|handler| match handler.kind.as_str() {
+                "runtime-handler" => Ok(handler.id),
+                _ => Err(DecorationBridgeError::UnsupportedNodeKind(handler.kind)),
+            })
+            .transpose()?,
+        dismiss: dismiss
+            .map(|handlers| match handlers.kind.as_str() {
+                "runtime-popup-dismiss" => Ok(PopupDismissHandlers {
+                    outside_press: handlers.outside_press,
+                    escape: handlers.escape,
+                    anchor_gone: handlers.anchor_gone,
+                    other_popup: handlers.other_popup,
+                }),
+                _ => Err(DecorationBridgeError::UnsupportedNodeKind(handlers.kind)),
+            })
+            .transpose()?,
+    };
+    Ok((handlers != PopupHandlers::default()).then(|| Box::new(handlers)))
 }
 
 fn parse_direction(input: Option<String>) -> Result<LayoutDirection, DecorationBridgeError> {

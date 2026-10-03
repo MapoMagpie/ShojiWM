@@ -93,7 +93,7 @@ use crate::{
     config::DisplayModePreference,
     drawing::PointerRenderElement,
     presentation::{take_presentation_feedback, update_primary_scanout_output},
-    ssd::{EffectInput, WindowSourceInclude},
+    ssd::{EffectInput, PopupLayer, WindowSourceInclude},
     state::ShojiWM,
 };
 use smithay::wayland::presentation::Refresh;
@@ -3896,6 +3896,18 @@ fn render_surface(
         let mut fullscreen_overlay_visible =
             fullscreen_window.is_some() && !upper_layer_elements.is_empty();
         scene_elements.extend(upper_layer_elements);
+        if fullscreen_window.is_none() {
+            timescope::scope!("tty ssd popups");
+            scene_elements.extend(ssd_popup_scene_elements(
+                &mut backend.renderer,
+                window_decorations,
+                &windows_top_to_bottom,
+                &output,
+                output_geo,
+                scale,
+                PopupLayer::Top,
+            ));
+        }
         let upper_layers_elapsed_ms = upper_layers_started_at.elapsed().as_secs_f64() * 1000.0;
         timing.upper_layers_elapsed_ms = upper_layers_elapsed_ms;
         let closing_snapshots_started_at = Instant::now();
@@ -6228,6 +6240,17 @@ fn render_surface(
                 // Smithay renders render elements in reverse order, so this vector is
                 // ordered front-to-back. Front effects go before the window elements;
                 // behind effects go after them but still above lower windows.
+                if !use_full_window_snapshot {
+                    scene_elements.extend(ssd_popup_scene_elements(
+                        &mut backend.renderer,
+                        window_decorations,
+                        std::slice::from_ref(window),
+                        &output,
+                        output_geo,
+                        scale,
+                        PopupLayer::Window,
+                    ));
+                }
                 if let Some(in_front_effects) = in_front_effects {
                     if window_effect_debug_enabled() {
                         info!(
@@ -8015,6 +8038,77 @@ fn transform_snapshot_elements(
             ))
         })
         .collect())
+}
+
+/// The open SSD `<Popup>`s of `layer` of `windows` (front to back). Popups
+/// are drawn only while their window sits still: during a move / scale
+/// animation the window renders through paths a popup is not part of.
+fn ssd_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    window_decorations: &mut HashMap<smithay::desktop::Window, crate::ssd::WindowDecorationState>,
+    windows: &[smithay::desktop::Window],
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    layer: PopupLayer,
+) -> Vec<TtyRenderElements> {
+    let mut elements = Vec::new();
+    for window in windows {
+        let Some(decoration) = window_decorations.get_mut(window) else {
+            continue;
+        };
+        if !decoration.managed_window_allows_render_on_output(output.name().as_str())
+            || !decoration.popup_scopes().has_layer(layer)
+        {
+            continue;
+        }
+        let visual = window_visual_state(
+            decoration.layout.root.rect,
+            decoration.visual_transform,
+            output_geo,
+            scale,
+        );
+        if !is_identity_visual_geometry(visual) {
+            continue;
+        }
+        let root_origin = root_physical_origin_precise(
+            decoration.layout.root.rect,
+            decoration.root_subpixel_offset,
+            output_geo,
+            scale,
+        );
+        let popups = match decoration::popup_elements_for_decoration(
+            renderer,
+            decoration,
+            layer,
+            output_geo,
+            scale,
+            visual.opacity,
+        ) {
+            Ok(popups) => popups,
+            Err(error) => {
+                warn!(?error, "failed to build SSD popup elements");
+                continue;
+            }
+        };
+        elements.extend(popups.into_iter().map(|element| match element {
+            decoration::PopupSceneElement::Decoration(element) => {
+                TtyRenderElements::RelocatedDecoration(RelocateRenderElement::from_element(
+                    element,
+                    root_origin,
+                    Relocate::Relative,
+                ))
+            }
+            decoration::PopupSceneElement::Texture(element) => {
+                TtyRenderElements::RelocatedText(RelocateRenderElement::from_element(
+                    element,
+                    root_origin,
+                    Relocate::Relative,
+                ))
+            }
+        }));
+    }
+    elements
 }
 
 fn transform_decoration_elements(

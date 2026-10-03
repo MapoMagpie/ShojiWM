@@ -14,6 +14,8 @@ mod evaluator;
 mod integration;
 mod interaction;
 pub mod paint;
+pub mod popup;
+mod popup_input;
 pub mod window_model;
 
 use smithay::utils::Logical;
@@ -42,6 +44,12 @@ pub use integration::{
 #[cfg(test)]
 pub(crate) use integration::paint_buffers_for_layout;
 pub use interaction::DecorationInteractionSnapshot;
+pub(crate) use popup_input::PopupInputState;
+pub use popup::{
+    DecorationPart, PopupAlign, PopupCollision, PopupDismissHandlers, PopupDismissReason,
+    PopupHandlers, PopupInfo, PopupLayer, PopupMode, PopupNode, PopupPlacement, PopupScopes,
+    set_popup_viewports,
+};
 pub use window_model::{
     GestureSwipeEventSnapshot, GestureSwipePhaseSnapshot, LayerKindSnapshot, LayerPositionSnapshot,
     ManagedWindowAnimationEasingSnapshot, ManagedWindowAnimationMode,
@@ -185,6 +193,12 @@ impl ComputedDecorationTree {
     /// rects that are rendered, so input matches what is on screen exactly.
     pub fn hit_test_at(&self, x: f64, y: f64) -> DecorationHitTestResult {
         let point = self.root.frame.layout_point(x, y);
+        // Interactive popups sit above everything else of the window.
+        if let Some(hit) = popup::popup_hit(&self.root, point) {
+            return find_button_action(hit.popup, point)
+                .map(DecorationHitTestResult::Action)
+                .unwrap_or(DecorationHitTestResult::Popup);
+        }
         if let Some(action) = find_button_action(&self.root, point) {
             return DecorationHitTestResult::Action(action);
         }
@@ -238,7 +252,26 @@ impl ComputedDecorationTree {
         x: f64,
         y: f64,
     ) -> Option<DecorationInteractionTarget> {
-        find_interaction_target(&self.root, self.root.frame.layout_point(x, y))
+        self.interaction_targets_at_precise(x, y).into_iter().next()
+    }
+
+    /// The nodes with interaction handlers that the pointer at a global
+    /// logical point is on, innermost first. Outside popups that is the
+    /// innermost one only; inside an interactive popup it is every node of
+    /// the chain down to it, the popup's ancestors included (see
+    /// `ssd::popup`).
+    pub fn interaction_targets_at_precise(&self, x: f64, y: f64) -> Vec<DecorationInteractionTarget> {
+        let point = self.root.frame.layout_point(x, y);
+        match popup::popup_hit(&self.root, point) {
+            Some(hit) => popup::hover_chain(&hit, point),
+            None => find_interaction_target(&self.root, point).into_iter().collect(),
+        }
+    }
+
+    /// Every `<Popup>` whose anchor is shown, for the compositor's input
+    /// handling.
+    pub fn popups(&self) -> Vec<popup::PopupInfo> {
+        popup::popups(&self.root)
     }
 }
 
@@ -350,7 +383,11 @@ impl ComputedDecorationNode {
             let mut child_max_x = ResolvedLayoutValue::from_raw(i32::MIN);
             let mut child_max_y = ResolvedLayoutValue::from_raw(i32::MIN);
 
-            for child in &self.children {
+            for child in self
+                .children
+                .iter()
+                .filter(|child| !matches!(child.kind, DecorationNodeKind::Popup(_)))
+            {
                 let child_bounds = child.resolved_bounds_rect();
                 child_min_x = child_min_x.min(child_bounds.x);
                 child_min_y = child_min_y.min(child_bounds.y);
@@ -392,11 +429,10 @@ impl ComputedDecorationNode {
         let mut child_max_x = ResolvedLayoutValue::from_raw(i32::MIN);
         let mut child_max_y = ResolvedLayoutValue::from_raw(i32::MIN);
 
-        for child in self
-            .children
-            .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
-        {
+        for child in self.children.iter().filter(|child| {
+            !child.style.is_absolute_positioned()
+                && !matches!(child.kind, DecorationNodeKind::Popup(_))
+        }) {
             has_flow_child = true;
             let child_bounds = child.resolved_layout_bounds_rect();
             let (layout_min_x, layout_min_y, layout_max_x, layout_max_y) =
@@ -474,6 +510,7 @@ impl ComputedDecorationNode {
             DecorationNodeKind::Box(layout) => Some(layout.direction),
             DecorationNodeKind::ShaderEffect(effect) => Some(effect.direction),
             DecorationNodeKind::Button(_) => Some(LayoutDirection::Column),
+            DecorationNodeKind::Popup(_) => Some(LayoutDirection::Column),
             _ => None,
         }
     }
@@ -551,12 +588,16 @@ pub enum DecorationHitTestResult {
     Resize(ResizeEdges),
     Action(WindowAction),
     ClientArea,
+    /// On an interactive `<Popup>`, away from its buttons: nothing happens.
+    Popup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DecorationInteractionHandlers {
     pub hover_change: Option<DecorationStateChangeHandler>,
     pub active_change: Option<DecorationStateChangeHandler>,
+    /// `<Popup>` nodes only.
+    pub popup: Option<Box<popup::PopupHandlers>>,
 }
 
 impl DecorationInteractionHandlers {
@@ -687,6 +728,26 @@ impl DecorationNode {
         self.children.push(child);
     }
 
+    /// Absolutely positioned nodes and popups take no space in their parent.
+    fn is_out_of_flow(&self) -> bool {
+        self.style.is_absolute_positioned() || matches!(self.kind, DecorationNodeKind::Popup(_))
+    }
+
+    /// The style the computed node carries: a hint popup takes no pointer
+    /// input, and a closed popup is hidden.
+    fn computed_style(&self) -> DecorationStyle {
+        let mut style = self.style.clone();
+        if let DecorationNodeKind::Popup(popup) = &self.kind {
+            if !popup.mode.is_interactive() {
+                style.pointer_events = Some(PointerEvents::None);
+            }
+            if !popup.open {
+                style.visible = Some(false);
+            }
+        }
+        style
+    }
+
     pub fn layout_equivalent(&self, other: &Self) -> bool {
         self.stable_id == other.stable_id
             && kind_layout_equivalent(&self.kind, &other.kind)
@@ -712,6 +773,9 @@ pub enum DecorationNodeKind {
     WindowBorder,
     /// Reserved anchor where the client surface is placed.
     WindowSlot,
+    /// Children laid out as a column next to the parent and drawn outside the
+    /// window (see `ssd::popup`).
+    Popup(PopupNode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1841,6 +1905,7 @@ fn layout_node_resolved(
             node,
             content_rect,
             layout.direction,
+            resolved_rect,
             effective_clip,
             window_slot_size,
             frame,
@@ -1850,6 +1915,7 @@ fn layout_node_resolved(
             node,
             content_rect,
             effect.direction,
+            resolved_rect,
             effective_clip,
             window_slot_size,
             frame,
@@ -1863,6 +1929,17 @@ fn layout_node_resolved(
             node,
             content_rect,
             LayoutDirection::Column,
+            resolved_rect,
+            effective_clip,
+            window_slot_size,
+            frame,
+            child_containing_block,
+        )?,
+        DecorationNodeKind::Popup(_) => layout_box_children(
+            node,
+            content_rect,
+            LayoutDirection::Column,
+            resolved_rect,
             effective_clip,
             window_slot_size,
             frame,
@@ -1873,6 +1950,9 @@ fn layout_node_resolved(
             .children
             .iter()
             .map(|child| {
+                if let DecorationNodeKind::Popup(popup) = &child.kind {
+                    return layout_popup(child, popup, resolved_rect, window_slot_size, frame);
+                }
                 let child_rect = if child.style.is_absolute_positioned() {
                     absolute_child_rect_resolved(
                         child,
@@ -1900,7 +1980,7 @@ fn layout_node_resolved(
         interaction: node.interaction.clone(),
         window_border_interaction: node.window_border_interaction,
         kind: node.kind.clone(),
-        style: node.style.clone(),
+        style: node.computed_style(),
         rect: frame.logical_rect(resolved_rect),
         resolved_rect,
         resolved_content_rect: content_rect,
@@ -1928,7 +2008,7 @@ pub(super) fn reapply_tree_preserving_layout(
     computed.interaction = node.interaction.clone();
     computed.window_border_interaction = node.window_border_interaction;
     computed.kind = node.kind.clone();
-    computed.style = node.style.clone();
+    computed.style = node.computed_style();
     let content_rect = computed
         .resolved_rect
         .inset(node.style.resolved_content_inset(scale));
@@ -1942,11 +2022,12 @@ pub(super) fn reapply_tree_preserving_layout(
     computed.resolved_effective_clip = effective_clip;
 
     for (computed_child, node_child) in computed.children.iter_mut().zip(node.children.iter()) {
-        reapply_tree_preserving_layout(
-            computed_child,
-            node_child,
-            computed.resolved_effective_clip,
-        );
+        let inherited_clip = if matches!(node_child.kind, DecorationNodeKind::Popup(_)) {
+            None
+        } else {
+            computed.resolved_effective_clip
+        };
+        reapply_tree_preserving_layout(computed_child, node_child, inherited_clip);
     }
 }
 
@@ -1954,6 +2035,7 @@ fn layout_box_children(
     node: &DecorationNode,
     content_rect: ResolvedLogicalRect,
     direction: LayoutDirection,
+    anchor: ResolvedLogicalRect,
     effective_clip: Option<ResolvedDecorationClip>,
     window_slot_size: Option<(i32, i32)>,
     frame: LayoutFrame,
@@ -1968,7 +2050,7 @@ fn layout_box_children(
         .children
         .iter()
         .enumerate()
-        .filter(|(_, child)| !child.style.is_absolute_positioned())
+        .filter(|(_, child)| !child.is_out_of_flow())
         .collect::<Vec<_>>();
     let gap = node.style.resolved_gap(scale);
     let main_available = direction.main_len_resolved(content_rect);
@@ -2179,6 +2261,7 @@ fn layout_box_children(
                 DecorationNodeKind::ShaderEffect(_) => "shader-effect",
                 DecorationNodeKind::WindowBorder => "window-border",
                 DecorationNodeKind::WindowSlot => "window-slot",
+                DecorationNodeKind::Popup(_) => "popup",
             };
             tracing::info!(
                 parent_stable_id,
@@ -2217,7 +2300,9 @@ fn layout_box_children(
     }
 
     for (index, child) in node.children.iter().enumerate() {
-        if child.style.is_absolute_positioned() {
+        if let DecorationNodeKind::Popup(popup) = &child.kind {
+            children[index] = Some(layout_popup(child, popup, anchor, window_slot_size, frame)?);
+        } else if child.style.is_absolute_positioned() {
             let child_rect =
                 absolute_child_rect_resolved(child, containing_block, window_slot_size, scale);
             children[index] = Some(layout_node_resolved(
@@ -2302,6 +2387,45 @@ fn absolute_child_rect_resolved(
         width,
         height,
     }
+}
+
+/// Lays out a `<Popup>` next to `anchor` (its parent's border box), sized by
+/// its content and free of its ancestors' clips.
+fn layout_popup(
+    node: &DecorationNode,
+    popup: &PopupNode,
+    anchor: ResolvedLogicalRect,
+    window_slot_size: Option<(i32, i32)>,
+    frame: LayoutFrame,
+) -> Result<ComputedDecorationNode, DecorationLayoutError> {
+    let scale = frame.scale;
+    let snap = |value: f64| ResolvedLayoutValue::from_logical(value, scale);
+    let auto_size = node.auto_size_resolved(window_slot_size, scale);
+    let clamp = |value: ResolvedLayoutValue, min: Option<f64>, max: Option<f64>| {
+        let value = max.map(snap).map_or(value, |max| value.min(max));
+        min.map(snap).map_or(value, |min| value.max(min))
+    };
+    let style = &node.style;
+    let width = clamp(
+        style
+            .width
+            .map(snap)
+            .or(auto_size.map(|(width, _)| width))
+            .unwrap_or(ResolvedLayoutValue::ZERO),
+        style.min_width,
+        style.max_width,
+    );
+    let height = clamp(
+        style
+            .height
+            .map(snap)
+            .or(auto_size.map(|(_, height)| height))
+            .unwrap_or(ResolvedLayoutValue::ZERO),
+        style.min_height,
+        style.max_height,
+    );
+    let rect = popup::popup_rect(popup, anchor, (width, height), frame);
+    layout_node_resolved(node, rect, None, window_slot_size, frame, rect)
 }
 
 fn apply_node_transform(node: &mut ComputedDecorationNode) {
@@ -2517,6 +2641,11 @@ impl DecorationNode {
             DecorationNodeKind::WindowBorder => {
                 Some(self.overlay_content_size_resolved(window_slot_size, scale))
             }
+            DecorationNodeKind::Popup(_) => Some(self.stack_content_size_resolved(
+                LayoutDirection::Column,
+                window_slot_size,
+                scale,
+            )),
             _ => None,
         }
     }
@@ -2535,7 +2664,7 @@ impl DecorationNode {
         let flow_children = self
             .children
             .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
+            .filter(|child| !child.is_out_of_flow())
             .collect::<Vec<_>>();
         if flow_children.is_empty() {
             return (inset.left + inset.right, inset.top + inset.bottom);
@@ -2591,7 +2720,7 @@ impl DecorationNode {
         for child in self
             .children
             .iter()
-            .filter(|child| !child.style.is_absolute_positioned())
+            .filter(|child| !child.is_out_of_flow())
         {
             let margin = child.style.resolved_margin(scale);
             width = width.max(
@@ -2748,6 +2877,10 @@ fn kind_layout_equivalent(left: &DecorationNodeKind, right: &DecorationNodeKind)
         }
         (DecorationNodeKind::WindowBorder, DecorationNodeKind::WindowBorder) => true,
         (DecorationNodeKind::WindowSlot, DecorationNodeKind::WindowSlot) => true,
+        // `open` only toggles visibility: a closed popup is laid out too.
+        (DecorationNodeKind::Popup(left), DecorationNodeKind::Popup(right)) => {
+            PopupNode { open: true, ..*left } == PopupNode { open: true, ..*right }
+        }
         _ => false,
     }
 }
@@ -3033,7 +3166,10 @@ fn find_button_action(node: &ComputedDecorationNode, point: LayoutPoint) -> Opti
         return None;
     }
 
-    for child in paint_ordered_children(node) {
+    for child in paint_ordered_children(node)
+        .into_iter()
+        .filter(|child| !matches!(child.kind, DecorationNodeKind::Popup(_)))
+    {
         if let Some(action) = find_button_action(child, point) {
             return Some(action);
         }
@@ -3061,7 +3197,10 @@ fn find_interaction_target(
         return None;
     }
 
-    for child in paint_ordered_children(node) {
+    for child in paint_ordered_children(node)
+        .into_iter()
+        .filter(|child| !matches!(child.kind, DecorationNodeKind::Popup(_)))
+    {
         if let Some(target) = find_interaction_target(child, point) {
             return Some(target);
         }
@@ -5115,5 +5254,317 @@ mod tests {
         };
         assert!(!popup_mask.supports_framebuffer_backdrop());
         assert!(popup_mask.supports_popup_framebuffer_backdrop());
+    }
+
+    /// A bordered window whose title bar ends with a 20px button carrying a
+    /// 60x16 tooltip popup.
+    fn popup_tree(popup: PopupNode, with_popup: bool) -> DecorationTree {
+        let mut button = DecorationNode::new(DecorationNodeKind::Button(ButtonNode {
+            action: WindowAction::Maximize,
+        }))
+        .with_style(DecorationStyle {
+            width: Some(20.0),
+            height: Some(20.0),
+            ..Default::default()
+        });
+        button.stable_id = Some("button".into());
+        if with_popup {
+            let mut tooltip = DecorationNode::new(DecorationNodeKind::Popup(popup)).with_children(
+                vec![DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
+                    DecorationStyle {
+                        width: Some(60.0),
+                        height: Some(16.0),
+                        background: Some(Color::rgba(0, 0, 0, 255)),
+                        ..Default::default()
+                    },
+                )],
+            );
+            tooltip.stable_id = Some("tooltip".into());
+            tooltip.children[0].stable_id = Some("tooltip-body".into());
+            button.push_child(tooltip);
+        }
+        let titlebar = DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+            direction: LayoutDirection::Row,
+        }))
+        .with_style(DecorationStyle {
+            height: Some(20.0),
+            ..Default::default()
+        })
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
+                DecorationStyle {
+                    flex_grow: Some(1.0),
+                    ..Default::default()
+                },
+            ),
+            button,
+        ]);
+        DecorationTree::new(
+            DecorationNode::new(DecorationNodeKind::WindowBorder)
+                .with_style(DecorationStyle {
+                    border: Some(BorderStyle {
+                        width: 2.0,
+                        color: Color::rgba(255, 255, 255, 255),
+                    }),
+                    border_radius: Some(8.0),
+                    ..Default::default()
+                })
+                .with_children(vec![
+                    DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_children(
+                        vec![titlebar, DecorationNode::new(DecorationNodeKind::WindowSlot)],
+                    ),
+                ]),
+        )
+    }
+
+    fn find_by_id<'a>(
+        node: &'a ComputedDecorationNode,
+        id: &str,
+    ) -> Option<&'a ComputedDecorationNode> {
+        if node.stable_id.as_deref() == Some(id) {
+            return Some(node);
+        }
+        node.children.iter().find_map(|child| find_by_id(child, id))
+    }
+
+    #[test]
+    fn popup_sits_below_its_anchor_outside_the_flow_and_the_clips() {
+        set_popup_viewports(Vec::new());
+        let popup = PopupNode {
+            offset: 4.0,
+            ..PopupNode::default()
+        };
+        let window = LogicalRect::new(100, 100, 300, 200);
+        let layout = popup_tree(popup, true).layout(window).expect("layout");
+        let without = popup_tree(popup, false).layout(window).expect("layout");
+
+        let button = find_by_id(&layout.root, "button").unwrap();
+        assert_eq!(button.rect, find_by_id(&without.root, "button").unwrap().rect);
+        let tooltip = find_by_id(&layout.root, "tooltip").unwrap();
+        assert_eq!(
+            tooltip.rect,
+            LogicalRect::new(button.rect.x - 20, button.rect.y + 20 + 4, 60, 16)
+        );
+        // It reaches past the window's right edge, unclipped by the border.
+        assert!(tooltip.rect.x + tooltip.rect.width > window.x + window.width);
+        assert!(tooltip.effective_clip.is_none());
+        assert!(tooltip.children[0].effective_clip.is_none());
+        // The window keeps its size and its input.
+        assert_eq!(layout.bounds_rect(), without.bounds_rect());
+        let inside_tooltip = LogicalPoint::new(tooltip.rect.x + 10, tooltip.rect.y + 8);
+        assert_eq!(layout.hit_test(inside_tooltip), without.hit_test(inside_tooltip));
+        assert_eq!(
+            layout.hit_test(LogicalPoint::new(button.rect.x + 10, button.rect.y + 10)),
+            DecorationHitTestResult::Action(WindowAction::Maximize)
+        );
+
+        // Its paint goes to the popup pass, unclipped; the rest stays in the
+        // window's pass.
+        let scopes = PopupScopes::of(&layout.root);
+        let buffers = paint_buffers_for_layout(&layout);
+        let (popup_buffers, window_buffers): (Vec<_>, Vec<_>) = buffers
+            .iter()
+            .partition(|buffer| scopes.layer_of(&buffer.stable_key) == Some(PopupLayer::Top));
+        assert_eq!(popup_buffers.len(), 1);
+        assert_eq!(popup_buffers[0].owner_node_id.as_deref(), Some("tooltip-body"));
+        assert!(popup_buffers[0].paint.geometry.clip.is_none());
+        assert!(popup_buffers[0].paint.geometry.rounded_clip.is_none());
+        assert!(!window_buffers.is_empty());
+    }
+
+    #[test]
+    fn closed_popup_is_neither_drawn_nor_in_a_scope() {
+        let closed = PopupNode {
+            open: false,
+            ..PopupNode::default()
+        };
+        let layout = popup_tree(closed, true)
+            .layout(LogicalRect::new(0, 0, 300, 200))
+            .expect("layout");
+        let tooltip = find_by_id(&layout.root, "tooltip").unwrap();
+        assert_eq!(tooltip.style.visible, Some(false));
+        assert!(PopupScopes::of(&layout.root).is_empty());
+        assert!(
+            paint_buffers_for_layout(&layout)
+                .iter()
+                .all(|buffer| buffer.owner_node_id.as_deref() != Some("tooltip-body"))
+        );
+        // Opening it does not need a relayout.
+        assert!(
+            popup_tree(closed, true)
+                .root
+                .layout_equivalent(&popup_tree(PopupNode::default(), true).root)
+        );
+    }
+
+    #[test]
+    fn popup_flips_above_when_the_output_ends_below_its_anchor() {
+        // The output ends just below the title bar.
+        set_popup_viewports(vec![LogicalRect::new(0, 0, 1000, 130)]);
+        let popup = PopupNode {
+            offset: 4.0,
+            ..PopupNode::default()
+        };
+        let layout = popup_tree(popup, true)
+            .layout(LogicalRect::new(100, 100, 300, 200))
+            .expect("layout");
+        set_popup_viewports(Vec::new());
+        let button = find_by_id(&layout.root, "button").unwrap();
+        let tooltip = find_by_id(&layout.root, "tooltip").unwrap();
+        assert_eq!(tooltip.rect.y + tooltip.rect.height + 4, button.rect.y);
+    }
+
+    fn hoverable(mut node: DecorationNode, id: &str) -> DecorationNode {
+        node.stable_id = Some(id.into());
+        node.interaction.hover_change = Some(DecorationStateChangeHandler {
+            true_handler: format!("{id}.true"),
+            false_handler: format!("{id}.false"),
+        });
+        node
+    }
+
+    fn sized(kind: DecorationNodeKind, width: f64, height: f64) -> DecorationNode {
+        DecorationNode::new(kind).with_style(DecorationStyle {
+            width: Some(width),
+            height: Some(height),
+            ..Default::default()
+        })
+    }
+
+    /// A title bar button ("anchor") with an `Auto` menu below it; the menu
+    /// holds a button ("item") that has a submenu of its own.
+    fn menu_tree(menu_open: bool) -> DecorationTree {
+        let auto = |open: bool, placement: PopupPlacement, layer: PopupLayer| PopupNode {
+            open,
+            placement,
+            layer,
+            offset: 4.0,
+            mode: PopupMode::Auto,
+            ..PopupNode::default()
+        };
+        let mut submenu = DecorationNode::new(DecorationNodeKind::Popup(auto(
+            true,
+            PopupPlacement::Right,
+            PopupLayer::Window,
+        )))
+        .with_children(vec![sized(DecorationNodeKind::Box(BoxNode::default()), 30.0, 30.0)]);
+        submenu.stable_id = Some("submenu".into());
+        let item = hoverable(
+            sized(
+                DecorationNodeKind::Button(ButtonNode {
+                    action: WindowAction::Minimize,
+                }),
+                20.0,
+                20.0,
+            ),
+            "item",
+        )
+        .with_children(vec![submenu]);
+        let mut menu = DecorationNode::new(DecorationNodeKind::Popup(auto(
+            menu_open,
+            PopupPlacement::Bottom,
+            PopupLayer::Top,
+        )))
+        .with_children(vec![
+            sized(DecorationNodeKind::Box(BoxNode::default()), 80.0, 40.0).with_children(vec![item]),
+        ]);
+        menu.stable_id = Some("menu".into());
+        let anchor = hoverable(
+            sized(
+                DecorationNodeKind::Button(ButtonNode {
+                    action: WindowAction::Maximize,
+                }),
+                20.0,
+                20.0,
+            ),
+            "anchor",
+        )
+        .with_children(vec![menu]);
+        DecorationTree::new(
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(BoxNode {
+                    direction: LayoutDirection::Row,
+                }))
+                .with_style(DecorationStyle {
+                    height: Some(20.0),
+                    ..Default::default()
+                })
+                .with_children(vec![anchor]),
+                DecorationNode::new(DecorationNodeKind::WindowSlot),
+            ]),
+        )
+    }
+
+    fn center(rect: LogicalRect) -> (f64, f64) {
+        (
+            rect.x as f64 + rect.width as f64 / 2.0,
+            rect.y as f64 + rect.height as f64 / 2.0,
+        )
+    }
+
+    #[test]
+    fn interactive_popup_takes_input_and_keeps_its_anchor_hovered() {
+        set_popup_viewports(Vec::new());
+        let layout = menu_tree(true)
+            .layout(LogicalRect::new(100, 100, 300, 200))
+            .expect("layout");
+        let anchor = find_by_id(&layout.root, "anchor").unwrap().rect;
+        let menu = find_by_id(&layout.root, "menu").unwrap().rect;
+        let item = find_by_id(&layout.root, "item").unwrap().rect;
+        let ids = |(x, y): (f64, f64)| {
+            layout
+                .interaction_targets_at_precise(x, y)
+                .into_iter()
+                .map(|target| target.node_id)
+                .collect::<Vec<_>>()
+        };
+
+        // A button inside the menu works; the menu's background swallows the
+        // press instead of moving the window or reaching the client.
+        let (x, y) = center(item);
+        assert_eq!(
+            layout.hit_test_at(x, y),
+            DecorationHitTestResult::Action(WindowAction::Minimize)
+        );
+        let below_item = (menu.x as f64 + 70.0, menu.y as f64 + 35.0);
+        assert_eq!(layout.hit_test_at(below_item.0, below_item.1), DecorationHitTestResult::Popup);
+        // Inside the menu the anchor stays hovered (DOM `:hover`); outside,
+        // only the innermost node is.
+        assert_eq!(ids(center(item)), ["item", "anchor"]);
+        assert_eq!(ids(below_item), ["anchor"]);
+        assert_eq!(ids(center(anchor)), ["anchor"]);
+    }
+
+    #[test]
+    fn popup_info_reports_areas_anchor_interest_and_nesting() {
+        set_popup_viewports(Vec::new());
+        let layout = menu_tree(true)
+            .layout(LogicalRect::new(100, 100, 300, 200))
+            .expect("layout");
+        let anchor = find_by_id(&layout.root, "anchor").unwrap().rect;
+        let submenu = find_by_id(&layout.root, "submenu").unwrap().rect;
+        let popups = layout.popups();
+        assert_eq!(popups.len(), 2);
+        let (menu, nested) = (&popups[0], &popups[1]);
+        assert_eq!(menu.node_id.as_deref(), Some("menu"));
+        assert!(menu.enclosing.is_empty());
+        assert_eq!(nested.enclosing, ["menu"]);
+        // A nested popup is drawn (and hit) in its outer popup's layer.
+        assert_eq!(nested.popup.layer, PopupLayer::Top);
+
+        let (x, y) = center(submenu);
+        assert!(menu.contains(x, y), "the menu covers its open submenu");
+        assert!(!menu.anchor_contains(x, y));
+        let (x, y) = center(anchor);
+        assert!(menu.anchor_contains(x, y) && menu.has_interest(x, y));
+
+        // Closed: no area of its own, interest only on the anchor.
+        let layout = menu_tree(false)
+            .layout(LogicalRect::new(100, 100, 300, 200))
+            .expect("layout");
+        let popups = layout.popups();
+        assert_eq!(popups.len(), 1, "a closed popup hides what it nests");
+        assert!(!popups[0].is_open_and_interactive());
+        assert!(popups[0].has_interest(x, y));
     }
 }

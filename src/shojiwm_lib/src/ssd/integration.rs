@@ -883,6 +883,31 @@ impl WindowDecorationState {
         self.layout.hit_test_at(point.x, point.y)
     }
 
+    /// The open `<Popup>`s, which the backends draw in their own pass.
+    pub fn popup_scopes(&self) -> super::PopupScopes {
+        super::PopupScopes::of(&self.layout.root)
+    }
+
+    /// Whether the tree has a `<Popup>`, open or not.
+    pub fn has_popup(&self) -> bool {
+        fn any(node: &super::ComputedDecorationNode) -> bool {
+            matches!(node.kind, super::DecorationNodeKind::Popup(_)) || node.children.iter().any(any)
+        }
+        any(&self.layout.root)
+    }
+
+    /// Whether an open `Auto` / `Manual` popup takes pointer input.
+    pub fn has_open_interactive_popup(&self) -> bool {
+        fn any(node: &super::ComputedDecorationNode) -> bool {
+            if node.style.visible == Some(false) {
+                return false;
+            }
+            matches!(&node.kind, super::DecorationNodeKind::Popup(popup) if popup.mode.is_interactive())
+                || node.children.iter().any(any)
+        }
+        any(&self.layout.root)
+    }
+
     pub fn managed_window_allows_render(&self) -> bool {
         !self.managed_window.managed
             || (self.managed_window.visible
@@ -2647,6 +2672,20 @@ impl ShojiWM {
             timescope::scope!("ssd sync runtime display state");
             self.sync_runtime_display_state();
         }
+        super::set_popup_viewports(
+            self.space
+                .outputs()
+                .filter_map(|output| self.space.output_geometry(output))
+                .map(|geometry| {
+                    LogicalRect::new(
+                        geometry.loc.x,
+                        geometry.loc.y,
+                        geometry.size.w,
+                        geometry.size.h,
+                    )
+                })
+                .collect(),
+        );
         let windows: Vec<Window> = {
             timescope::scope!("ssd collect windows");
             self.space.elements().cloned().collect()
@@ -3782,6 +3821,7 @@ impl ShojiWM {
                                             &previous_shader_buffers,
                                             rebuilt_shader_buffers,
                                             &dirty_node_ids,
+                                            &order_map,
                                         )
                                     };
                                     {
@@ -3797,6 +3837,7 @@ impl ShojiWM {
                                             &previous_buffers,
                                             rebuilt_buffers,
                                             &dirty_node_ids,
+                                            &order_map,
                                         )
                                     };
                                     cached.shader_buffers = merged_shader_buffers;
@@ -3813,6 +3854,7 @@ impl ShojiWM {
                                                 &previous_text_buffers,
                                             ),
                                             &dirty_node_ids,
+                                            &order_map,
                                         )
                                     };
                                     cached.icon_buffers = {
@@ -3828,6 +3870,7 @@ impl ShojiWM {
                                                 &mut self.icon_rasterizer,
                                             ),
                                             &dirty_node_ids,
+                                            &order_map,
                                         )
                                     };
                                 }
@@ -4333,6 +4376,7 @@ impl ShojiWM {
                                     &previous_shader_buffers,
                                     rebuilt_shader_buffers,
                                     &dirty_node_ids,
+                                    &order_map,
                                 );
                                 freeze_manual_shader_buffers(
                                     &previous_shader_buffers,
@@ -4342,6 +4386,7 @@ impl ShojiWM {
                                     &previous_buffers,
                                     rebuilt_buffers,
                                     &dirty_node_ids,
+                                    &order_map,
                                 );
                                 closing.decoration.shader_buffers = merged_shader_buffers;
                                 closing.decoration.text_buffers = merge_text_buffers(
@@ -4355,6 +4400,7 @@ impl ShojiWM {
                                         &previous_text_buffers,
                                     ),
                                     &dirty_node_ids,
+                                    &order_map,
                                 );
                                 closing.decoration.icon_buffers = merge_icon_buffers(
                                     &previous_icon_buffers,
@@ -4367,6 +4413,7 @@ impl ShojiWM {
                                         &mut self.icon_rasterizer,
                                     ),
                                     &dirty_node_ids,
+                                    &order_map,
                                 );
                             }
                         } else {
@@ -4730,6 +4777,7 @@ impl ShojiWM {
         self.runtime_poll_dirty = !self.runtime_dirty_window_ids.is_empty();
         self.async_asset_dirty = false;
         self.sync_wlr_foreign_toplevel_states();
+        self.sync_popup_dismissals();
 
         Ok(())
     }
@@ -4738,6 +4786,12 @@ impl ShojiWM {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(Window, DecorationHitTestResult)> {
+        // Popups are hit only while their window is untransformed, so the
+        // point needs no inverse transform.
+        if let Some(window) = self.ssd_popup_window_under(point) {
+            let hit = self.window_decorations.get(&window)?.hit_test(point);
+            return Some((window, hit));
+        }
         let output_name = self.output_name_at_point(point);
         self.windows_top_to_bottom().into_iter().find_map(|window| {
             let decoration = self.window_decorations.get(window)?;
@@ -4765,6 +4819,21 @@ impl ShojiWM {
         &self,
         point: Point<f64, Logical>,
     ) -> Option<(Window, super::DecorationInteractionTarget)> {
+        let (window, targets) = self.decoration_interaction_targets_under(point)?;
+        targets.into_iter().next().map(|target| (window, target))
+    }
+
+    /// Like `decoration_interaction_target_under`, with the whole hover chain
+    /// when the pointer is inside an interactive `<Popup>` (innermost first).
+    pub fn decoration_interaction_targets_under(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<(Window, Vec<super::DecorationInteractionTarget>)> {
+        if let Some(window) = self.ssd_popup_window_under(point) {
+            let decoration = self.window_decorations.get(&window)?;
+            let targets = decoration.layout.interaction_targets_at_precise(point.x, point.y);
+            return Some((window, targets));
+        }
         let output_name = self.output_name_at_point(point);
         self.windows_top_to_bottom().into_iter().find_map(|window| {
             let decoration = self.window_decorations.get(window)?;
@@ -4783,10 +4852,10 @@ impl ShojiWM {
                     decoration.layout.root.rect,
                     decoration.visual_transform,
                 );
-                decoration
+                let targets = decoration
                     .layout
-                    .interaction_target_at_precise(local_point.x, local_point.y)
-                    .map(|target| (window.clone(), target))
+                    .interaction_targets_at_precise(local_point.x, local_point.y);
+                (!targets.is_empty()).then(|| (window.clone(), targets))
             })?
         })
     }
@@ -6439,6 +6508,7 @@ fn build_cached_buffers_and_shaders(
         &layout.root,
         "root".to_string(),
         super::paint::PaintClipState::default(),
+        false,
         order_map,
         dirty_node_ids,
         node_geometry,
@@ -6815,6 +6885,7 @@ fn merge_cached_buffers(
     previous: &[CachedDecorationBuffer],
     rebuilt: Vec<CachedDecorationBuffer>,
     dirty_node_ids: &[String],
+    order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedDecorationBuffer> {
     let dirty_node_ids = dirty_node_ids
         .iter()
@@ -6827,7 +6898,15 @@ fn merge_cached_buffers(
                 .as_deref()
                 .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
-        .cloned()
+        // The kept items get the current paint order: a node shown or hidden
+        // elsewhere (an opening popup) renumbers the ones after it.
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(order) = order_map.get(&item.stable_key) {
+                item.order = *order;
+            }
+            item
+        })
         .collect::<Vec<_>>();
     merged.extend(rebuilt);
     merged.sort_by_key(|item| item.order);
@@ -6838,6 +6917,7 @@ fn merge_shader_buffers(
     previous: &[CachedShaderEffect],
     rebuilt: Vec<CachedShaderEffect>,
     dirty_node_ids: &[String],
+    order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedShaderEffect> {
     let dirty_node_ids = dirty_node_ids
         .iter()
@@ -6850,7 +6930,15 @@ fn merge_shader_buffers(
                 .as_deref()
                 .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
-        .cloned()
+        // The kept items get the current paint order: a node shown or hidden
+        // elsewhere (an opening popup) renumbers the ones after it.
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(order) = order_map.get(&item.stable_key) {
+                item.order = *order;
+            }
+            item
+        })
         .collect::<Vec<_>>();
     merged.extend(rebuilt);
     merged.sort_by_key(|item| item.order);
@@ -6861,6 +6949,7 @@ fn merge_text_buffers(
     previous: &[CachedDecorationLabel],
     rebuilt: Vec<CachedDecorationLabel>,
     dirty_node_ids: &[String],
+    order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedDecorationLabel> {
     let dirty_node_ids = dirty_node_ids
         .iter()
@@ -6873,7 +6962,15 @@ fn merge_text_buffers(
                 .as_deref()
                 .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
-        .cloned()
+        // The kept items get the current paint order: a node shown or hidden
+        // elsewhere (an opening popup) renumbers the ones after it.
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(order) = order_map.get(&item.stable_key) {
+                item.order = *order;
+            }
+            item
+        })
         .collect::<Vec<_>>();
     merged.extend(rebuilt);
     merged.sort_by_key(|item| item.order);
@@ -6884,6 +6981,7 @@ fn merge_icon_buffers(
     previous: &[CachedDecorationIcon],
     rebuilt: Vec<CachedDecorationIcon>,
     dirty_node_ids: &[String],
+    order_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<CachedDecorationIcon> {
     let dirty_node_ids = dirty_node_ids
         .iter()
@@ -6896,17 +6994,27 @@ fn merge_icon_buffers(
                 .as_deref()
                 .is_none_or(|node_id| !node_id_matches_dirty_scope(node_id, &dirty_node_ids))
         })
-        .cloned()
+        // The kept items get the current paint order: a node shown or hidden
+        // elsewhere (an opening popup) renumbers the ones after it.
+        .map(|item| {
+            let mut item = item.clone();
+            if let Some(order) = order_map.get(&item.stable_key) {
+                item.order = *order;
+            }
+            item
+        })
         .collect::<Vec<_>>();
     merged.extend(rebuilt);
     merged.sort_by_key(|item| item.order);
     merged
 }
 
+/// Node ids are paths: the TypeScript runtime joins segments with `.`
+/// (`root.Box#title`), the Rust SDK with `/` (`w1/0/2`).
 fn is_descendant_node_id(node_id: &str, ancestor_id: &str) -> bool {
     node_id.len() > ancestor_id.len()
         && node_id.starts_with(ancestor_id)
-        && node_id.as_bytes().get(ancestor_id.len()) == Some(&b'.')
+        && matches!(node_id.as_bytes()[ancestor_id.len()], b'.' | b'/')
 }
 
 fn node_id_matches_dirty_scope(
@@ -7009,6 +7117,7 @@ fn collect_cached_buffers(
     node: &super::ComputedDecorationNode,
     path: String,
     clips: super::paint::PaintClipState,
+    in_popup: bool,
     order_map: &std::collections::HashMap<String, usize>,
     dirty_node_ids: Option<&std::collections::HashSet<&str>>,
     node_geometry: &impl NodeGeometryLookup,
@@ -7021,6 +7130,17 @@ fn collect_cached_buffers(
     if matches!(node.kind, super::DecorationNodeKind::WindowSlot) {
         return;
     }
+    // A popup is drawn outside the window: its ancestors' clips do not apply,
+    // and its pass has no effect pipeline (backdrops would sample the window
+    // stream it is not part of), so `<ShaderEffect>`s inside it draw only
+    // their paint and children.
+    let is_popup = matches!(node.kind, super::DecorationNodeKind::Popup(_));
+    let clips = if is_popup {
+        super::paint::PaintClipState::default()
+    } else {
+        clips
+    };
+    let in_popup = in_popup || is_popup;
 
     let include_node = dirty_node_ids.is_none_or(|dirty_node_ids| {
         node.stable_id
@@ -7049,7 +7169,9 @@ fn collect_cached_buffers(
             });
         }
 
-        if let super::DecorationNodeKind::ShaderEffect(effect) = &node.kind {
+        if let super::DecorationNodeKind::ShaderEffect(effect) = &node.kind
+            && !in_popup
+        {
             // Effects keep their established clip rule: the inherited clip
             // when it is rounded, otherwise the nearest rounded ancestor.
             let effect_clip = clips
@@ -7105,6 +7227,7 @@ fn collect_cached_buffers(
             child,
             format!("{path}/child-{index}"),
             child_clips,
+            in_popup,
             order_map,
             dirty_node_ids,
             node_geometry,
@@ -7477,6 +7600,7 @@ fn node_kind_name(kind: &super::DecorationNodeKind) -> &'static str {
         super::DecorationNodeKind::ShaderEffect(_) => "shader-effect",
         super::DecorationNodeKind::WindowBorder => "window-border",
         super::DecorationNodeKind::WindowSlot => "window-slot",
+        super::DecorationNodeKind::Popup(_) => "popup",
     }
 }
 
@@ -8419,6 +8543,79 @@ mod tests {
             final_override_rect_animation_target(&static_managed_window, &channels),
             None
         );
+    }
+
+    /// Opening a popup renumbers the paint order of the nodes after it; the
+    /// buffers a partial rebuild keeps must follow, or a kept label ends up
+    /// behind a rebuilt background.
+    #[test]
+    fn partial_rebuild_renumbers_the_buffers_it_keeps() {
+        let tree = |open: bool| {
+            let mut background = DecorationNode::new(DecorationNodeKind::Box(
+                super::super::BoxNode::default(),
+            ))
+            .with_style(DecorationStyle {
+                height: Some(20.0),
+                background: Some(super::super::Color::rgba(0, 0, 0, 255)),
+                ..Default::default()
+            });
+            background.stable_id = Some("root.background".into());
+            let mut popup = DecorationNode::new(DecorationNodeKind::Popup(super::super::PopupNode {
+                open,
+                ..Default::default()
+            }))
+            .with_children(vec![
+                DecorationNode::new(DecorationNodeKind::Box(super::super::BoxNode::default()))
+                    .with_style(DecorationStyle {
+                        width: Some(10.0),
+                        height: Some(10.0),
+                        background: Some(super::super::Color::rgba(255, 0, 0, 255)),
+                        ..Default::default()
+                    }),
+            ]);
+            popup.stable_id = Some("root.popup".into());
+            let mut root = DecorationNode::new(DecorationNodeKind::Box(super::super::BoxNode::default()))
+                .with_children(vec![
+                    background,
+                    DecorationNode::new(DecorationNodeKind::WindowSlot),
+                    // Last child: painted first (front), so it shifts the rest.
+                    popup,
+                ]);
+            root.stable_id = Some("root".into());
+            DecorationTree::new(root)
+                .layout_for_client(LogicalRect::new(0, 0, 100, 100))
+                .expect("layout")
+        };
+
+        let closed = tree(false);
+        let closed_orders = build_render_order_map(&closed);
+        let previous = build_cached_buffers(&closed, &closed_orders);
+        let open = tree(true);
+        let open_orders = build_render_order_map(&open);
+        let dirty = vec!["root.popup".to_owned()];
+        let (rebuilt, _) = rebuild_partial_buffers(&open, &open_orders, &dirty);
+        let merged = merge_cached_buffers(&previous, rebuilt, &dirty, &open_orders);
+
+        let background = merged
+            .iter()
+            .find(|buffer| buffer.owner_node_id.as_deref() == Some("root.background"))
+            .expect("kept background buffer");
+        assert_eq!(Some(&background.order), open_orders.get(&background.stable_key));
+        assert_ne!(
+            closed_orders.get(&background.stable_key),
+            open_orders.get(&background.stable_key),
+            "the popup renumbers the background"
+        );
+    }
+
+    #[test]
+    fn dirty_scope_covers_descendants_in_both_id_styles() {
+        let dirty = std::collections::HashSet::from(["root.Box#bar", "w1/0/2"]);
+        assert!(node_id_matches_dirty_scope("root.Box#bar.Label", &dirty));
+        assert!(node_id_matches_dirty_scope("w1/0/2/0", &dirty));
+        assert!(node_id_matches_dirty_scope("w1/0/2", &dirty));
+        assert!(!node_id_matches_dirty_scope("w1/0/21", &dirty));
+        assert!(!node_id_matches_dirty_scope("root.Box#barista", &dirty));
     }
 
     #[test]

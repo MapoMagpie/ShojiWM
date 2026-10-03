@@ -10,6 +10,8 @@
 //! | `<ShaderEffect shader=…>` | [`ShaderEffect::new`]           |
 //! | `<WindowBorder>`    | [`WindowBorder::new`]                 |
 //! | `<ClientWindow />`  | [`ClientWindow::new`]                 |
+//! | `<Popup open=…>`    | [`Popup::new`]`.open(…)`              |
+//! | `<Popup trigger=…>` | [`Popup::new`]`.trigger(…)`           |
 //! | `<ManagedWindow …>` | [`ManagedWindow::new`]                |
 //! | `{cond && <X/>}`    | [`Element::child_dyn`]                |
 //!
@@ -30,7 +32,9 @@ use shojiwm_lib::{
     ssd::{
         BoxNode, ButtonNode, DecorationInteractionHandlers, DecorationNode, DecorationNodeKind,
         DecorationStateChangeHandler, DecorationStyle, ImageFit, ImageNode, LabelNode,
-        LayoutDirection, ManagedWindowRectSnapshot, ManagedWindowState, ShaderEffectNode,
+        LayoutDirection, ManagedWindowRectSnapshot, ManagedWindowState, PopupAlign,
+        PopupCollision, PopupDismissHandlers, PopupDismissReason, PopupHandlers, PopupLayer,
+        PopupMode, PopupNode, PopupPlacement, ShaderEffectNode,
         ShaderUniformValue, TransformOrigin, WindowAction, WindowBorderInteraction,
         WindowResizeHitArea, WindowTransform,
     },
@@ -140,6 +144,11 @@ enum ElementKind {
     },
     WindowBorder { interaction: WindowBorderInteraction },
     WindowSlot,
+    Popup {
+        open: Prop<bool>,
+        popup: PopupNode,
+        callbacks: Box<PopupCallbacks>,
+    },
 }
 
 /// A child of an element: fixed, or recomputed when what it reads changes.
@@ -235,6 +244,131 @@ impl Element {
             *fit = value;
         }
         self
+    }
+
+    /// Whether a [`Popup`] is shown.
+    pub fn open(mut self, value: impl Into<Prop<bool>>) -> Self {
+        match &mut self.kind {
+            ElementKind::Popup { open, .. } => *open = value.into(),
+            _ => tracing::warn!("open() only applies to Popup"),
+        }
+        self
+    }
+
+    fn popup_option(mut self, name: &str, set: impl FnOnce(&mut PopupNode)) -> Self {
+        match &mut self.kind {
+            ElementKind::Popup { popup, .. } => set(popup),
+            _ => tracing::warn!("{name}() only applies to Popup"),
+        }
+        self
+    }
+
+    /// The side of the parent a [`Popup`] goes to (default bottom).
+    pub fn placement(self, value: PopupPlacement) -> Self {
+        self.popup_option("placement", |popup| popup.placement = value)
+    }
+
+    /// Alignment of a [`Popup`] along that side (default center).
+    pub fn align(self, value: PopupAlign) -> Self {
+        self.popup_option("align", |popup| popup.align = value)
+    }
+
+    /// Distance of a [`Popup`] from its parent, in logical pixels.
+    pub fn offset(self, value: f64) -> Self {
+        self.popup_option("offset", |popup| popup.offset = value)
+    }
+
+    /// What a [`Popup`] does when it would leave the output (default flip).
+    pub fn collision(self, value: PopupCollision) -> Self {
+        self.popup_option("collision", |popup| popup.collision = value)
+    }
+
+    /// Stacking layer of a [`Popup`] (default above every window).
+    pub fn layer(self, value: PopupLayer) -> Self {
+        self.popup_option("layer", |popup| popup.layer = value)
+    }
+
+    /// How a [`Popup`] takes part in input (default [`PopupMode::Hint`]).
+    pub fn mode(self, value: PopupMode) -> Self {
+        self.popup_option("mode", |popup| popup.mode = value)
+    }
+
+    /// Whether Escape closes an `Auto` [`Popup`] (default `true`).
+    pub fn close_on_escape(self, value: bool) -> Self {
+        self.popup_option("close_on_escape", |popup| popup.close_on_escape = value)
+    }
+
+    /// Whether a press outside closes an `Auto` [`Popup`] (default `true`).
+    pub fn close_on_outside_press(self, value: bool) -> Self {
+        self.popup_option("close_on_outside_press", |popup| {
+            popup.close_on_outside_press = value
+        })
+    }
+
+    fn popup_callbacks(mut self, name: &str, set: impl FnOnce(&mut PopupCallbacks)) -> Self {
+        match &mut self.kind {
+            ElementKind::Popup { callbacks, .. } => set(callbacks),
+            _ => tracing::warn!("{name}() only applies to Popup"),
+        }
+        self
+    }
+
+    /// Called with `(false, reason)` when the compositor asks an `Auto`
+    /// [`Popup`] to close. Update the `open` signal to follow it, or leave it
+    /// open.
+    pub fn on_open_change(self, f: impl Fn(bool, PopupDismissReason) + 'static) -> Self {
+        self.popup_callbacks("on_open_change", |callbacks| {
+            callbacks.on_open_change = Some(Rc::new(f))
+        })
+    }
+
+    /// Called when the pointer enters / leaves the [`Popup`]'s anchor or,
+    /// for an interactive popup, the popup itself.
+    pub fn on_interest_change(self, f: impl Fn(bool) + 'static) -> Self {
+        self.popup_callbacks("on_interest_change", |callbacks| {
+            callbacks.on_interest_change = Some(Rc::new(f))
+        })
+    }
+
+    /// Called when the [`Popup`]'s anchor is pressed.
+    pub fn on_anchor_press(self, f: impl Fn() + 'static) -> Self {
+        self.popup_callbacks("on_anchor_press", |callbacks| {
+            callbacks.on_anchor_press = Some(Rc::new(f))
+        })
+    }
+
+    /// Let the [`Popup`] open and close itself: on hover of its anchor (after
+    /// a delay) or on a press of its anchor. Replaces [`open`](Self::open);
+    /// close requests ([`on_open_change`](Self::on_open_change)) close it.
+    pub fn trigger(self, trigger: PopupTrigger) -> Self {
+        let state = Rc::new(TriggerState {
+            open: crate::reactive::signal(false),
+            pending: Cell::new(None),
+        });
+        let element = self.open(state.open);
+        match trigger {
+            PopupTrigger::Hover {
+                open_delay_ms,
+                close_delay_ms,
+            } => {
+                let hover = state.clone();
+                element
+                    .on_interest_change(move |interested| {
+                        let delay = if interested { open_delay_ms } else { close_delay_ms };
+                        hover.set_after(interested, delay);
+                    })
+                    .popup_callbacks("trigger", |callbacks| callbacks.trigger = Some(state))
+            }
+            PopupTrigger::Click => {
+                let press = state.clone();
+                element
+                    .on_anchor_press(move || {
+                        let open = press.open.get_untracked();
+                        press.set_after(!open, 0.0);
+                    })
+                    .popup_callbacks("trigger", |callbacks| callbacks.trigger = Some(state))
+            }
+        }
     }
 
     /// Resize handles of a [`WindowBorder`]: width of the edges and corners.
@@ -375,6 +509,99 @@ impl WindowBorder {
         Element::new(ElementKind::WindowBorder {
             interaction: WindowBorderInteraction::default(),
         })
+    }
+}
+
+/// `<Popup>`: children shown next to the parent but drawn outside the window
+/// (tooltips). It takes no space in the parent, is not clipped by the
+/// window's corners, stays on the output and lets pointer input through.
+///
+/// ```
+/// use shojiwm_rs::prelude::*;
+///
+/// let hover = signal(false);
+/// let maximize = Button::new()
+///     .on_hover_change(move |on| hover.set(on))
+///     .child(
+///         Popup::new()
+///             .open(hover)
+///             .placement(PopupPlacement::Bottom)
+///             .offset(6.0)
+///             .child(Label::new("Maximize")),
+///     );
+/// # let _ = maximize;
+/// ```
+pub struct Popup;
+
+impl Popup {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> Element {
+        Element::new(ElementKind::Popup {
+            open: true.into(),
+            popup: PopupNode::default(),
+            callbacks: Box::default(),
+        })
+    }
+}
+
+/// What opens a [`Popup`] built with [`Element::trigger`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PopupTrigger {
+    /// Open once the pointer has rested `open_delay_ms` on the anchor (or the
+    /// interactive popup); close `close_delay_ms` after it left both. The
+    /// close delay lets the pointer cross the gap between them.
+    Hover {
+        open_delay_ms: f64,
+        close_delay_ms: f64,
+    },
+    /// Toggle on a press of the anchor.
+    Click,
+}
+
+impl PopupTrigger {
+    pub fn hover(open_delay_ms: f64, close_delay_ms: f64) -> Self {
+        Self::Hover {
+            open_delay_ms,
+            close_delay_ms,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct PopupCallbacks {
+    on_open_change: Option<Rc<dyn Fn(bool, PopupDismissReason)>>,
+    on_interest_change: Option<Rc<dyn Fn(bool)>>,
+    on_anchor_press: Option<Rc<dyn Fn()>>,
+    trigger: Option<Rc<TriggerState>>,
+}
+
+/// The open state of a [`Popup`] with a trigger, and its pending change.
+pub(crate) struct TriggerState {
+    open: crate::reactive::Signal<bool>,
+    pending: Cell<Option<crate::animation::TimerHandle>>,
+}
+
+impl TriggerState {
+    /// Move to `open` after `delay_ms`, dropping a change still pending.
+    /// Asking for the current state just cancels the pending change.
+    fn set_after(self: &Rc<Self>, open: bool, delay_ms: f64) {
+        if let Some(pending) = self.pending.take() {
+            pending.cancel();
+        }
+        if open == self.open.get_untracked() {
+            return;
+        }
+        if delay_ms <= 0.0 {
+            self.open.set(open);
+            return;
+        }
+        let state = Rc::downgrade(self);
+        self.pending.set(Some(crate::animation::set_timeout(delay_ms, move || {
+            if let Some(state) = state.upgrade() {
+                state.pending.set(None);
+                state.open.set(open);
+            }
+        })));
     }
 }
 
@@ -662,6 +889,68 @@ fn child_id(parent: &str, index: usize, element: &Element) -> String {
     }
 }
 
+/// The handler ids a popup node carries, matching `register_popup_handlers`.
+fn popup_handlers(id: &str, popup: &PopupNode, callbacks: &PopupCallbacks) -> Option<Box<PopupHandlers>> {
+    let dismissable = popup.mode == PopupMode::Auto
+        && (callbacks.on_open_change.is_some() || callbacks.trigger.is_some());
+    let handlers = PopupHandlers {
+        interest_change: callbacks.on_interest_change.as_ref().map(|_| DecorationStateChangeHandler {
+            true_handler: format!("{id}#popup.interest.true"),
+            false_handler: format!("{id}#popup.interest.false"),
+        }),
+        anchor_press: callbacks
+            .on_anchor_press
+            .as_ref()
+            .map(|_| format!("{id}#popup.anchor-press")),
+        dismiss: dismissable.then(|| {
+            let handler = |reason: PopupDismissReason| format!("{id}#popup.dismiss.{}", reason.as_str());
+            PopupDismissHandlers {
+                outside_press: handler(PopupDismissReason::OutsidePress),
+                escape: handler(PopupDismissReason::Escape),
+                anchor_gone: handler(PopupDismissReason::AnchorGone),
+                other_popup: handler(PopupDismissReason::OtherPopup),
+            }
+        }),
+    };
+    (handlers != PopupHandlers::default()).then(|| Box::new(handlers))
+}
+
+fn register_popup_handlers(
+    context: &ViewContext,
+    id: &str,
+    popup: &PopupNode,
+    callbacks: &PopupCallbacks,
+) {
+    if let Some(handler) = &callbacks.on_interest_change {
+        let (on, off) = (handler.clone(), handler.clone());
+        context.register_handler(format!("{id}#popup.interest.true"), Rc::new(move || on(true)));
+        context.register_handler(format!("{id}#popup.interest.false"), Rc::new(move || off(false)));
+    }
+    if let Some(handler) = &callbacks.on_anchor_press {
+        context.register_handler(format!("{id}#popup.anchor-press"), handler.clone());
+    }
+    if popup.mode == PopupMode::Auto {
+        for reason in PopupDismissReason::ALL {
+            let user = callbacks.on_open_change.clone();
+            let trigger = callbacks.trigger.clone();
+            if user.is_none() && trigger.is_none() {
+                continue;
+            }
+            context.register_handler(
+                format!("{id}#popup.dismiss.{}", reason.as_str()),
+                Rc::new(move || {
+                    if let Some(trigger) = &trigger {
+                        trigger.set_after(false, 0.0);
+                    }
+                    if let Some(user) = &user {
+                        user(false, reason);
+                    }
+                }),
+            );
+        }
+    }
+}
+
 impl MountedNode {
     /// Attach observers and handlers; must run inside the owning scope.
     pub(crate) fn mount(element: Element, id: String, context: &ViewContext) -> Self {
@@ -674,6 +963,9 @@ impl MountedNode {
 
         if let Some(ClickAction::Handler(handler)) = &element.on_click {
             context.register_handler(format!("{id}#click"), handler.clone());
+        }
+        if let ElementKind::Popup { popup, callbacks, .. } = &element.kind {
+            register_popup_handlers(context, &id, popup, callbacks);
         }
         for (name, handler) in [
             ("hover", &element.on_hover_change),
@@ -826,6 +1118,10 @@ impl MountedNode {
                 }
                 ElementKind::WindowBorder { .. } => DecorationNodeKind::WindowBorder,
                 ElementKind::WindowSlot => DecorationNodeKind::WindowSlot,
+                ElementKind::Popup { open, popup, .. } => DecorationNodeKind::Popup(PopupNode {
+                    open: open.get(),
+                    ..*popup
+                }),
             };
             (kind, style)
         });
@@ -839,6 +1135,10 @@ impl MountedNode {
                 true_handler: format!("{id}#active.true"),
                 false_handler: format!("{id}#active.false"),
             }),
+            popup: match &element.kind {
+                ElementKind::Popup { popup, callbacks, .. } => popup_handlers(&id, popup, callbacks),
+                _ => None,
+            },
         };
         let window_border_interaction = match &element.kind {
             ElementKind::WindowBorder { interaction } => *interaction,

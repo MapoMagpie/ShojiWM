@@ -34,6 +34,7 @@ use crate::{
     },
     backend::{damage, damage_blink, decoration, snapshot, window as window_render},
     presentation::{take_presentation_feedback, update_primary_scanout_output},
+    ssd::PopupLayer,
 };
 use smithay::wayland::presentation::Refresh;
 
@@ -1076,6 +1077,17 @@ pub fn init_winit(
                             upper_layer_backdrop_windows,
                             fullscreen_scanout.is_some(),
                         ));
+                        if fullscreen_scanout.is_none() {
+                            scene_elements.extend(ssd_popup_scene_elements(
+                                renderer,
+                                state,
+                                &windows_top_to_bottom,
+                                &output,
+                                output_geo,
+                                scale,
+                                PopupLayer::Top,
+                            ));
+                        }
                         scene_elements.extend(
                             closing_snapshot_elements(renderer, state, &output, scale),
                         );
@@ -1739,6 +1751,17 @@ pub fn init_winit(
                                     )
                                 }
                             };
+                            if !use_full_window_snapshot {
+                                scene_elements.extend(ssd_popup_scene_elements(
+                                    renderer,
+                                    state,
+                                    std::slice::from_ref(window),
+                                    &output,
+                                    output_geo,
+                                    scale,
+                                    PopupLayer::Window,
+                                ));
+                            }
                             let popup_elements = transform_window_elements(
                                 window_render::popup_elements(
                                     window,
@@ -2435,6 +2458,76 @@ fn transform_snapshot_elements(
             ))
         })
         .collect()
+}
+
+/// The open SSD `<Popup>`s of `layer` of `windows` (front to back), drawn
+/// only while their window sits still (see the tty backend).
+fn ssd_popup_scene_elements(
+    renderer: &mut GlesRenderer,
+    state: &mut ShojiWM,
+    windows: &[smithay::desktop::Window],
+    output: &Output,
+    output_geo: Rectangle<i32, Logical>,
+    scale: smithay::utils::Scale<f64>,
+    layer: PopupLayer,
+) -> Vec<WinitRenderElements> {
+    let mut elements = Vec::new();
+    for window in windows {
+        let Some(decoration) = state.window_decorations.get_mut(window) else {
+            continue;
+        };
+        if !decoration.managed_window_allows_render_on_output(output.name().as_str())
+            || !decoration.popup_scopes().has_layer(layer)
+        {
+            continue;
+        }
+        let visual = window_visual_state(
+            decoration.layout.root.rect,
+            decoration.visual_transform,
+            output_geo,
+            scale,
+        );
+        if !is_identity_visual_geometry(visual) {
+            continue;
+        }
+        let root_origin = root_physical_origin_precise(
+            decoration.layout.root.rect,
+            decoration.root_subpixel_offset,
+            output_geo,
+            scale,
+        );
+        let popups = match decoration::popup_elements_for_decoration(
+            renderer,
+            decoration,
+            layer,
+            output_geo,
+            scale,
+            visual.opacity,
+        ) {
+            Ok(popups) => popups,
+            Err(error) => {
+                warn!(?error, "failed to build SSD popup elements");
+                continue;
+            }
+        };
+        elements.extend(popups.into_iter().map(|element| match element {
+            decoration::PopupSceneElement::Decoration(element) => {
+                WinitRenderElements::RelocatedDecoration(RelocateRenderElement::from_element(
+                    element,
+                    root_origin,
+                    Relocate::Relative,
+                ))
+            }
+            decoration::PopupSceneElement::Texture(element) => {
+                WinitRenderElements::RelocatedText(RelocateRenderElement::from_element(
+                    element,
+                    root_origin,
+                    Relocate::Relative,
+                ))
+            }
+        }));
+    }
+    elements
 }
 
 fn transform_decoration_elements(

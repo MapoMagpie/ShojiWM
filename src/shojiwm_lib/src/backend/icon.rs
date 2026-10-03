@@ -30,7 +30,7 @@ use crate::backend::visual::{
     PreciseLogicalRect, relative_physical_rect_from_root_precise,
     relative_physical_rect_from_root_snapped_edges,
 };
-use crate::ssd::{ImageFit, LogicalRect, WindowDecorationState, WindowIconSnapshot};
+use crate::ssd::{DecorationPart, ImageFit, LogicalRect, WindowDecorationState, WindowIconSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct CachedDecorationIcon {
@@ -380,6 +380,44 @@ fn cached_icon_from_buffer(spec: &IconSpec, buffer: MemoryRenderBuffer) -> Cache
     }
 }
 
+/// The icon buffers of `decoration` drawn in `part`.
+fn icon_buffers_for(
+    decoration: &WindowDecorationState,
+    part: DecorationPart,
+) -> impl Iterator<Item = &CachedDecorationIcon> {
+    let scopes = decoration.popup_scopes();
+    decoration
+        .icon_buffers
+        .iter()
+        .filter(move |icon| scopes.includes(part, &icon.stable_key))
+}
+
+/// The icon elements of one `part` of `decoration`, with their paint order.
+pub fn ordered_icon_elements_for_part(
+    renderer: &mut GlesRenderer,
+    decoration: &WindowDecorationState,
+    part: DecorationPart,
+    output_geo: Rectangle<i32, Logical>,
+    scale: OutputScale<f64>,
+    alpha: f32,
+) -> Result<Vec<(usize, crate::backend::text::DecorationTextureElements)>, GlesError> {
+    icon_buffers_for(decoration, part)
+        .filter_map(|icon| {
+            memory_icon_element(
+                renderer,
+                icon,
+                decoration.layout.root.rect,
+                decoration.root_subpixel_offset,
+                output_geo,
+                scale,
+                alpha,
+            )
+            .transpose()
+            .map(|result| result.map(|element| (icon.order, element)))
+        })
+        .collect()
+}
+
 pub fn icon_elements_for_window(
     renderer: &mut GlesRenderer,
     space: &Space<Window>,
@@ -396,9 +434,7 @@ pub fn icon_elements_for_window(
         return Ok(Vec::new());
     };
 
-    decoration
-        .icon_buffers
-        .iter()
+    icon_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|icon| {
             memory_icon_element(
                 renderer,
@@ -430,9 +466,7 @@ pub fn ordered_icon_elements_for_window(
         return Ok(Vec::new());
     };
 
-    decoration
-        .icon_buffers
-        .iter()
+    icon_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|icon| {
             memory_icon_element(
                 renderer,
@@ -456,9 +490,7 @@ pub fn ordered_icon_elements_for_decoration(
     scale: OutputScale<f64>,
     alpha: f32,
 ) -> Result<Vec<(usize, crate::backend::text::DecorationTextureElements)>, GlesError> {
-    decoration
-        .icon_buffers
-        .iter()
+    icon_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|icon| {
             memory_icon_element(
                 renderer,
@@ -482,9 +514,7 @@ pub fn icon_elements_for_decoration(
     scale: OutputScale<f64>,
     alpha: f32,
 ) -> Result<Vec<crate::backend::text::DecorationTextureElements>, GlesError> {
-    decoration
-        .icon_buffers
-        .iter()
+    icon_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|icon| {
             memory_icon_element(
                 renderer,

@@ -8,7 +8,7 @@ sidebar_position: 8
 ウィンドウ装飾を描くための部品です。`shoji_wm` から import します。
 
 ```tsx
-import {Box, Label, Button, AppIcon, Image, ShaderEffect, WindowBorder} from 'shoji_wm';
+import {Box, Label, Button, AppIcon, Image, Popup, ShaderEffect, WindowBorder} from 'shoji_wm';
 ```
 
 `<ManagedWindow/>` と `<ClientWindow/>` は
@@ -161,6 +161,154 @@ const [hover, setHover] = useState(false);
   <ClientWindow />
 </WindowBorder>
 ```
+
+## `<Popup/>`
+
+親の隣に表示し、**ウィンドウの外**に描くコンテンツです。タイトルバーのボタンの
+ツールチップや、ボタン付きのメニューに使います。属するコンポーネントの中に書き
+（親が *基準（アンカー）* になります）、そのコンポーネントのシグナルをそのまま
+使えます。仕組みはブラウザの
+[Popover API](https://developer.mozilla.org/ja/docs/Web/API/Popover_API) に倣っています。
+
+### ツールチップ
+
+```tsx
+import {Box, Button, Label, Popup, windowAction} from 'shoji_wm';
+
+<Button onClick={windowAction('maximize')} style={{width: 16, height: 16}}>
+  <Popup trigger="hover" openDelay={500} placement="bottom" offset={6}>
+    <Box style={{background: '#1e1e2ef0', borderRadius: 6, paddingX: 10, paddingY: 4}}>
+      <Label text="最大化" style={{fontSize: 12, color: '#f5f7fa'}} />
+    </Box>
+  </Popup>
+</Button>
+```
+
+`trigger="hover"` は、ボタンにポインターを `openDelay` ms 置くと開き、離れて
+`closeDelay` ms 経つと閉じます。
+
+### ボタン付きのメニュー
+
+```tsx
+<Button onClick={toggleMaximize}>
+  <Popup trigger="hover" mode="auto" openDelay={500} closeDelay={200}>
+    <Box direction="row" style={{gap: 6, padding: 6}}>
+      <Button onClick={() => snap(window, 'left')}>…</Button>
+      <Button onClick={() => snap(window, 'right')}>…</Button>
+    </Box>
+  </Popup>
+</Button>
+```
+
+`mode="auto"` ではポップアップが入力を受けるので、中のボタンが押せます。基準から
+ポップアップへポインターを移しても、ポップアップ内では基準もホバー中とみなされ、
+間の隙間は `closeDelay` が吸収します。外側を押す・Esc・別の `"auto"` ポップアップが
+開く、のいずれかで閉じます。
+
+### 自分で状態を持つ、クリックで開くメニュー
+
+```tsx
+const [open, setOpen] = useState(false);
+
+<Button onClick={() => setOpen(!open())}>
+  <AppIcon icon={window.icon} />
+  <Popup mode="auto" open={open} onOpenChange={(next, reason) => setOpen(next)}>
+    <Button onClick={() => { window.close(); setOpen(false); }}>…</Button>
+  </Popup>
+</Button>
+```
+
+短く書くなら `<Popup trigger="click" mode="auto">` です。
+
+### Props
+
+| Prop | 型 | 意味 |
+| --- | --- | --- |
+| `open` | `boolean`（またはシグナル） | 表示するか（既定 `true`）。`trigger` 使用時は使いません |
+| `trigger` | `"hover" \| "click"` | ポップアップが自分で開閉する（後述） |
+| `openDelay` | `number` | `trigger="hover"`: 基準に置いてから開くまでの ms（既定 `500`） |
+| `closeDelay` | `number` | `trigger="hover"`: 離れてから閉じるまでの ms（既定 `200`） |
+| `mode` | `"hint" \| "auto" \| "manual"` | 入力への関わり方（既定 `"hint"`、後述） |
+| `onOpenChange` | `(open, reason) => void` | `"auto"`: コンポジターから閉じる要求が来た |
+| `closeOnEscape` | `boolean` | `"auto"`: Esc で閉じる（既定 `true`） |
+| `closeOnOutsidePress` | `boolean` | `"auto"`: ポップアップと基準の外を押すと閉じる（既定 `true`） |
+| `onInterestChange` | `(interested) => void` | ポインターが基準（`"hint"` 以外はポップアップも）に出入りした |
+| `onAnchorPress` | `() => void` | 基準が押された |
+| `placement` | `"top" \| "bottom" \| "left" \| "right"` | 基準のどちら側に出すか（既定 `"bottom"`） |
+| `align` | `"start" \| "center" \| "end"` | その辺での揃え位置（既定 `"center"`） |
+| `offset` | `number` | 基準からの距離（論理ピクセル、既定 `0`） |
+| `collision` | `"flip" \| "none"` | `"flip"`（既定）: 出力内の余白が反対側の方が大きければそちらへ移り、辺に沿って出力内に収まるようずらす |
+| `layer` | `"top" \| "window"` | `"top"`（既定）: 全ウィンドウの上。`"window"`: 自分のウィンドウのすぐ上（上にあるウィンドウには隠れる） |
+| `style` | `SSDStyle` | ポップアップ自体のスタイル |
+
+### モード
+
+| `mode` | ポインター入力 | コンポジターが閉じる要求を出すとき |
+| --- | --- | --- |
+| `"hint"`（既定） | 下へ素通り | なし |
+| `"auto"` | 受ける（他のウィンドウのクライアントの上でも） | 外側を押した・Esc・ウィンドウが隠れた・別の `"auto"` が開いた |
+| `"manual"` | 受ける | なし |
+
+コンポジターが `open` を直接変えることはありません。`onOpenChange(false, reason)` を
+呼び、どうするかは設定側が決めます。`onOpenChange` も `trigger` もない `"auto"` には
+閉じる要求は来ません（Esc もウィンドウに届きます）。`reason` は次のいずれかです。
+
+| `reason` | いつ |
+| --- | --- |
+| `"outside-press"` | ポップアップ（とその中の入れ子のポップアップ）と基準の外が押された |
+| `"escape"` | Esc。最後に開いた `"auto"` に届きます。開いている間 Esc はフォーカス中のウィンドウに届きません。ウィンドウに渡したいときは `closeOnEscape={false}` |
+| `"anchor-gone"` | ウィンドウが隠れた（最小化・別ワークスペースへ移動） |
+| `"other-popup"` | このポップアップの中に入れ子になっていない、別の `"auto"` が開いた |
+
+### トリガー
+
+`trigger` を付けると開閉の状態を SDK が持ちます。ブラウザの `interestfor` /
+`popovertarget` に相当します。
+
+- `"hover"`: 基準に `openDelay` ms 置くと開き、基準と（`"hint"` 以外は）ポップアップの
+  両方から離れて `closeDelay` ms で閉じます。その間に戻れば開いたままです。
+- `"click"`: 基準を押すたびに開閉します。
+
+`trigger` 付きのポップアップは `onOpenChange` の要求でも閉じます（自分の
+`onOpenChange` も呼ばれます）。`trigger` は最初に決めたら切り替えないでください。
+
+### ポップアップ内のホバー
+
+ポップアップの外では、ホバーは `onHoverChange` を持つ一番内側のノードだけに届きます。
+`"auto"` / `"manual"` のポップアップの中では、DOM の `:hover` と同じく祖先の連なり
+全体に届きます。中のボタン・ポップアップ・基準・基準の祖先がすべてホバー中になるので、
+基準の `onHoverChange` で動かす `open={hover}` は、ポインターがメニュー上にある間
+開いたままになります。
+
+### 普通の子要素との違い
+
+- **位置**: 大きさは中身で決まり（子要素は縦に並びます）、親のレイアウトで場所を取りません。
+- **切り抜かれない**: ウィンドウの角丸や `overflow: 'hidden'` の祖先に切られません。
+- **重なり順**: 専用のパスで描かれ、全ウィンドウの上（`layer="top"`）、レイヤーシェルの
+  バーやオーバーレイの下に来ます。入れ子のポップアップは外側のポップアップと一緒に描かれます。
+- **描画**: 普通の装飾ツリーなので、`style`・`boxShadow`・
+  [ペイントシェーダー](./paint.md)・ラベル・画像・シグナルで動かす `opacity` が
+  そのまま使えます。ポップアップ内の `<ShaderEffect/>` は子要素だけ描き、
+  エフェクトは描きません。
+- **ウィンドウのアニメーション**: ウィンドウが変形を伴うアニメーション（開閉・最小化・
+  拡縮）で描かれている間は、描かれず入力も受けません。ドラッグで動かすと一緒に動きます。
+- `open` は表示の切り替えだけです。閉じている間もレイアウトは保たれるので、
+  開くのは軽い処理です。
+
+### Rust
+
+```rust
+Button::new().child(
+    Popup::new()
+        .mode(PopupMode::Auto)
+        .trigger(PopupTrigger::hover(500.0, 200.0))
+        .on_open_change(|open, reason| eprintln!("open: {open} ({reason:?})"))
+        .child(Label::new("最大化")),
+)
+```
+
+`Popup::new().open(signal)`・`.close_on_escape(false)`・`.on_interest_change(...)`・
+`.on_anchor_press(...)` は上の props に対応します。
 
 ---
 

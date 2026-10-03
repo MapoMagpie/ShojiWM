@@ -11,7 +11,7 @@ use crate::{
         PreciseLogicalRect, relative_physical_rect_from_root_precise,
         relative_physical_rect_from_root_snapped_edges,
     },
-    ssd::{Color, LogicalRect, WindowDecorationState},
+    ssd::{Color, DecorationPart, LogicalRect, WindowDecorationState},
 };
 use cosmic_text::{
     Align, Attrs, Buffer, Color as CosmicColor, Family as CosmicFamily, FontSystem, Metrics,
@@ -384,6 +384,44 @@ smithay::render_elements! {
     Clipped=crate::backend::clipped_memory::ClippedMemoryElement,
 }
 
+/// The text buffers of `decoration` drawn in `part`.
+fn text_buffers_for(
+    decoration: &WindowDecorationState,
+    part: DecorationPart,
+) -> impl Iterator<Item = &CachedDecorationLabel> {
+    let scopes = decoration.popup_scopes();
+    decoration
+        .text_buffers
+        .iter()
+        .filter(move |label| scopes.includes(part, &label.stable_key))
+}
+
+/// The text elements of one `part` of `decoration`, with their paint order.
+pub fn ordered_text_elements_for_part(
+    renderer: &mut GlesRenderer,
+    decoration: &WindowDecorationState,
+    part: DecorationPart,
+    output_geo: Rectangle<i32, Logical>,
+    scale: OutputScale<f64>,
+    alpha: f32,
+) -> Result<Vec<(usize, DecorationTextureElements)>, GlesError> {
+    text_buffers_for(decoration, part)
+        .filter_map(|label| {
+            memory_text_element(
+                renderer,
+                label,
+                decoration.layout.root.rect,
+                decoration.root_subpixel_offset,
+                output_geo,
+                scale,
+                alpha,
+            )
+            .transpose()
+            .map(|result| result.map(|element| (label.order, element)))
+        })
+        .collect()
+}
+
 pub fn text_elements_for_window(
     renderer: &mut GlesRenderer,
     space: &Space<Window>,
@@ -400,9 +438,7 @@ pub fn text_elements_for_window(
         return Ok(Vec::new());
     };
 
-    decoration
-        .text_buffers
-        .iter()
+    text_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|label| {
             memory_text_element(
                 renderer,
@@ -434,9 +470,7 @@ pub fn ordered_text_elements_for_window(
         return Ok(Vec::new());
     };
 
-    decoration
-        .text_buffers
-        .iter()
+    text_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|label| {
             memory_text_element(
                 renderer,
@@ -460,9 +494,7 @@ pub fn ordered_text_elements_for_decoration(
     scale: OutputScale<f64>,
     alpha: f32,
 ) -> Result<Vec<(usize, DecorationTextureElements)>, GlesError> {
-    decoration
-        .text_buffers
-        .iter()
+    text_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|label| {
             memory_text_element(
                 renderer,
@@ -486,9 +518,7 @@ pub fn text_elements_for_decoration(
     scale: OutputScale<f64>,
     alpha: f32,
 ) -> Result<Vec<DecorationTextureElements>, GlesError> {
-    decoration
-        .text_buffers
-        .iter()
+    text_buffers_for(decoration, DecorationPart::Window)
         .filter_map(|label| {
             memory_text_element(
                 renderer,

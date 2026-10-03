@@ -1,5 +1,6 @@
 /// <reference path="./runtime-globals.d.ts" />
 import type {
+  CompositionRenderable,
   AppIconProps,
   ImageProps,
   Component,
@@ -23,6 +24,7 @@ import type {
   BoxProps,
   ButtonProps,
   LabelProps,
+  PopupProps,
   ManagedWindowProps,
   ManagedWindowAnimationEasing,
   ManagedWindowAnimationMode,
@@ -213,7 +215,8 @@ import {
   installProcessResolverBridge,
   takePendingProcessConfig,
 } from "./process";
-import { createElementNode } from "./runtime";
+import { createElementNode, useRef, useState } from "./runtime";
+import { createPoll, type PollHandle } from "./scheduler";
 import {
   computed as createComputedSignal,
   isSignal as isReadonlySignal,
@@ -508,6 +511,14 @@ export type {
   AppIconProps,
   BoxProps,
   ButtonProps,
+  PopupAlign,
+  PopupCollision,
+  PopupLayer,
+  PopupMode,
+  PopupOpenChangeReason,
+  PopupPlacement,
+  PopupProps,
+  PopupTrigger,
   ImageFit,
   ImageProps,
   Component,
@@ -701,6 +712,98 @@ export type CompositionNode = CompositionChild;
  * ```
  */
 export const Box = defineIntrinsicComponent<BoxProps>("Box");
+
+/**
+ * Content shown next to its parent but drawn outside the window: above every
+ * window by default, unclipped by the window's rounded corners, and kept on
+ * the output (it flips to the other side of the parent when needed). It takes
+ * no space in the parent's layout and lets pointer input through.
+ * 親の隣に表示し、ウィンドウの外に描くコンテンツ。既定では全ウィンドウの上に
+ * 描かれ、ウィンドウの角丸に切り抜かれず、出力内に収まるよう（必要なら親の
+ * 反対側へ）配置されます。親のレイアウトで場所を取らず、ポインター入力は
+ * 下へ素通りします。
+ *
+ * With `mode="auto"` or `"manual"` it takes pointer input (buttons inside
+ * work), and while the pointer is inside it its ancestors count as hovered.
+ * An `"auto"` popup is asked to close (`onOpenChange`) on a press outside,
+ * Escape, when its window goes away, or when another `"auto"` popup opens.
+ * `trigger` lets it open and close by itself.
+ * `mode="auto"` / `"manual"` では入力を受け（中のボタンが押せる）、ポインターが
+ * 中にある間は祖先もホバー中になります。`"auto"` は外側クリック・Esc・ウィンドウが
+ * 消えたとき・別の `"auto"` が開いたときに閉じる要求（`onOpenChange`）を受けます。
+ * `trigger` を付けると自分で開閉します。
+ *
+ * @example Tooltip of a title bar button / タイトルバーのボタンのツールチップ
+ * ```tsx
+ * <Button onClick={windowAction("maximize")}>
+ *   <Popup trigger="hover" openDelay={500} offset={6}>
+ *     <Box style={{ background: "#1e1e2ef0", borderRadius: 6, padding: 6 }}>
+ *       <Label text="Maximize" />
+ *     </Box>
+ *   </Popup>
+ * </Button>
+ * ```
+ *
+ * @example A menu with buttons / ボタン付きのメニュー
+ * ```tsx
+ * <Button onClick={toggleMaximize}>
+ *   <Popup trigger="hover" mode="auto" openDelay={500} closeDelay={200}>
+ *     <Button onClick={() => snap("left")}>…</Button>
+ *   </Popup>
+ * </Button>
+ * ```
+ */
+export function Popup(props: PopupProps): CompositionRenderable {
+  const { trigger, openDelay = 500, closeDelay = 200, ...rest } = props;
+  if (trigger === undefined) {
+    return PopupIntrinsic(rest);
+  }
+  const [open, setOpen] = useState(false);
+  const pending = useRef<PollHandle | null>(null);
+  // Move to `next` after `delayMs`, dropping a change still pending; asking
+  // for the current state just cancels the pending change.
+  const setAfter = (next: boolean, delayMs: number) => {
+    pending.current?.cancel();
+    pending.current = null;
+    if (next === open.peek()) {
+      return;
+    }
+    if (delayMs <= 0) {
+      setOpen(next);
+      return;
+    }
+    pending.current = createPoll(delayMs, (handle) => {
+      handle.cancel();
+      pending.current = null;
+      setOpen(next);
+    });
+  };
+  const { onInterestChange, onAnchorPress, onOpenChange } = rest;
+  return PopupIntrinsic({
+    ...rest,
+    open,
+    onInterestChange:
+      trigger === "hover"
+        ? (interested) => {
+            setAfter(interested, interested ? openDelay : closeDelay);
+            onInterestChange?.(interested);
+          }
+        : onInterestChange,
+    onAnchorPress:
+      trigger === "click"
+        ? () => {
+            setAfter(!open.peek(), 0);
+            onAnchorPress?.();
+          }
+        : onAnchorPress,
+    onOpenChange: (next, reason) => {
+      setAfter(next, 0);
+      onOpenChange?.(next, reason);
+    },
+  });
+}
+
+const PopupIntrinsic = defineIntrinsicComponent<PopupProps>("Popup");
 
 /**
  * Renders a text string, optionally reactive via a `ReadonlySignal<string>`.

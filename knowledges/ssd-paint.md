@@ -62,14 +62,15 @@ Rust SDK: `view.rs` `paint_shaders()`.
   shadow, custom shader sees layout pixels at 1.25x).
 - `shoji_wm` evaluator test `embedded_runtime_sends_paint_shaders_and_patches_their_uniforms`.
 - `shojiwm_rs/tests/reactive_runtime.rs` (overlay uniform patch, box_shadow).
+- Checked by hand: a `boxShadow` reaching outside the window root survives
+  the snapshot-based close / minimize animations.
 
 ## Not done yet
 
 - Per-component post effects on the final image (render a subtree
   offscreen, then run an effect pipeline over it).
-- Paint for layer / popup surfaces (fancy popups).
-- Unverified: whether a `boxShadow` reaching outside the window root
-  survives the snapshot-based close / minimize animations.
+- SSD layers not tied to a window (OSDs). SSD popups (tooltips that escape
+  the window) are done: see `ssd-popup.md`.
 
 ## EffectContext frame shape
 

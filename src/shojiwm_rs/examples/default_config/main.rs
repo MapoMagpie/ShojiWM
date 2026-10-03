@@ -828,11 +828,45 @@ fn decorated_contents(window: Window, is_terminal: bool) -> Element {
         .child(ClientWindow::new())
 }
 
+/// How long the pointer has to rest on a title bar button before its tooltip shows.
+const TOOLTIP_DELAY_MS: f64 = 500.0;
+
+/// A small label under a title bar button, drawn above every window. It
+/// opens once the pointer has rested on the button for [`TOOLTIP_DELAY_MS`]
+/// and closes as soon as it leaves.
+fn titlebar_tooltip(text: impl Into<Prop<String>>) -> Element {
+    Popup::new()
+        .trigger(PopupTrigger::hover(TOOLTIP_DELAY_MS, 0.0))
+        .placement(PopupPlacement::Bottom)
+        .offset(8.0)
+        .child(
+            Flex::column()
+                .style(
+                    Style::new()
+                        .background(hex("#1f2430e6"))
+                        .border_radius(6.0)
+                        .padding_x(8.0)
+                        .padding_y(4.0)
+                        .border(1.0, hex("#ffffff1f"))
+                        .box_shadow(shadow(0.0, 4.0, 12.0, hex("#00000070"))),
+                )
+                .child(
+                    Label::new(text).style(
+                        Style::new()
+                            .color(hex("#e6e9ef"))
+                            .fonts(["Noto Sans CJK JP", "Noto Color Emoji"])
+                            .font_size(12.0),
+                    ),
+                ),
+        )
+}
+
 /// A round titlebar button whose icon appears while hovered.
 fn title_button(
     hover_border: Memo<Color>,
     hover: Signal<bool>,
     icon: impl Fn() -> Option<Element> + 'static,
+    tooltip: impl Fn() -> Option<Element> + 'static,
     on_click: impl Fn() + 'static,
 ) -> Element {
     Flex::column()
@@ -850,6 +884,7 @@ fn title_button(
                 ),
         )
         .child_dyn(icon)
+        .child_dyn(tooltip)
 }
 
 fn button_icon(src: impl Into<Prop<String>>) -> Element {
@@ -869,6 +904,7 @@ fn close_button(window: Window) -> Element {
         border,
         hover,
         move || hover.get().then(|| button_icon("./assets/x.svg")),
+        || None,
         move || window.close(),
     )
 }
@@ -898,6 +934,13 @@ fn maximize_button(window: Window) -> Element {
             })
         },
         move || {
+            window.is_resizable().get().then(|| {
+                titlebar_tooltip(window.is_maximized().map(|maximized| {
+                    if *maximized { "Restore" } else { "Maximize" }.to_string()
+                }))
+            })
+        },
+        move || {
             if !window.is_resizable().get_untracked() {
                 return;
             }
@@ -917,6 +960,7 @@ fn minimize_button(window: Window) -> Element {
         border,
         hover,
         move || hover.get().then(|| button_icon("./assets/minus.svg")),
+        || Some(titlebar_tooltip("Minimize")),
         move || window.minimize(),
     )
 }
@@ -1085,5 +1129,65 @@ mod tests {
         let border = |node: &shojiwm_rs::ssd::DecorationNode| node.style.border.unwrap().color;
         assert_eq!(border(&focused.node), hex("#d7ba7d"));
         assert_eq!(border(&unfocused.node), hex("#4f5666"));
+    }
+
+    #[test]
+    fn title_button_tooltips_wait_for_a_resting_hover() {
+        use shojiwm_rs::ssd::{DecorationNode, DecorationNodeKind};
+
+        fn collect<'a>(node: &'a DecorationNode, out: &mut Vec<&'a DecorationNode>) {
+            out.push(node);
+            for child in &node.children {
+                collect(child, out);
+            }
+        }
+        fn popups(node: &DecorationNode) -> Vec<bool> {
+            let mut nodes = Vec::new();
+            collect(node, &mut nodes);
+            nodes
+                .iter()
+                .filter_map(|node| match &node.kind {
+                    DecorationNodeKind::Popup(popup) => Some(popup.open),
+                    _ => None,
+                })
+                .collect()
+        }
+        let opened = |cached: &shojiwm_rs::ssd::DecorationCachedEvaluationResult| {
+            cached
+                .node_patches
+                .iter()
+                .filter_map(|patch| patch.replacement_node())
+                .chain(cached.node.as_ref())
+                .any(|node| popups(node).contains(&true))
+        };
+
+        let mut runtime = start();
+        let evaluation = runtime.evaluate_window(&window("w1", true), 1000).unwrap();
+        // Minimize and maximize carry a closed tooltip, close has none.
+        assert_eq!(popups(&evaluation.node), [false, false]);
+        let mut nodes = Vec::new();
+        collect(&evaluation.node, &mut nodes);
+        // The compositor reports the pointer on the minimize button as
+        // interest in its tooltip.
+        let minimize = nodes
+            .iter()
+            .find(|node| matches!(node.kind, DecorationNodeKind::Popup(_)))
+            .and_then(|node| node.interaction.popup.as_ref()?.interest_change.clone())
+            .expect("minimize tooltip interest handler");
+
+        runtime.invoke_handler("w1", &minimize.true_handler, 1000).unwrap();
+        for now in [1000, 1200, 1490] {
+            runtime.scheduler_tick(now as f64).unwrap();
+            let cached = runtime.evaluate_cached_window("w1", None, now, false).unwrap();
+            assert!(!opened(&cached), "the tooltip opened early at {now} ms");
+        }
+        runtime.scheduler_tick(1500.0).unwrap();
+        let cached = runtime.evaluate_cached_window("w1", None, 1500, false).unwrap();
+        assert!(opened(&cached), "the tooltip opens after a resting hover");
+
+        // Leaving closes it again.
+        runtime.invoke_handler("w1", &minimize.false_handler, 1600).unwrap();
+        let cached = runtime.evaluate_cached_window("w1", None, 1600, false).unwrap();
+        assert!(!opened(&cached));
     }
 }

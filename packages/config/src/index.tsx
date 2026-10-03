@@ -24,6 +24,8 @@ import {
   type DisplayConfigDraft,
   compilePopupEffect,
   popupSource,
+  Popup,
+  type ReadonlySignal,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
@@ -1069,6 +1071,48 @@ const CloseButton = ({ window }: { window: WaylandWindow }) => {
   );
 };
 
+/** How long the pointer has to rest on a title bar button before its tooltip shows. */
+const TOOLTIP_DELAY_MS = 500;
+
+/**
+ * A small label under a title bar button, drawn above every window. It
+ * opens once the pointer has rested on the button for `TOOLTIP_DELAY_MS` and
+ * closes as soon as it leaves.
+ */
+const TitlebarTooltip = ({
+  text,
+}: {
+  text: string | ReadonlySignal<string>;
+}) => (
+  <Popup
+    trigger="hover"
+    openDelay={TOOLTIP_DELAY_MS}
+    closeDelay={0}
+    placement="bottom"
+    offset={8}
+  >
+    <Box
+      style={{
+        background: "#1f2430e6",
+        borderRadius: 6,
+        paddingX: 8,
+        paddingY: 4,
+        border: { px: 1, color: "#ffffff1f" },
+        boxShadow: [{ y: 4, blur: 12, color: "#00000070" }],
+      }}
+    >
+      <Label
+        text={text}
+        style={{
+          color: "#e6e9ef",
+          fontFamily: ["Noto Sans CJK JP", "Noto Color Emoji"],
+          fontSize: 12,
+        }}
+      />
+    </Box>
+  </Popup>
+);
+
 const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
   const [hover, setHover] = useState(false);
 
@@ -1124,6 +1168,13 @@ const MaximizeButton = ({ window }: { window: WaylandWindow }) => {
         }}
       />
       {icon}
+      {window.isResizable() ? (
+        <TitlebarTooltip
+          text={window.isMaximized((maximized) =>
+            maximized ? "Restore" : "Maximize",
+          )}
+        />
+      ) : null}
     </Box>
   );
 };
@@ -1163,6 +1214,7 @@ const MinimizeButton = ({ window }: { window: WaylandWindow }) => {
         onClick={() => window.minimize()}
       />
       {icon}
+      <TitlebarTooltip text="Minimize" />
     </Box>
   );
 };
