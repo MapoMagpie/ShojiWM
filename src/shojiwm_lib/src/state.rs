@@ -4135,7 +4135,8 @@ impl ShojiWM {
                 if transformed_root.contains(LogicalPoint::new(
                     pos.x.floor() as i32,
                     pos.y.floor() as i32,
-                )) {
+                )) && self.client_input_region_accepts(window, Some(decoration), pos)
+                {
                     return None;
                 }
 
@@ -4160,7 +4161,8 @@ impl ShojiWM {
             if rect.contains(LogicalPoint::new(
                 pos.x.floor() as i32,
                 pos.y.floor() as i32,
-            )) {
+            )) && self.client_input_region_accepts(window, None, pos)
+            {
                 return None;
             }
         }
@@ -4201,7 +4203,8 @@ impl ShojiWM {
                 if transformed_root.contains(LogicalPoint::new(
                     pos.x.floor() as i32,
                     pos.y.floor() as i32,
-                )) {
+                )) && self.client_input_region_accepts(window, Some(decoration), pos)
+                {
                     return None;
                 }
 
@@ -4220,7 +4223,8 @@ impl ShojiWM {
             if rect.contains(LogicalPoint::new(
                 pos.x.floor() as i32,
                 pos.y.floor() as i32,
-            )) {
+            )) && self.client_input_region_accepts(window, None, pos)
+            {
                 return None;
             }
         }
@@ -4302,10 +4306,67 @@ impl ShojiWM {
             }
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-            transformed_root
-                .contains(logical_pos)
-                .then_some((window, decoration))
+            if !transformed_root.contains(logical_pos)
+                || !self.client_input_region_accepts(window, Some(decoration), pos)
+            {
+                return None;
+            }
+            Some((window, decoration))
         })
+    }
+
+    /// Let explicit client input-region holes fall through to lower windows.
+    /// SSD chrome and clients without an explicit region retain their rectangle
+    /// hit tests. Use the surface tree so interactive children remain reachable.
+    pub(crate) fn client_input_region_accepts(
+        &self,
+        window: &Window,
+        decoration: Option<&WindowDecorationState>,
+        pos: Point<f64, Logical>,
+    ) -> bool {
+        let root_surface = window
+            .toplevel()
+            .map(|surface| surface.wl_surface().clone())
+            .or_else(|| window.x11_surface().and_then(|surface| surface.wl_surface()));
+        let Some(root_surface) = root_surface else {
+            return true;
+        };
+        let has_input_region = with_states(&root_surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .input_region
+                .is_some()
+        });
+        if !has_input_region {
+            return true;
+        }
+        let Some(location) = self.space.element_location(window) else {
+            return true;
+        };
+        let local_pos = match decoration {
+            Some(decoration) => {
+                let logical_pos = LogicalPoint::new(pos.x.floor() as i32, pos.y.floor() as i32);
+                let transformed_client = transformed_rect(
+                    decoration.client_rect,
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                );
+                if !transformed_client.contains(logical_pos) {
+                    return true;
+                }
+                inverse_transform_point(
+                    pos,
+                    decoration.layout.root.rect,
+                    decoration.visual_transform,
+                )
+            }
+            None => pos,
+        };
+        window
+            .surface_under(local_pos - location.to_f64(), WindowSurfaceType::ALL)
+            .is_some()
     }
 
     pub fn raw_window_under(&self, logical_pos: LogicalPoint) -> Option<(&Window, LogicalRect)> {
@@ -4329,7 +4390,10 @@ impl ShojiWM {
                 }
             }
             let rect = self.window_bbox_rect(window)?;
-            rect.contains(logical_pos).then_some((window, rect))
+            if !rect.contains(logical_pos) || !self.client_input_region_accepts(window, None, pos) {
+                return None;
+            }
+            Some((window, rect))
         })
     }
 

@@ -4804,6 +4804,9 @@ impl ShojiWM {
             let logical_point = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+            if !self.client_input_region_accepts(window, Some(decoration), point) {
+                return None;
+            }
             transformed_root.contains(logical_point).then(|| {
                 let local_point = inverse_transform_point(
                     point,
@@ -4846,6 +4849,9 @@ impl ShojiWM {
             let logical_point = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
+            if !self.client_input_region_accepts(window, Some(decoration), point) {
+                return None;
+            }
             transformed_root.contains(logical_point).then(|| {
                 let local_point = inverse_transform_point(
                     point,
