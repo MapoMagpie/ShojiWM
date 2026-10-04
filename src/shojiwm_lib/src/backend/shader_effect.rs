@@ -6857,7 +6857,7 @@ mod frame_rect_tests {
              \x20   return vec4(\n\
              \x20       effect.frame_rect_phy_px.z / 255.0,\n\
              \x20       effect.frame_rect_px.z / 255.0,\n\
-             \x20       (effect_frame_phy_px(effect).x - effect_frame_px(effect).x) + 0.5,\n\
+             \x20       (effect_frame_phy_px(effect).x - effect_frame_px(effect).x) + 0.25,\n\
              \x20       1.0);\n\
              }\n",
         )
@@ -6898,7 +6898,10 @@ mod frame_rect_tests {
             .unwrap();
         let bytes = renderer.map_texture(&mapping).unwrap().to_vec();
         let offset = ((20 * size.0 + 40) * 4) as usize;
-        assert_eq!(&bytes[offset..offset + 3], &[40, 40, 128], "aliases match");
+        // The blue channel is the alias difference plus 0.25: a 0.5 offset would
+        // be 127.5 once written to the 8-bit target, a rounding tie that GPUs
+        // resolve differently (e.g. NVIDIA rounds it down to 127).
+        assert_eq!(&bytes[offset..offset + 3], &[40, 40, 64], "aliases match");
     }
 
     fn run_frame_probe(source: &str, frame: EffectFrame) -> Option<Vec<u8>> {
