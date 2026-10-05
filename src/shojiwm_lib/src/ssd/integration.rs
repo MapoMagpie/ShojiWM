@@ -4804,17 +4804,17 @@ impl ShojiWM {
             let logical_point = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-            if !self.client_input_region_accepts(window, Some(decoration), point) {
+            if !transformed_root.contains(logical_point)
+                || !self.client_input_region_accepts(window, Some(decoration), point)
+            {
                 return None;
             }
-            transformed_root.contains(logical_point).then(|| {
-                let local_point = inverse_transform_point(
-                    point,
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                );
-                (window.clone(), decoration.hit_test(local_point))
-            })
+            let local_point = inverse_transform_point(
+                point,
+                decoration.layout.root.rect,
+                decoration.visual_transform,
+            );
+            Some((window.clone(), decoration.hit_test(local_point)))
         })
     }
 
@@ -4849,20 +4849,20 @@ impl ShojiWM {
             let logical_point = LogicalPoint::new(point.x.floor() as i32, point.y.floor() as i32);
             let transformed_root =
                 transformed_root_rect(decoration.layout.root.rect, decoration.visual_transform);
-            if !self.client_input_region_accepts(window, Some(decoration), point) {
+            if !transformed_root.contains(logical_point)
+                || !self.client_input_region_accepts(window, Some(decoration), point)
+            {
                 return None;
             }
-            transformed_root.contains(logical_point).then(|| {
-                let local_point = inverse_transform_point(
-                    point,
-                    decoration.layout.root.rect,
-                    decoration.visual_transform,
-                );
-                let targets = decoration
-                    .layout
-                    .interaction_targets_at_precise(local_point.x, local_point.y);
-                (!targets.is_empty()).then(|| (window.clone(), targets))
-            })?
+            let local_point = inverse_transform_point(
+                point,
+                decoration.layout.root.rect,
+                decoration.visual_transform,
+            );
+            let targets = decoration
+                .layout
+                .interaction_targets_at_precise(local_point.x, local_point.y);
+            (!targets.is_empty()).then(|| (window.clone(), targets))
         })
     }
 

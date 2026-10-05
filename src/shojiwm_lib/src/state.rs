@@ -4356,11 +4356,21 @@ impl ShojiWM {
                 if !transformed_client.contains(logical_pos) {
                     return true;
                 }
-                inverse_transform_point(
+                let local_pos = inverse_transform_point(
                     pos,
                     decoration.layout.root.rect,
                     decoration.visual_transform,
-                )
+                );
+                // SSD content placed in the client area (an absolutely
+                // positioned button, seen through a transparent hole) keeps
+                // the pointer there.
+                if decoration
+                    .layout
+                    .takes_input_over_client_at(local_pos.x, local_pos.y)
+                {
+                    return true;
+                }
+                local_pos
             }
             None => pos,
         };

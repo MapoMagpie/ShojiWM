@@ -268,6 +268,25 @@ impl ComputedDecorationTree {
         }
     }
 
+    /// Whether the decoration itself takes the pointer at a global logical
+    /// point inside the client area: an interactive popup, a button, a resize
+    /// edge, or a node with handlers other than the client slot's ancestors
+    /// (those only wrap the client). Such points stay on this window where
+    /// the client's input region has a hole, since the decoration under the
+    /// client shows through it.
+    pub fn takes_input_over_client_at(&self, x: f64, y: f64) -> bool {
+        if matches!(
+            self.hit_test_at(x, y),
+            DecorationHitTestResult::Action(_)
+                | DecorationHitTestResult::Popup
+                | DecorationHitTestResult::Resize(_)
+        ) {
+            return true;
+        }
+        let point = self.root.frame.layout_point(x, y);
+        has_interaction_target_beside_client(&self.root, point)
+    }
+
     /// Every `<Popup>` whose anchor is shown, for the compositor's input
     /// handling.
     pub fn popups(&self) -> Vec<popup::PopupInfo> {
@@ -3217,6 +3236,31 @@ fn find_interaction_target(
     None
 }
 
+/// `find_interaction_target` without the nodes that contain the client slot.
+fn has_interaction_target_beside_client(node: &ComputedDecorationNode, point: LayoutPoint) -> bool {
+    if node.style.visible == Some(false) || !node.style.pointer_events_enabled() {
+        return false;
+    }
+    if node
+        .resolved_effective_clip
+        .is_some_and(|clip| !clip.rect.contains_point(point))
+    {
+        return false;
+    }
+    if node
+        .children
+        .iter()
+        .filter(|child| !matches!(child.kind, DecorationNodeKind::Popup(_)))
+        .any(|child| has_interaction_target_beside_client(child, point))
+    {
+        return true;
+    }
+    node.resolved_rect.contains_point(point)
+        && node.interaction.has_any()
+        && node.stable_id.is_some()
+        && node.resolved_window_slot_rect().is_none()
+}
+
 fn hit_test_resize_edges(
     rect: ResolvedLogicalRect,
     edge_width: i32,
@@ -5500,6 +5544,64 @@ mod tests {
             rect.x as f64 + rect.width as f64 / 2.0,
             rect.y as f64 + rect.height as f64 / 2.0,
         )
+    }
+
+    #[test]
+    fn only_content_placed_in_the_client_area_takes_input_there() {
+        let absolute = |node: DecorationNode, left: f64| {
+            let style = DecorationStyle {
+                position: Some(StylePosition::Absolute),
+                inset: PositionOffsets {
+                    top: Some(10.0),
+                    left: Some(left),
+                    ..Default::default()
+                },
+                ..node.style.clone()
+            };
+            node.with_style(style)
+        };
+        let root = hoverable(
+            DecorationNode::new(DecorationNodeKind::Box(BoxNode::default())).with_style(
+                DecorationStyle {
+                    position: Some(StylePosition::Relative),
+                    ..Default::default()
+                },
+            ),
+            "frame",
+        )
+        .with_children(vec![
+            DecorationNode::new(DecorationNodeKind::WindowSlot),
+            absolute(
+                hoverable(sized(DecorationNodeKind::Box(BoxNode::default()), 30.0, 20.0), "chip"),
+                10.0,
+            ),
+            absolute(
+                sized(
+                    DecorationNodeKind::Button(ButtonNode {
+                        action: WindowAction::Close,
+                    }),
+                    20.0,
+                    20.0,
+                ),
+                60.0,
+            ),
+        ]);
+        let layout = DecorationTree::new(root)
+            .layout(LogicalRect::new(100, 100, 200, 150))
+            .expect("layout");
+        let chip = find_by_id(&layout.root, "chip").unwrap().rect;
+        let (x, y) = center(chip);
+        assert!(layout.takes_input_over_client_at(x, y), "a node with handlers in the client area");
+        assert!(layout.takes_input_over_client_at(170.0, 120.0), "a button in the client area");
+        // The frame only wraps the client: it is hovered there, but a hole in
+        // the client's input region still falls through.
+        let ids = layout
+            .interaction_targets_at_precise(250.0, 200.0)
+            .into_iter()
+            .map(|target| target.node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["frame"]);
+        assert!(!layout.takes_input_over_client_at(250.0, 200.0));
     }
 
     #[test]
