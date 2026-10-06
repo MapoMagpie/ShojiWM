@@ -5164,7 +5164,12 @@ impl ShojiWM {
                 timescope::scope!("ssd apply managed desired client");
                 let root_size_changed = desired_root.width != current_root.width
                     || desired_root.height != current_root.height;
-                if root_size_changed {
+                // Without forceRectSize the client keeps its own size (e.g.
+                // swappy settles on a size other than the managed rect), so
+                // only the origin follows the rect. Treating the mismatch as a
+                // size change would skip the position update below, and the
+                // window would move only when the client commits.
+                if root_size_changed && force_rect_size {
                     record_managed_rect_path_event(ManagedRectPathEvent::ApplySizeFast);
                     managed_client_rect_from_current_insets(
                         current_root,
