@@ -468,6 +468,29 @@ function suppressionAppliesToViolation(
   return !suppression.windowIds && !suppression.layerIds;
 }
 
+let snapshotSyncDepth = 0;
+
+/**
+ * Run `fn` as a snapshot sync: the compositor pushing its own state (a
+ * window's position, focus, …) into the signals that mirror it. A write there
+ * that no composition depends on is dropped instead of re-evaluating every
+ * window. The compositor already re-evaluates whatever its state change needs
+ * (it does not count position-only changes), and the conservative fallback
+ * turned into a feedback loop during window animations: each full
+ * re-evaluation re-sends every snapshot with this frame's positions, whose
+ * writes asked for the next full re-evaluation, every frame, at a cost
+ * proportional to the window count. Writes that compositions do depend on
+ * still dirty those windows; signal subscribers and computeds update as usual.
+ */
+export function withSnapshotSync<T>(fn: () => T): T {
+  snapshotSyncDepth += 1;
+  try {
+    return fn();
+  } finally {
+    snapshotSyncDepth -= 1;
+  }
+}
+
 export function installRuntimeHooks(nextHooks: RuntimeHooks | null): void {
   hooks = nextHooks;
 }
@@ -947,6 +970,9 @@ export function trackSignalWrite(signal: object): void {
     !hasWindowShaderUniformDeps &&
     !hasLayerNodeDeps
   ) {
+    if (snapshotSyncDepth > 0) {
+      return;
+    }
     if (suppression?.allowManagedWindowOnly) {
       const violationResult = handleSSDRebuildSuppressionViolation(
         "runtime",

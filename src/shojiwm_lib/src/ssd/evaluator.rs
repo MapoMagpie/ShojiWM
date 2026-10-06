@@ -61,6 +61,8 @@ pub trait DecorationEvaluator {
     fn scheduler_tick(
         &self,
         _now_ms: f64,
+        _output: Option<&str>,
+        _frame_outputs: &[String],
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
         Ok(DecorationSchedulerTick::default())
     }

@@ -248,6 +248,11 @@ pub struct NativeSchedulerRequest {
     /// Fractional: frame-driven ticks carry a presentation time between whole
     /// milliseconds, and truncating it would step 8, 8, 9 ms at 120 Hz.
     pub now_ms: f64,
+    /// The output whose frame this tick is for; absent for a wall-clock
+    /// timer tick (see `SchedulerTickRequest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    pub frame_outputs: Vec<String>,
     pub display_state: std::collections::BTreeMap<String, WaylandOutputSnapshot>,
     pub input_state: std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +274,8 @@ enum BridgeRequest {
     SchedulerFast {
         request_id: u64,
         now_ms: f64,
+        output: Option<String>,
+        frame_outputs: Vec<String>,
     },
 }
 
@@ -659,6 +666,24 @@ fn op_shoji_output_power(
     Ok(())
 }
 
+/// The runtime's schedule (`RuntimeSchedule`), published whenever it changes.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRuntimeSchedule {
+    output_due_ms: HashMap<String, f64>,
+    timer_due_ms: Option<f64>,
+}
+
+type PublishedSchedule = Arc<Mutex<PublishedHostState>>;
+
+/// What the runtime published for the compositor during a request (see
+/// `EmbeddedRuntime::take_published_state`).
+#[derive(Default)]
+struct PublishedHostState {
+    schedule: Option<shojiwm_lib::runtime_api::RuntimeSchedule>,
+    frame_pacing: Option<shojiwm_lib::frame_pacing::FramePacingConfig>,
+}
+
 struct BridgeRegistration {
     overlay_owner: Arc<AtomicBool>,
     requests: tokio::sync::mpsc::UnboundedReceiver<BridgeRequest>,
@@ -666,6 +691,7 @@ struct BridgeRegistration {
     composition_updates: Arc<Mutex<HashMap<u64, NativeCompositionUpdate>>>,
     effect_updates: Arc<Mutex<HashMap<u64, NativeEffectUpdate>>>,
     effect_uniform_patch_count: Arc<AtomicU32>,
+    schedule: PublishedSchedule,
 }
 
 static NEXT_BRIDGE_ID: AtomicU32 = AtomicU32::new(1);
@@ -733,6 +759,7 @@ struct ShojiRuntimeBridge {
     effect_uniform_slots: Mutex<HashMap<u32, NativeEffectUniformSlot>>,
     effect_uniform_patch_count: Arc<AtomicU32>,
     pending_native_response: Mutex<Option<EmbeddedRuntimeResponse>>,
+    schedule: PublishedSchedule,
 }
 
 #[derive(Debug, Clone)]
@@ -982,6 +1009,30 @@ impl RuntimeRequestEnvelope {
         }
     }
 
+    // The output a fast scheduler tick is for; empty for a timer tick.
+    #[string]
+    fn fast_scheduler_output(&self) -> String {
+        let Ok(request) = self.request.lock() else {
+            return String::new();
+        };
+        match request.as_ref() {
+            Some(BridgeRequest::SchedulerFast { output, .. }) => output.clone().unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    // The frame-rendering outputs of a fast scheduler tick, one per line.
+    #[string]
+    fn fast_scheduler_frame_outputs(&self) -> String {
+        let Ok(request) = self.request.lock() else {
+            return String::new();
+        };
+        match request.as_ref() {
+            Some(BridgeRequest::SchedulerFast { frame_outputs, .. }) => frame_outputs.join("\n"),
+            _ => String::new(),
+        }
+    }
+
     #[string]
     fn fast_window_id(&self) -> String {
         let Ok(request) = self.request.lock() else {
@@ -1060,7 +1111,35 @@ impl ShojiRuntimeBridge {
             effect_uniform_slots: Mutex::new(HashMap::new()),
             effect_uniform_patch_count: registration.effect_uniform_patch_count,
             pending_native_response: Mutex::new(None),
+            schedule: registration.schedule,
         })
+    }
+
+    // The runtime's schedule changed; the compositor picks it up after the
+    // request that changed it (see `EmbeddedRuntime::take_published_schedule`).
+    fn publish_schedule(&self, #[serde] schedule: WireRuntimeSchedule) {
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.schedule = Some(shojiwm_lib::runtime_api::RuntimeSchedule {
+                output_due_ms: schedule
+                    .output_due_ms
+                    .into_iter()
+                    .filter(|(_, due)| due.is_finite())
+                    .collect(),
+                timer_due_ms: schedule.timer_due_ms.filter(|due| due.is_finite()),
+            });
+        }
+    }
+
+    // `COMPOSITOR.rendering.framePacing` resolved per output; published like the schedule.
+    fn publish_frame_pacing(
+        &self,
+        #[serde] pacing: HashMap<String, shojiwm_lib::frame_pacing::FramePacing>,
+    ) {
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.frame_pacing = Some(shojiwm_lib::frame_pacing::FramePacingConfig {
+                outputs: pacing,
+            });
+        }
     }
 
     fn create_overlay(&self, #[string] output: String, #[string] placement: String,
@@ -1160,6 +1239,7 @@ impl ShojiRuntimeBridge {
         });
         set_pending_native_response(&self.pending_native_response, response)
     }
+
 
     #[fast]
     fn add_scheduler_dirty_window(
@@ -2430,6 +2510,7 @@ pub struct EmbeddedRuntime {
     // read only via the #[cfg(test)] accessor below
     #[cfg_attr(not(test), allow(dead_code))]
     effect_uniform_patch_count: Arc<AtomicU32>,
+    schedule: PublishedSchedule,
     worker: Option<JoinHandle<()>>,
     worker_error: Arc<Mutex<Option<String>>>,
 }
@@ -2711,6 +2792,7 @@ impl EmbeddedRuntime {
         let composition_updates = Arc::new(Mutex::new(HashMap::new()));
         let effect_updates = Arc::new(Mutex::new(HashMap::new()));
         let effect_uniform_patch_count = Arc::new(AtomicU32::new(0));
+        let schedule = PublishedSchedule::default();
         let overlay_owner = Arc::new(AtomicBool::new(true));
         let overlay_owner_for_thread = overlay_owner.clone();
 
@@ -2726,6 +2808,7 @@ impl EmbeddedRuntime {
                     composition_updates: Arc::clone(&composition_updates),
                     effect_updates: Arc::clone(&effect_updates),
                     effect_uniform_patch_count: Arc::clone(&effect_uniform_patch_count),
+                    schedule: Arc::clone(&schedule),
                 },
             );
 
@@ -2768,6 +2851,7 @@ impl EmbeddedRuntime {
                 effect_updates,
                 effect_state_cache: Mutex::new(NativeEffectStateCache::default()),
                 effect_uniform_patch_count,
+                schedule,
                 worker: Some(worker),
                 worker_error,
             }),
@@ -2820,6 +2904,22 @@ impl EmbeddedRuntime {
             .map_err(|_| self.failure_message("embedded runtime request channel closed"))
     }
 
+    /// What the runtime published since the last call, as host messages.
+    pub fn take_published_state(&self) -> Vec<shojiwm_lib::runtime_api::HostMessage> {
+        use shojiwm_lib::runtime_api::HostMessage;
+        let Ok(mut slot) = self.schedule.lock() else {
+            return Vec::new();
+        };
+        let mut messages = Vec::new();
+        if let Some(schedule) = slot.schedule.take() {
+            messages.push(HostMessage::Schedule(schedule));
+        }
+        if let Some(pacing) = slot.frame_pacing.take() {
+            messages.push(HostMessage::FramePacing(pacing));
+        }
+        messages
+    }
+
     pub fn write_scheduler_request(&self, request: NativeSchedulerRequest) -> Result<(), String> {
         self.requests
             .as_ref()
@@ -2847,11 +2947,22 @@ impl EmbeddedRuntime {
             .map_err(|_| self.failure_message("embedded runtime request channel closed"))
     }
 
-    pub fn write_scheduler_fast_request(&self, request_id: u64, now_ms: f64) -> Result<(), String> {
+    pub fn write_scheduler_fast_request(
+        &self,
+        request_id: u64,
+        now_ms: f64,
+        output: Option<String>,
+        frame_outputs: Vec<String>,
+    ) -> Result<(), String> {
         self.requests
             .as_ref()
             .ok_or_else(|| "embedded runtime is closed".to_owned())?
-            .send(BridgeRequest::SchedulerFast { request_id, now_ms })
+            .send(BridgeRequest::SchedulerFast {
+                request_id,
+                now_ms,
+                output,
+                frame_outputs,
+            })
             .map_err(|_| self.failure_message("embedded runtime request channel closed"))
     }
 

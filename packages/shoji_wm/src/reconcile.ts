@@ -193,8 +193,11 @@ export function createCompositionEvaluationCache(
     runtimeHandlers = new Map();
     enterWindowDependencyScope(currentSnapshot.id);
     try {
-      const rendered = withComponentRenderRoot(currentSnapshot.id, componentStateStore, () =>
-        evaluate(handle.window, context)
+      const rendered = withComponentRenderRoot(
+        currentSnapshot.id,
+        componentStateStore,
+        () => evaluate(handle.window, context),
+        () => handle.window.output.peek(),
       );
       const extracted = extractManagedWindowRoot(rendered, handle, currentSnapshot.id);
       tree = extracted.tree;

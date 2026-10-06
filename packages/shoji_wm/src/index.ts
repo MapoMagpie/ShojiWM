@@ -217,7 +217,7 @@ import {
   installProcessResolverBridge,
   takePendingProcessConfig,
 } from "./process";
-import { createElementNode, useRef, useState } from "./runtime";
+import { createElementNode, renderRootOutput, useRef, useState } from "./runtime";
 import { createPoll, type PollHandle } from "./scheduler";
 import {
   computed as createComputedSignal,
@@ -231,6 +231,10 @@ export type { OverlayOptions, OverlayHandle, OverlayEffectHandle, SnapshotSource
 import { serializeCompositionTree } from "./serialize";
 export {
   advanceAnimationFrame,
+  advanceAnimations,
+  activeAnimationOutputs,
+  installAnimationClock,
+  type AnimationClock,
   hasActiveAnimations,
   hasActiveAnimationsInStore,
   createAnimationControllerWithStore,
@@ -426,6 +430,7 @@ export {
   useRef,
   useComputed,
   useEffect,
+  useOutput,
   useState,
   withComponentRenderRoot,
 } from "./runtime";
@@ -463,11 +468,16 @@ export {
 } from "./window-stack";
 export {
   createPoll,
-  createManagedPoll,
+  createPollForEachOutput,
   installSchedulerBridge,
+  pollOutputResolver,
+  type OutputPollCallback,
+  type OutputPollOptions,
   type PollCallback,
   type PollDirtyMode,
   type PollHandle,
+  type PollOptions,
+  type PollOutput,
 } from "./scheduler";
 export {
   createIpcServer,
@@ -628,6 +638,7 @@ export type {
   CompositorDefinition,
   CompositorEffectConfig,
   CompositorRenderingConfig,
+  FramePacing,
   SurfacePolicy,
   SurfacePolicyTarget,
   CompositorWindowController,
@@ -768,6 +779,8 @@ export function Popup(props: PopupProps): CompositionRenderable {
   }
   const [open, setOpen] = useState(false);
   const pending = useRef<PollHandle | null>(null);
+  // Delays count on the frames of the output the popup's window is on.
+  const output = renderRootOutput();
   // Move to `next` after `delayMs`, dropping a change still pending; asking
   // for the current state just cancels the pending change.
   const setAfter = (next: boolean, delayMs: number) => {
@@ -780,11 +793,15 @@ export function Popup(props: PopupProps): CompositionRenderable {
       setOpen(next);
       return;
     }
-    pending.current = createPoll(delayMs, (handle) => {
-      handle.cancel();
-      pending.current = null;
-      setOpen(next);
-    });
+    pending.current = createPoll(
+      delayMs,
+      (handle) => {
+        handle.cancel();
+        pending.current = null;
+        setOpen(next);
+      },
+      { output },
+    );
   };
   const { onInterestChange, onAnchorPress, onOpenChange } = rest;
   return PopupIntrinsic({

@@ -39,6 +39,10 @@ pub struct WaylandWindowSnapshot {
     pub parent_id: Option<String>,
     pub icon: Option<WindowIconSnapshot>,
     pub interaction: DecorationInteractionSnapshot,
+    /// The output whose frames drive this window's runtime work (see
+    /// `primary_output_name_for_window`); `None` when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -861,6 +865,7 @@ impl ShojiWM {
             .unwrap_or(position);
 
         WaylandWindowSnapshot {
+            output_name: self.primary_output_name_for_window(window),
             id: runtime_id,
             title,
             app_id: app_id.clone(),
@@ -888,6 +893,7 @@ impl ShojiWM {
     fn snapshot_x11_window(&self, window: &Window) -> WaylandWindowSnapshot {
         let Some(x11) = window.x11_surface() else {
             return WaylandWindowSnapshot {
+                output_name: None,
                 id: "unknown".into(),
                 title: String::new(),
                 app_id: None,
@@ -956,6 +962,7 @@ impl ShojiWM {
             .unwrap_or(position);
 
         WaylandWindowSnapshot {
+            output_name: self.primary_output_name_for_window(window),
             id: runtime_id,
             title,
             app_id: app_id.clone(),

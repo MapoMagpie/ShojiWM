@@ -915,6 +915,21 @@ impl EmbeddedDecorationEvaluator {
         delta.publish(&self.host);
     }
 
+    /// Forward what the runtime published during the last request (its
+    /// `RuntimeSchedule` and frame pacing), so it lands with that request's
+    /// other side effects.
+    pub fn forward_published_state(&self) {
+        let messages = self
+            .runtime
+            .lock()
+            .ok()
+            .and_then(|runtime| Some(runtime.as_ref()?.child.take_published_state()))
+            .unwrap_or_default();
+        if !messages.is_empty() {
+            self.host.send_all(messages);
+        }
+    }
+
     pub fn set_display_state(
         &self,
         display_state: std::collections::BTreeMap<String, WaylandOutputSnapshot>,
@@ -1821,10 +1836,12 @@ impl EmbeddedDecorationRuntime {
         &mut self,
         request_id: u64,
         now_ms: f64,
+        output: Option<String>,
+        frame_outputs: Vec<String>,
     ) -> Result<(), DecorationEvaluationError> {
         timescope::scope!("runtime write scheduler fast request");
         self.child
-            .write_scheduler_fast_request(request_id, now_ms)
+            .write_scheduler_fast_request(request_id, now_ms, output, frame_outputs)
             .map_err(DecorationEvaluationError::RuntimeProtocol)
     }
 
@@ -2691,6 +2708,8 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
     fn scheduler_tick(
         &self,
         now_ms: f64,
+        output: Option<&str>,
+        frame_outputs: &[String],
     ) -> Result<DecorationSchedulerTick, DecorationEvaluationError> {
         let mut runtime_guard = self.runtime.lock().map_err(|_| {
             DecorationEvaluationError::RuntimeProtocol("runtime mutex poisoned".into())
@@ -2712,7 +2731,12 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
         let layout_changed = runtime.last_sent_keyboard_layout != keyboard_layout;
         if runtime.last_sent_runtime_state_generation == runtime_state_generation && !layout_changed
         {
-            runtime.write_scheduler_fast_request(request_id, now_ms)?;
+            runtime.write_scheduler_fast_request(
+                request_id,
+                now_ms,
+                output.map(str::to_owned),
+                frame_outputs.to_vec(),
+            )?;
         } else {
             let display_state = self
                 .display_state
@@ -2729,6 +2753,8 @@ impl DecorationEvaluator for EmbeddedDecorationEvaluator {
                 request_id,
                 kind: "schedulerTick",
                 now_ms,
+                output: output.map(str::to_owned),
+                frame_outputs: frame_outputs.to_vec(),
                 display_state,
                 input_state,
                 keyboard_layout: if layout_changed {
@@ -4190,6 +4216,7 @@ mod tests {
 
     fn make_window(is_focused: bool) -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
+            output_name: None,
             id: "1".into(),
             title: "Kitty".into(),
             app_id: Some("kitty".into()),
@@ -5565,7 +5592,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
             // time; it must not pull the scheduler clock back.
             rect_x(frame_time.floor() as u64 - 4);
             evaluator
-                .scheduler_tick(frame_time)
+                .scheduler_tick(frame_time, None, &[])
                 .expect("scheduler tick should evaluate");
             let x = rect_x(frame_time.floor() as u64);
             let velocity =
@@ -5666,7 +5693,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now as f64)
+                .scheduler_tick(now as f64, None, &[])
                 .expect("scheduler tick should evaluate");
         }
 
@@ -5773,7 +5800,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now as f64)
+                .scheduler_tick(now as f64, None, &[])
                 .expect("scheduler tick should evaluate");
         }
 
@@ -5896,7 +5923,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now as f64)
+                .scheduler_tick(now as f64, None, &[])
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6000,7 +6027,7 @@ COMPOSITOR.rendering.surfacePolicy = () => ({ opaqueRegion: "ignore" });
         for _ in 0..250 {
             now += 8;
             evaluator
-                .scheduler_tick(now as f64)
+                .scheduler_tick(now as f64, None, &[])
                 .expect("scheduler tick should evaluate");
         }
 
@@ -6355,14 +6382,14 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
             }));
             // Other runtime traffic must not consume the pending layout update.
             evaluator.evaluate_window(&make_window(false), 0).unwrap();
-            evaluator.scheduler_tick(1.0).unwrap();
+            evaluator.scheduler_tick(1.0, None, &[]).unwrap();
             assert!(!evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
                 index, name: name.into(),
             }));
-            evaluator.scheduler_tick(2.0).unwrap();
+            evaluator.scheduler_tick(2.0, None, &[]).unwrap();
             // A full state payload must not re-emit an unchanged layout either.
             evaluator.runtime_state_generation.fetch_add(1, Ordering::Release);
-            evaluator.scheduler_tick(3.0).unwrap();
+            evaluator.scheduler_tick(3.0, None, &[]).unwrap();
         }
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
             index: 0, name: "English (US)".into(),
@@ -6370,7 +6397,7 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
         evaluator.set_keyboard_layout(KeyboardLayoutSnapshot {
             index: 1, name: "German".into(),
         });
-        evaluator.scheduler_tick(4.0).unwrap();
+        evaluator.scheduler_tick(4.0, None, &[]).unwrap();
         let state = evaluator.lifecycle_disable("reload").unwrap();
         assert_eq!(state["layouts"], serde_json::json!([
             { "index": 0, "name": "English (US)" },
@@ -6379,8 +6406,8 @@ COMPOSITOR.event.onDisable((event) => event.persist("layouts", layouts));
         ]));
         let reloaded = evaluator.fresh_like();
         reloaded.lifecycle_enable("reload", None).unwrap();
-        reloaded.scheduler_tick(5.0).unwrap();
-        reloaded.scheduler_tick(6.0).unwrap();
+        reloaded.scheduler_tick(5.0, None, &[]).unwrap();
+        reloaded.scheduler_tick(6.0, None, &[]).unwrap();
         let state = reloaded.lifecycle_disable("shutdown").unwrap();
         assert_eq!(state["layouts"], serde_json::json!([
             { "index": 1, "name": "German" },
@@ -6436,7 +6463,7 @@ COMPOSITOR.window.composition = (window) => {
             .evaluate_window(&window, 0)
             .expect("initial native composition should evaluate");
         let tick = evaluator
-            .scheduler_tick(16.0)
+            .scheduler_tick(16.0, None, &[])
             .expect("animation scheduler should advance");
         assert!(tick.dirty_window_ids.iter().any(|id| id == &window.id));
 
@@ -6531,7 +6558,7 @@ COMPOSITOR.window.composition = (window) => {
             .evaluate_window(&window, 0)
             .expect("initial native composition should evaluate");
         let tick = evaluator
-            .scheduler_tick(16.0)
+            .scheduler_tick(16.0, None, &[])
             .expect("animation scheduler should advance");
         assert!(
             tick.dirty_window_node_ids
@@ -6639,7 +6666,7 @@ COMPOSITOR.window.composition = (window) => {
         assert!(style.box_shadow[1].inset);
 
         evaluator
-            .scheduler_tick(16.0)
+            .scheduler_tick(16.0, None, &[])
             .expect("animation scheduler should advance");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 16, false)
@@ -6823,12 +6850,12 @@ COMPOSITOR.window.composition = () => (
         evaluator
             .invoke_handler(&window.id, &interest.true_handler, 1000)
             .expect("interest handler");
-        evaluator.scheduler_tick(1200.0).expect("tick");
+        evaluator.scheduler_tick(1200.0, None, &[]).expect("tick");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 1200, false)
             .expect("evaluate");
         assert!(!open_states(&cached).contains(&true), "opened before the delay");
-        evaluator.scheduler_tick(1300.0).expect("tick");
+        evaluator.scheduler_tick(1300.0, None, &[]).expect("tick");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 1300, false)
             .expect("evaluate");
@@ -6877,10 +6904,11 @@ COMPOSITOR.window.composition = () => (
         std::fs::write(
             &config_path,
             r##"
-import { Box, Button, ClientWindow, COMPOSITOR, createPoll, Label, Popup, useEffect, useState } from "shoji_wm";
+import { Box, Button, ClientWindow, COMPOSITOR, createPoll, Label, Popup, useEffect, useOutput, useState } from "shoji_wm";
 
 const useRestingHover = (hovered: boolean) => {
   const [rested, setRested] = useState(false);
+  const output = useOutput();
   useEffect(() => {
     if (!hovered) {
       setRested(false);
@@ -6889,7 +6917,7 @@ const useRestingHover = (hovered: boolean) => {
     const timer = createPoll(2000, (handle) => {
       handle.cancel();
       setRested(true);
-    });
+    }, { output });
     return () => timer.cancel();
   }, [hovered]);
   return rested;
@@ -6962,18 +6990,251 @@ COMPOSITOR.window.composition = () => (
         assert!(cached.next_poll_in_ms.is_some(), "the delay must wake the compositor");
 
         for now_ms in [1001, 1500, 2900] {
-            evaluator.scheduler_tick(now_ms as f64).expect("tick");
+            evaluator.scheduler_tick(now_ms as f64, None, &[]).expect("tick");
             let cached = evaluator
                 .evaluate_cached_window(&window.id, None, now_ms, false)
                 .expect("composition should evaluate");
             assert_ne!(opened_by(&cached), Some(true), "opened early at {now_ms} ms");
         }
 
-        evaluator.scheduler_tick(3000.0).expect("tick");
+        evaluator.scheduler_tick(3000.0, None, &[]).expect("tick");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 3000, false)
             .expect("rested composition should evaluate");
         assert_eq!(opened_by(&cached), Some(true));
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// A snapshot sync that only moves the window (no composition reads its
+    /// position) must not mark the whole runtime dirty: during a window
+    /// animation every full re-evaluation re-sends each moved snapshot, and
+    /// the fallback turned that into a per-frame full re-evaluation loop.
+    #[test]
+    fn embedded_runtime_snapshot_sync_does_not_mark_the_runtime_dirty() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-snapshot-sync-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import { Box, ClientWindow, COMPOSITOR, Label } from "shoji_wm";
+
+COMPOSITOR.window.composition = (window) => (
+  <Box direction="column">
+    <Label text={window.title} />
+    <ClientWindow />
+  </Box>
+);
+"##,
+        )
+        .expect("test config should be written");
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let mut window = make_window(false);
+        evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        evaluator
+            .scheduler_tick(1.0, None, &[])
+            .expect("tick clears the initial state");
+
+        for step in 1..=3 {
+            window.position.x += 40.0 * step as f64;
+            window.rect.x = window.position.x;
+            evaluator
+                .evaluate_cached_window(&window.id, Some(&window), 2 + step, true)
+                .expect("moved snapshot should evaluate");
+            let tick = evaluator
+                .scheduler_tick(2.0 + step as f64, None, &[])
+                .expect("tick");
+            assert!(
+                !tick.runtime_dirty,
+                "moving the window marked the runtime dirty at step {step}"
+            );
+        }
+
+        drop(evaluator);
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// Time is kept per output: a poll or animation bound to an output steps
+    /// only on that output's frame ticks, stamped with their presentation
+    /// time, and work bound to an output without frames falls back to the
+    /// wall-clock timer ticks.
+    #[test]
+    fn embedded_runtime_keeps_a_clock_per_output() {
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repository root should exist");
+        let test_dir = std::env::temp_dir().join(format!(
+            "shojiwm-deno-output-clock-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
+        let config_path = test_dir.join("config.tsx");
+        std::fs::write(
+            &config_path,
+            r##"
+import { animationVariable, Box, ClientWindow, COMPOSITOR, createPoll, Label, signal } from "shoji_wm";
+
+const runs = { a: signal("a"), b: signal("b") };
+for (const name of ["a", "b"] as const) {
+  createPoll(10, (handle) => {
+    runs[name].value = `${runs[name].peek()},${handle.nowMs}`;
+  }, { output: name.toUpperCase() });
+}
+
+const OPEN = animationVariable("open");
+COMPOSITOR.event.onOpen((window) => {
+  window.animation.start(OPEN, { duration: 100, from: 0, to: 1 });
+});
+
+COMPOSITOR.window.composition = (window) => (
+  <Box direction="column">
+    <Label text={runs.a} />
+    <Label text={runs.b} />
+    <Label text={window.animation.signal(OPEN)((t) => `t=${t}`)} />
+    <ClientWindow />
+  </Box>
+);
+"##,
+        )
+        .expect("test config should be written");
+
+        fn collect_labels(node: &shojiwm_lib::ssd::DecorationNode, out: &mut Vec<String>) {
+            if let DecorationNodeKind::Label(label) = &node.kind {
+                out.push(label.text.clone());
+            }
+            for child in &node.children {
+                collect_labels(child, out);
+            }
+        }
+        fn labels(cached: &DecorationCachedEvaluationResult) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(node) = cached.node.as_ref() {
+                collect_labels(node, &mut out);
+            }
+            for patch in &cached.node_patches {
+                if let Some(node) = patch.replacement_node() {
+                    collect_labels(node, &mut out);
+                }
+            }
+            out
+        }
+
+        // The schedule the runtime published since the last call, as the compositor
+        // would receive it.
+        fn published_schedule(
+            evaluator: &EmbeddedDecorationEvaluator,
+        ) -> Option<shojiwm_lib::runtime_api::RuntimeSchedule> {
+            evaluator.forward_published_state();
+            std::iter::from_fn(|| evaluator.host.pop())
+                .filter_map(|message| match message {
+                    HostMessage::Schedule(schedule) => Some(schedule),
+                    _ => None,
+                })
+                .last()
+        }
+
+        let evaluator = EmbeddedDecorationEvaluator::for_paths(
+            repository_root.join("tools/decoration-runtime.ts"),
+            &config_path,
+        )
+        .with_working_dir(&test_dir);
+        let mut window = make_window(false);
+        window.output_name = Some("A".into());
+        let both = ["A".to_owned(), "B".to_owned()];
+        let only_a = ["A".to_owned()];
+
+        // Before any tick reports frame outputs, everything runs on the wall
+        // clock; the polls were anchored at 0 when the config loaded.
+        evaluator
+            .evaluate_window(&window, 0)
+            .expect("initial composition should evaluate");
+        evaluator
+            .scheduler_tick(5.0, None, &both)
+            .expect("timer tick");
+        let schedule = published_schedule(&evaluator).expect("per-output schedule");
+        assert_eq!(
+            schedule.output_due_ms.get("A"),
+            Some(&0.0),
+            "the window animation runs on A"
+        );
+        assert_eq!(schedule.output_due_ms.get("B"), Some(&10.0));
+        assert_eq!(schedule.timer_due_ms, None);
+
+        // A's frames run A's poll and advance the window's animation; B's
+        // poll waits for B's frames.
+        evaluator
+            .scheduler_tick(12.5, Some("A"), &both)
+            .expect("frame tick A");
+        let texts = labels(
+            &evaluator
+                .evaluate_cached_window(&window.id, None, 6, false)
+                .expect("evaluate"),
+        );
+        assert!(texts.contains(&"a,12.5".to_owned()), "{texts:?}");
+        assert!(texts.contains(&"t=0.125".to_owned()), "{texts:?}");
+        assert!(!texts.iter().any(|text| text.starts_with("b,")), "{texts:?}");
+
+        // B's frame does not move A's clock: the animation stays put.
+        evaluator
+            .scheduler_tick(25.0, Some("B"), &both)
+            .expect("frame tick B");
+        let texts = labels(
+            &evaluator
+                .evaluate_cached_window(&window.id, None, 7, false)
+                .expect("evaluate"),
+        );
+        assert!(texts.contains(&"b,25".to_owned()), "{texts:?}");
+        assert!(!texts.iter().any(|text| text.starts_with("t=") && text != "t=0.125"), "{texts:?}");
+
+        // A frame due within the tolerance runs; a frame before it does not.
+        // (Due at 22.5.)
+        evaluator
+            .scheduler_tick(21.9, Some("A"), &both)
+            .expect("early frame tick A");
+        evaluator
+            .scheduler_tick(22.0, Some("A"), &both)
+            .expect("frame tick A within tolerance");
+        let texts = labels(
+            &evaluator
+                .evaluate_cached_window(&window.id, None, 8, false)
+                .expect("evaluate"),
+        );
+        assert!(texts.contains(&"a,12.5,22".to_owned()), "{texts:?}");
+
+        // Once B renders no frames its poll moves to the timer ticks.
+        let _ = published_schedule(&evaluator);
+        evaluator
+            .scheduler_tick(30.0, None, &only_a)
+            .expect("timer tick");
+        let schedule = published_schedule(&evaluator).expect("B left the frame outputs");
+        assert!(!schedule.output_due_ms.contains_key("B"), "{schedule:?}");
+        assert_eq!(schedule.timer_due_ms, Some(35.0));
+        evaluator
+            .scheduler_tick(36.0, None, &only_a)
+            .expect("timer tick");
+        let texts = labels(
+            &evaluator
+                .evaluate_cached_window(&window.id, None, 36, false)
+                .expect("evaluate"),
+        );
+        assert!(texts.contains(&"b,25,36".to_owned()), "{texts:?}");
 
         drop(evaluator);
         let _ = std::fs::remove_dir_all(&test_dir);
@@ -7058,7 +7319,7 @@ COMPOSITOR.effect.window = (window) => ({
             .effect_uniform_patch_count();
 
         evaluator
-            .scheduler_tick(16.0)
+            .scheduler_tick(16.0, None, &[])
             .expect("animation scheduler should advance");
         let cached = evaluator
             .evaluate_cached_window(&window.id, None, 16, false)

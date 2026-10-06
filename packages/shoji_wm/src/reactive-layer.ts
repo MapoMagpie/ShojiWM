@@ -1,4 +1,4 @@
-import { markLayerDirty } from "./runtime-hooks";
+import { markLayerDirty, withSnapshotSync } from "./runtime-hooks";
 import { signal, type Signal } from "./signals";
 import {
   createAnimationController,
@@ -97,34 +97,36 @@ export function createReactiveLayer(
   return {
     layer,
     update(nextSnapshot) {
-      signals.id.value = nextSnapshot.id;
-      signals.namespace.value = nextSnapshot.namespace;
-      signals.layer.value = nextSnapshot.layer;
-      signals.outputName.value = nextSnapshot.outputName;
-      signals.positionX.value = nextSnapshot.position.x;
-      signals.positionY.value = nextSnapshot.position.y;
-      signals.positionWidth.value = nextSnapshot.position.width;
-      signals.positionHeight.value = nextSnapshot.position.height;
-      // Object fields are deserialized as fresh references on every runtime
-      // turn. Avoid notifying dependents when only object identity changed,
-      // otherwise layer-effect refresh can mark the whole runtime dirty again
-      // and create a self-sustaining redraw loop.
-      if (!shallowEqual(signals.anchor.peek(), nextSnapshot.anchor)) {
-        signals.anchor.value = nextSnapshot.anchor;
-      }
-      if (
-        !shallowEqual(signals.exclusiveZone.peek(), nextSnapshot.exclusiveZone)
-      ) {
-        signals.exclusiveZone.value = nextSnapshot.exclusiveZone;
-      }
-      signals.exclusiveEdge.value = nextSnapshot.exclusiveEdge;
-      if (!shallowEqual(signals.margin.peek(), nextSnapshot.margin)) {
-        signals.margin.value = nextSnapshot.margin;
-      }
-      signals.keyboardInteractivity.value = nextSnapshot.keyboardInteractivity;
-      if (!shallowEqual(signals.desiredSize.peek(), nextSnapshot.desiredSize)) {
-        signals.desiredSize.value = nextSnapshot.desiredSize;
-      }
+      withSnapshotSync(() => {
+        signals.id.value = nextSnapshot.id;
+        signals.namespace.value = nextSnapshot.namespace;
+        signals.layer.value = nextSnapshot.layer;
+        signals.outputName.value = nextSnapshot.outputName;
+        signals.positionX.value = nextSnapshot.position.x;
+        signals.positionY.value = nextSnapshot.position.y;
+        signals.positionWidth.value = nextSnapshot.position.width;
+        signals.positionHeight.value = nextSnapshot.position.height;
+        // Object fields are deserialized as fresh references on every runtime
+        // turn. Avoid notifying dependents when only object identity changed,
+        // otherwise layer-effect refresh can mark the whole runtime dirty again
+        // and create a self-sustaining redraw loop.
+        if (!shallowEqual(signals.anchor.peek(), nextSnapshot.anchor)) {
+          signals.anchor.value = nextSnapshot.anchor;
+        }
+        if (
+          !shallowEqual(signals.exclusiveZone.peek(), nextSnapshot.exclusiveZone)
+        ) {
+          signals.exclusiveZone.value = nextSnapshot.exclusiveZone;
+        }
+        signals.exclusiveEdge.value = nextSnapshot.exclusiveEdge;
+        if (!shallowEqual(signals.margin.peek(), nextSnapshot.margin)) {
+          signals.margin.value = nextSnapshot.margin;
+        }
+        signals.keyboardInteractivity.value = nextSnapshot.keyboardInteractivity;
+        if (!shallowEqual(signals.desiredSize.peek(), nextSnapshot.desiredSize)) {
+          signals.desiredSize.value = nextSnapshot.desiredSize;
+        }
+      });
     },
   };
 }

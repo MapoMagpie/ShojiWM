@@ -4,6 +4,8 @@ import {
   type WindowAnimationController,
 } from "./animation";
 import { shallowEqual } from "./reconcile";
+import { createPoll } from "./scheduler";
+import { withSnapshotSync } from "./runtime-hooks";
 import { createWindowStateStore } from "./window-state";
 import type {
   WindowCompositionInteractionSnapshot,
@@ -40,6 +42,7 @@ interface MutableWindowSignals {
   icon: Signal<WindowIcon | undefined>;
   interaction: Signal<WindowCompositionInteractionSnapshot>;
   decoration: Signal<WindowDecorationState>;
+  output: Signal<string | undefined>;
   transformOriginX: Signal<number>;
   transformOriginY: Signal<number>;
   transformTranslateX: Signal<number>;
@@ -76,6 +79,7 @@ export function createReactiveWindow(
     icon: signal(snapshot.icon),
     interaction: signal(snapshot.interaction),
     decoration: signal(snapshot.decoration),
+    output: signal(snapshot.outputName),
     transformOriginX: signal(0.5),
     transformOriginY: signal(0.5),
     transformTranslateX: signal(0),
@@ -175,6 +179,13 @@ export function createReactiveWindow(
     icon: signals.icon,
     interaction: signals.interaction,
     decoration: signals.decoration,
+    output: signals.output,
+    createPoll(intervalMs, callback, options) {
+      return createPoll(intervalMs, callback, {
+        output: signals.output,
+        dirty: options?.dirty,
+      });
+    },
     get transform() {
       return transform;
     },
@@ -199,48 +210,51 @@ export function createReactiveWindow(
     window,
     transform,
     update(nextSnapshot) {
-      // Primitive fields: WritableSignal.set's built-in Object.is check
-      // already suppresses spurious notifies when the value is unchanged.
-      signals.id.value = nextSnapshot.id;
-      signals.title.value = nextSnapshot.title;
-      signals.appId.value = nextSnapshot.appId;
-      signals.positionX.value = nextSnapshot.position.x;
-      signals.positionY.value = nextSnapshot.position.y;
-      signals.positionWidth.value = nextSnapshot.position.width;
-      signals.positionHeight.value = nextSnapshot.position.height;
-      snapshotRect = nextSnapshot.rect ?? nextSnapshot.position;
-      signals.isFocused.value = nextSnapshot.isFocused;
-      signals.isFloating.value = nextSnapshot.isFloating;
-      signals.isMaximized.value = nextSnapshot.isMaximized;
-      signals.isFullscreen.value = nextSnapshot.isFullscreen;
-      signals.isXwayland.value = nextSnapshot.isXwayland;
-      signals.isResizable.value = nextSnapshot.isResizable;
-      signals.isTransient.value = nextSnapshot.isTransient;
-      signals.parentId.value = nextSnapshot.parentId;
-      // Object fields: every snapshot from Rust deserializes to a *new*
-      // object reference with identical content. A naive write would
-      // therefore fail Object.is on every turn, fire notify, and re-mark
-      // the window dirty — which becomes a self-sustaining
-      // evaluate→handle.update→notify→dirty cycle (~250ms scheduler-tick
-      // cadence) once anything bootstraps it. Compare structurally before
-      // writing so identity-but-not-equality "changes" are squashed.
-      if (
-        !shallowEqual(
-          signals.sizeConstraints.peek(),
-          nextSnapshot.sizeConstraints,
-        )
-      ) {
-        signals.sizeConstraints.value = nextSnapshot.sizeConstraints;
-      }
-      if (!shallowEqual(signals.icon.peek(), nextSnapshot.icon)) {
-        signals.icon.value = nextSnapshot.icon;
-      }
-      if (!shallowEqual(signals.interaction.peek(), nextSnapshot.interaction)) {
-        signals.interaction.value = nextSnapshot.interaction;
-      }
-      if (!shallowEqual(signals.decoration.peek(), nextSnapshot.decoration)) {
-        signals.decoration.value = nextSnapshot.decoration;
-      }
+      withSnapshotSync(() => {
+        // Primitive fields: WritableSignal.set's built-in Object.is check
+        // already suppresses spurious notifies when the value is unchanged.
+        signals.id.value = nextSnapshot.id;
+        signals.title.value = nextSnapshot.title;
+        signals.appId.value = nextSnapshot.appId;
+        signals.positionX.value = nextSnapshot.position.x;
+        signals.positionY.value = nextSnapshot.position.y;
+        signals.positionWidth.value = nextSnapshot.position.width;
+        signals.positionHeight.value = nextSnapshot.position.height;
+        snapshotRect = nextSnapshot.rect ?? nextSnapshot.position;
+        signals.isFocused.value = nextSnapshot.isFocused;
+        signals.isFloating.value = nextSnapshot.isFloating;
+        signals.isMaximized.value = nextSnapshot.isMaximized;
+        signals.isFullscreen.value = nextSnapshot.isFullscreen;
+        signals.isXwayland.value = nextSnapshot.isXwayland;
+        signals.isResizable.value = nextSnapshot.isResizable;
+        signals.isTransient.value = nextSnapshot.isTransient;
+        signals.parentId.value = nextSnapshot.parentId;
+        signals.output.value = nextSnapshot.outputName;
+        // Object fields: every snapshot from Rust deserializes to a *new*
+        // object reference with identical content. A naive write would
+        // therefore fail Object.is on every turn, fire notify, and re-mark
+        // the window dirty — which becomes a self-sustaining
+        // evaluate→handle.update→notify→dirty cycle (~250ms scheduler-tick
+        // cadence) once anything bootstraps it. Compare structurally before
+        // writing so identity-but-not-equality "changes" are squashed.
+        if (
+          !shallowEqual(
+            signals.sizeConstraints.peek(),
+            nextSnapshot.sizeConstraints,
+          )
+        ) {
+          signals.sizeConstraints.value = nextSnapshot.sizeConstraints;
+        }
+        if (!shallowEqual(signals.icon.peek(), nextSnapshot.icon)) {
+          signals.icon.value = nextSnapshot.icon;
+        }
+        if (!shallowEqual(signals.interaction.peek(), nextSnapshot.interaction)) {
+          signals.interaction.value = nextSnapshot.interaction;
+        }
+        if (!shallowEqual(signals.decoration.peek(), nextSnapshot.decoration)) {
+          signals.decoration.value = nextSnapshot.decoration;
+        }
+      });
     },
     updateManagedWindow(state: ManagedWindowState) {
       managedRect = state.rect;

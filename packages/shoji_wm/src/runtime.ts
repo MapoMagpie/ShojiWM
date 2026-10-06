@@ -18,6 +18,7 @@ interface ComponentInstanceState {
 
 interface RenderRootContext {
   rootId: string;
+  output: () => string | undefined;
   store: ComponentStateStore;
   seenInstances: Set<string>;
   pendingLayoutEffects: Array<() => void>;
@@ -94,12 +95,14 @@ export function withComponentRenderRoot<T>(
   rootId: string,
   store: ComponentStateStore,
   render: () => T,
+  output: () => string | undefined = () => undefined,
 ): T {
   const previousRoot = activeRenderRoot;
   const previousDepth = renderFrames.length;
   const rootInstanceId = `${rootId}/__root__`;
   activeRenderRoot = {
     rootId,
+    output,
     store,
     seenInstances: new Set([rootInstanceId]),
     pendingLayoutEffects: [],
@@ -342,6 +345,36 @@ export function useMemo<T>(
  * useEffect(() => { prevId.current = window.id; });
  * ```
  */
+/**
+ * The output the composition being rendered belongs to (its window's output),
+ * read when called — capture it during render for timers started later.
+ */
+export function renderRootOutput(): () => string | undefined {
+  return activeRenderRoot?.output ?? (() => undefined);
+}
+
+/**
+ * Hook: the output of the window this component renders for, as a
+ * `PollOutput` that follows the window across outputs. Pass it to
+ * `createPoll` for timers and animations inside a component.
+ *
+ * フック: このコンポーネントを描画しているウィンドウの出力を、ウィンドウの移動に
+ * 追従する `PollOutput` として返します。コンポーネント内のタイマーやアニメーションで
+ * `createPoll` に渡してください。
+ *
+ * @example
+ * ```tsx
+ * const output = useOutput();
+ * useEffect(() => {
+ *   const timer = createPoll(500, (handle) => { handle.cancel(); open(); }, { output });
+ *   return () => timer.cancel();
+ * }, []);
+ * ```
+ */
+export function useOutput(): () => string | undefined {
+  return renderRootOutput();
+}
+
 export function useRef<T>(initialValue: T): { current: T } {
   const { hooks, hookIndex } = currentHookSlotContext("useRef");
   const existing = hooks[hookIndex] as RefHookSlot<T> | undefined;

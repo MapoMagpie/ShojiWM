@@ -1008,6 +1008,7 @@ mod tests {
 
     fn window(id: &str, focused: bool) -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
+            output_name: None,
             id: id.into(),
             title: format!("window {id}"),
             app_id: Some("org.example.App".into()),

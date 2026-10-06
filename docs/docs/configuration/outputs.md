@@ -218,6 +218,83 @@ How the power state behaves:
   screencasts of that output fail until it is back on (the screencast portal
   retries).
 
+## Frame pacing (triple buffering)
+
+`COMPOSITOR.rendering.framePacing` chooses how frames are paced on each output.
+
+| Value | Behavior |
+| --- | --- |
+| `"throughput"` (default) | **Render-ahead / triple buffering.** While one frame waits for its vblank, the next one is already being rendered. |
+| `"low-latency"` | A frame is rendered only after the previous one is on screen. |
+
+```ts
+// Every output (this is also the default when nothing is set)
+COMPOSITOR.rendering.framePacing = "throughput";
+
+// Per output: a function of the output, re-evaluated as the signals it reads change
+COMPOSITOR.rendering.framePacing = (output) =>
+  output.name.startsWith("DP-") ? "low-latency" : "throughput";
+```
+
+### Why render ahead
+
+The kernel accepts one page flip per display at a time. With `"low-latency"`,
+a frame can only start rendering once the previous flip has completed, so its
+CPU **and** GPU work together must fit between that vblank and the driver's
+commit deadline shortly before the next one. That is roughly 5 ms of an 8.3 ms
+period at 120 Hz. A heavy frame (many windows, blur, shaders) that misses it
+shows up one refresh late, and the animation stutters.
+
+With `"throughput"`, the next frame starts as soon as the previous one has been
+submitted and is held until the flip completes. This has two effects:
+
+- **More time per frame.** A frame gets up to one extra refresh period.
+- **Overlapping work.** One frame's GPU work overlaps the next frame's CPU work,
+  so what has to fit in a period is the larger of the two rather than their sum.
+
+### The cost: one frame of latency, only while frames are continuous
+
+While frames are produced back to back (an animation, a drag, video), what you
+see is one refresh later than with `"low-latency"`. That is about 8 ms at
+120 Hz and about 17 ms at 60 Hz.
+
+A frame that follows an idle period is never ahead of anything, so isolated
+updates such as typing in a terminal are not delayed.
+
+The hardware cursor keeps its freshness in both modes. While the pointer is
+moving, a frame rendered ahead is still held until just before its vblank so
+the cursor plane can carry the latest position. In that case less is gained
+from rendering ahead.
+
+### When the compositor always uses low latency
+
+Whatever `framePacing` says, render-ahead is turned off for:
+
+- **Tearing.** A game asking for immediate flips wants its newest frame on screen now.
+- **Fullscreen fast path / direct scanout.** A game's own buffer would be held one frame longer.
+- **Cursor-only updates.** Moving the pointer over a still screen re-renders nothing.
+
+The environment variable `SHOJI_RENDER_AHEAD=0` turns render-ahead off
+everywhere (handy for comparing).
+
+The compositor logs `frame pacing changed` with the per-output result whenever
+the effective setting changes, for example after a hot reload.
+
+### Picking a mode
+
+```ts
+// Battery: prefer smoothness. AC: prefer latency.
+COMPOSITOR.rendering.framePacing = () =>
+  onBattery() ? "throughput" : "low-latency";
+```
+
+`onBattery` stands for any signal you maintain yourself (for example, from a
+`createPoll` that reads `/sys/class/power_supply`).
+
+Animations and polls run on each output's own frame clock in both modes. Their
+timing is the same whichever you pick; only the latency of what reaches the
+screen changes (see [Frame Timing & Polls](./timing.md)).
+
 ## Reading output state
 
 The controller is also a read-only view, useful inside event handlers and the

@@ -96,7 +96,7 @@ impl ConfigRuntime for TypeScriptRuntime {
     ) -> Result<RuntimeReply, RuntimeError> {
         let evaluator = &self.evaluator;
         let now = now_ms as u64;
-        Ok(match request {
+        let reply = match request {
             RuntimeRequest::Decoration(request) => match request {
                 DecorationRequest::Evaluate { window, preview } => {
                     let result = if preview {
@@ -130,9 +130,9 @@ impl ConfigRuntime for TypeScriptRuntime {
                     RuntimeReply::Done
                 }
             },
-            RuntimeRequest::SchedulerTick => {
-                RuntimeReply::SchedulerTick(evaluator.scheduler_tick(now_ms)?)
-            }
+            RuntimeRequest::SchedulerTick(tick) => RuntimeReply::SchedulerTick(
+                evaluator.scheduler_tick(now_ms, tick.output, tick.frame_outputs)?,
+            ),
             RuntimeRequest::Window(request) => match request {
                 WindowRequest::Resize { window_id, event } => {
                     RuntimeReply::WindowResize(evaluator.window_resize(window_id, event, now)?)
@@ -184,7 +184,9 @@ impl ConfigRuntime for TypeScriptRuntime {
             RuntimeRequest::Workspace(WorkspaceRequest::Activate(event)) => {
                 RuntimeReply::Handler(Box::new(evaluator.workspace_activate(event, now)?))
             }
-        })
+        };
+        evaluator.forward_published_state();
+        Ok(reply)
     }
 
     fn post(&mut self, now_ms: f64, event: RuntimeEvent) {
@@ -285,6 +287,7 @@ COMPOSITOR.window.composition = (window) => <Label text={{window.title}} />;
         assert_eq!(key_binding_ids(&host), Some(vec!["first".to_string()]));
 
         let window = shojiwm_lib::ssd::WaylandWindowSnapshot {
+            output_name: None,
             id: "w1".into(),
             title: "hello".into(),
             app_id: Some("test".into()),
@@ -331,6 +334,7 @@ COMPOSITOR.window.composition = (window) => <Label text={{window.title}} />;
         let mut runtime =
             RuntimeHandle::new("none", Box::new(NullRuntime), RuntimeHost::detached());
         let window = shojiwm_lib::ssd::WaylandWindowSnapshot {
+            output_name: None,
             id: "w1".into(),
             title: "hello".into(),
             app_id: None,

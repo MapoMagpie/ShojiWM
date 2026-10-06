@@ -36,11 +36,29 @@ use crate::{
 pub enum RuntimeRequest<'a> {
     Decoration(DecorationRequest<'a>),
     /// Advance timers and animations; answered with the frame's dirty set.
-    SchedulerTick,
+    SchedulerTick(SchedulerTickRequest<'a>),
     Window(WindowRequest<'a>),
     Input(InputRequest<'a>),
     Effect(EffectRequest<'a>),
     Workspace(WorkspaceRequest<'a>),
+}
+
+/// Which clock a scheduler tick advances.
+///
+/// Time in the runtime is kept per output: an output's clock is the
+/// presentation time of the frames it shows, so work bound to that output
+/// (polls, animations of the windows and layers on it) steps exactly once per
+/// frame and is stamped with the vblank that frame lands on. `output` names
+/// the output whose frame is about to be rendered; `None` is a wall-clock
+/// tick from a timer, which advances only the work bound to outputs that are
+/// not rendering frames (`frame_outputs` does not list them) — a powered-off
+/// or disconnected output, or every output under a backend without frame
+/// ticks.
+#[derive(Debug, Clone, Copy)]
+pub struct SchedulerTickRequest<'a> {
+    pub output: Option<&'a str>,
+    /// Outputs that render frames and therefore tick their own clock.
+    pub frame_outputs: &'a [String],
 }
 
 #[derive(Debug, Clone, Copy)]

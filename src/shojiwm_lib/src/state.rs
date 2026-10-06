@@ -395,12 +395,29 @@ pub struct ShojiWM {
     /// animations sample at it, so each frame shows exactly the progress of the moment it
     /// reaches the screen instead of the moment the render happened to start.
     pub animation_frame_time_ms: Option<f64>,
-    /// The presentation time a frame-driven scheduler tick already ran for, ahead of the
-    /// render that will show it (see the TTY backend's queue path).
-    pub runtime_scheduler_pretick_ms: Option<f64>,
+    /// Per output, the presentation time a frame-driven scheduler tick already ran for,
+    /// ahead of the render that will show it (see the TTY backend's queue path).
+    pub runtime_scheduler_pretick: HashMap<String, f64>,
     /// When a rendered frame last ticked the runtime scheduler. While frames keep doing
     /// that, the scheduler timers stand down (see `frame_driven_runtime_scheduler_active`).
     pub runtime_scheduler_last_frame_tick_at: Option<Instant>,
+    /// The runtime's per-output schedule (`HostMessage::Schedule`); `None` for a runtime
+    /// that keeps a single clock, which is ticked on every frame something is due.
+    pub runtime_schedule: Option<crate::runtime_api::RuntimeSchedule>,
+    /// Outputs the schedule timer already asked to render for their due work; cleared
+    /// when the output renders or a new schedule arrives (see `arm_runtime_schedule_timer`).
+    pub runtime_schedule_redraws_requested: std::collections::HashSet<String>,
+    pub runtime_schedule_timer_generation: u64,
+    /// When the schedule timer last ran a wall-clock tick (monotonic ms); see
+    /// `next_runtime_schedule_wake_ms`.
+    pub runtime_schedule_last_timer_tick_ms: Option<f64>,
+    /// Outputs to render on the next pass when no redraw of every output is pending
+    /// (`schedule_output_redraw`).
+    pub pending_output_redraws: std::collections::HashSet<String>,
+    /// A redraw of every output is pending (`schedule_redraw`).
+    pub redraw_all_outputs: bool,
+    /// Per-output frame pacing from the config (`COMPOSITOR.rendering.framePacing`).
+    pub frame_pacing: crate::frame_pacing::FramePacingConfig,
     pub runtime_animation_outputs: std::collections::HashSet<String>,
     pub runtime_output_globals: HashMap<String, GlobalId>,
     pub managed_window_animations: HashMap<String, BTreeMap<String, ActiveManagedWindowAnimation>>,
@@ -617,6 +634,10 @@ fn detected_subpixel(output: &Output) -> smithay::output::Subpixel {
             |detected| detected.0,
         )
 }
+
+/// A frame ticks the runtime for work due within this much past its presentation time;
+/// the TypeScript runtime uses the same tolerance.
+const FRAME_DUE_TOLERANCE_MS: f64 = 0.5;
 
 impl ShojiWM {
     fn output_auto_sort_key(output_name: &str) -> (i32, String) {
@@ -1712,8 +1733,15 @@ impl ShojiWM {
             runtime_scheduler_enabled: false,
             runtime_scheduler_next_due_ms: None,
             animation_frame_time_ms: None,
-            runtime_scheduler_pretick_ms: None,
+            runtime_scheduler_pretick: HashMap::new(),
             runtime_scheduler_last_frame_tick_at: None,
+            runtime_schedule: None,
+            runtime_schedule_redraws_requested: Default::default(),
+            runtime_schedule_timer_generation: 0,
+            runtime_schedule_last_timer_tick_ms: None,
+            pending_output_redraws: Default::default(),
+            redraw_all_outputs: false,
+            frame_pacing: Default::default(),
             runtime_scheduler_kick_generation: 0,
             runtime_scheduler_kick_active: false,
             runtime_scheduler_kick_interval_ms: None,
@@ -2447,22 +2475,158 @@ impl ShojiWM {
     /// rendered frame and stamped with the time the frame will be shown, gives each frame
     /// exactly the motion that belongs to it. The step's dirty windows are then picked up
     /// by the decoration refresh that follows in the same render.
-    pub(crate) fn tick_runtime_scheduler_for_frame(&mut self, frame_time_ms: f64) -> bool {
-        // Only for a poll the scheduler reported as due by this frame. Evaluations also
-        // switch `runtime_scheduler_enabled` on (a window with a running animation reports
-        // "next poll: now") without registering any poll; ticking for those put a runtime
-        // turn in every animated frame, and each turn handed back every window whose
-        // position signals the animation had moved — as full re-evaluations. Window
-        // animations already re-evaluate what they need in the decoration refresh.
-        let due = self
-            .runtime_scheduler_next_due_ms
-            .is_some_and(|due_ms| due_ms <= frame_time_ms + 0.5);
-        if !self.runtime_scheduler_enabled || !due {
-            return false;
+    pub(crate) fn tick_runtime_scheduler_for_frame(
+        &mut self,
+        output_name: &str,
+        frame_time_ms: f64,
+    ) -> bool {
+        let due = match &self.runtime_schedule {
+            // A runtime with a clock per output: tick when work bound to this output
+            // comes due by this frame. Frames of other outputs leave its clock alone.
+            Some(schedule) => schedule
+                .output_due_ms
+                .get(output_name)
+                .is_some_and(|due_ms| *due_ms <= frame_time_ms + FRAME_DUE_TOLERANCE_MS),
+            // Only for a poll the scheduler reported as due by this frame. Evaluations also
+            // switch `runtime_scheduler_enabled` on (a window with a running animation
+            // reports "next poll: now") without registering any poll; ticking for those put
+            // a runtime turn in every animated frame, and each turn handed back every window
+            // whose position signals the animation had moved — as full re-evaluations.
+            // Window animations already re-evaluate what they need in the decoration
+            // refresh.
+            None => {
+                self.runtime_scheduler_enabled
+                    && self
+                        .runtime_scheduler_next_due_ms
+                        .is_some_and(|due_ms| due_ms <= frame_time_ms + FRAME_DUE_TOLERANCE_MS)
+            }
+        };
+        // This frame answers any redraw the schedule timer asked of the output. Ask for
+        // the next one once this frame's tick is done: work that stays due (an animation)
+        // or comes due later still needs frames even when nothing it touched is visible.
+        self.runtime_schedule_redraws_requested.remove(output_name);
+        if due {
+            self.runtime_scheduler_last_frame_tick_at = Some(Instant::now());
+            let _ = self.tick_runtime_scheduler_at(
+                self.runtime_schedule.is_some(),
+                Some((output_name, frame_time_ms)),
+            );
         }
-        self.runtime_scheduler_last_frame_tick_at = Some(Instant::now());
-        let _ = self.tick_runtime_scheduler_at(false, Some(frame_time_ms));
-        true
+        if self.runtime_schedule.is_some() {
+            self.arm_runtime_schedule_timer();
+        }
+        due
+    }
+
+    /// Outputs that render frames and therefore tick their own runtime clock.
+    pub(crate) fn runtime_frame_outputs(&self) -> Vec<String> {
+        crate::backend::tty::frame_tick_outputs(self)
+    }
+
+    pub(crate) fn apply_runtime_schedule(&mut self, schedule: crate::runtime_api::RuntimeSchedule) {
+        self.runtime_schedule = Some(schedule);
+        self.runtime_schedule_redraws_requested.clear();
+        self.arm_runtime_schedule_timer();
+    }
+
+    /// Arm the timer that turns the runtime's schedule into work: a redraw of an output
+    /// one refresh period before work bound to it comes due (its frame then ticks the
+    /// runtime at the frame's presentation time), and a wall-clock tick for work bound
+    /// to no rendering output.
+    pub(crate) fn arm_runtime_schedule_timer(&mut self) {
+        let Some(wake_at_ms) = self.next_runtime_schedule_wake_ms() else {
+            return;
+        };
+        self.runtime_schedule_timer_generation =
+            self.runtime_schedule_timer_generation.wrapping_add(1);
+        let generation = self.runtime_schedule_timer_generation;
+        let now_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
+        let delay = Duration::from_secs_f64((wake_at_ms - now_ms).max(0.0) / 1000.0);
+        let result = self
+            .loop_handle
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                state.record_event_source_wake("runtime-schedule");
+                if state.runtime_schedule_timer_generation == generation {
+                    state.run_runtime_schedule();
+                }
+                TimeoutAction::Drop
+            });
+        if let Err(error) = result {
+            debug!(?error, "failed to arm the runtime schedule timer");
+        }
+    }
+
+    fn next_runtime_schedule_wake_ms(&self) -> Option<f64> {
+        let schedule = self.runtime_schedule.as_ref()?;
+        let frame_outputs = self.runtime_frame_outputs();
+        let output_wakes = schedule
+            .output_due_ms
+            .iter()
+            .filter(|(name, _)| {
+                frame_outputs.contains(name)
+                    && !self.runtime_schedule_redraws_requested.contains(*name)
+            })
+            .map(|(name, due_ms)| due_ms - self.output_frame_period_ms(name));
+        // Work with no frames to pace it (an animation of an output that renders none)
+        // stays due on every tick; one tick per refresh period is as often as anything
+        // could show it, and more would only spin the loop.
+        let timer_wake = schedule.timer_due_ms.map(|due_ms| {
+            self.runtime_schedule_last_timer_tick_ms.map_or(due_ms, |last_ms| {
+                due_ms.max(last_ms + self.runtime_frame_sync_interval_ms() as f64)
+            })
+        });
+        output_wakes.chain(timer_wake).min_by(f64::total_cmp)
+    }
+
+    fn output_frame_period_ms(&self, output_name: &str) -> f64 {
+        self.space
+            .outputs()
+            .find(|output| output.name() == output_name)
+            .and_then(|output| output.current_mode())
+            .filter(|mode| mode.refresh > 0)
+            .map_or(16.0, |mode| 1_000_000.0 / mode.refresh as f64)
+    }
+
+    fn run_runtime_schedule(&mut self) {
+        let Some(schedule) = self.runtime_schedule.clone() else {
+            return;
+        };
+        let now_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0;
+        for name in self.runtime_frame_outputs() {
+            if self.runtime_schedule_redraws_requested.contains(&name) {
+                continue;
+            }
+            if let Some(due_ms) = schedule.output_due_ms.get(&name)
+                && *due_ms - self.output_frame_period_ms(&name) <= now_ms + FRAME_DUE_TOLERANCE_MS
+            {
+                self.runtime_schedule_redraws_requested.insert(name.clone());
+                self.schedule_output_redraw(&name);
+            }
+        }
+        let timer_paced = self
+            .runtime_schedule_last_timer_tick_ms
+            .is_none_or(|last_ms| {
+                now_ms + FRAME_DUE_TOLERANCE_MS
+                    >= last_ms + self.runtime_frame_sync_interval_ms() as f64
+            });
+        if timer_paced
+            && schedule
+                .timer_due_ms
+                .is_some_and(|due_ms| due_ms <= now_ms + FRAME_DUE_TOLERANCE_MS)
+        {
+            self.runtime_schedule_last_timer_tick_ms = Some(now_ms);
+            // May publish a fresh schedule, which re-arms the timer. The runtime
+            // applies the same tolerance to timer ticks; work that stays due is
+            // paced to one tick per refresh period (`next_runtime_schedule_wake_ms`).
+            let _ = self.tick_runtime_scheduler_with(true);
+        }
+        self.arm_runtime_schedule_timer();
+    }
+
+    /// Render `output_name` on the next pass, without redrawing the others.
+    pub fn schedule_output_redraw(&mut self, output_name: &str) {
+        self.pending_output_redraws.insert(output_name.to_owned());
+        self.needs_redraw = true;
     }
 
     /// Whether rendered frames are currently ticking the runtime scheduler, in which case
@@ -2479,7 +2643,10 @@ impl ShojiWM {
         self.tick_runtime_scheduler_at(force, None)
     }
 
-    fn tick_runtime_scheduler_at(&mut self, force: bool, frame_time_ms: Option<f64>) -> u64 {
+    /// `frame`: the output and presentation time of the frame this tick is for;
+    /// `None` for a wall-clock timer tick.
+    fn tick_runtime_scheduler_at(&mut self, force: bool, frame: Option<(&str, f64)>) -> u64 {
+        let frame_time_ms = frame.map(|(_, time)| time);
         self.sync_keyboard_layout();
         self.refresh_runtime_processes();
         let managed_window_animation_active = !self.managed_window_animations.is_empty();
@@ -2504,7 +2671,14 @@ impl ShojiWM {
         let now_ms = frame_time_ms
             .unwrap_or_else(|| Duration::from(self.clock.now()).as_secs_f64() * 1000.0);
         self.sync_runtime_display_state();
-        let tick = match self.config_runtime.scheduler_tick(now_ms) {
+        let frame_outputs = self.runtime_frame_outputs();
+        let tick = match self.config_runtime.scheduler_tick_with(
+            now_ms,
+            crate::runtime_api::SchedulerTickRequest {
+                output: frame.map(|(output, _)| output),
+                frame_outputs: &frame_outputs,
+            },
+        ) {
             Ok(tick) => tick,
             Err(error) => {
                 debug!(?error, "failed to tick decoration runtime scheduler");
@@ -2515,6 +2689,17 @@ impl ShojiWM {
                 return 250;
             }
         };
+        // What made the tick dirty (motion trace only).
+        let dirty_summary = Self::motion_trace_enabled().then(|| {
+            (
+                tick.runtime_dirty,
+                tick.dirty_window_ids.len(),
+                tick.dirty_managed_window_ids.len(),
+                tick.dirty_window_node_ids.len(),
+                tick.dirty_layer_ids.len(),
+                tick.actions.len(),
+            )
+        });
         if tick.dirty {
             if runtime_dirty_debug_enabled() {
                 info!(
@@ -2566,6 +2751,9 @@ impl ShojiWM {
                 wall_ms = Duration::from(self.clock.now()).as_secs_f64() * 1000.0,
                 dirty = tick.dirty,
                 next_poll_in_ms = ?tick.next_poll_in_ms,
+                output = ?frame.map(|(output, _)| output),
+                // (runtime_dirty, windows, managed-only, node-only, layers, actions)
+                dirty_summary = ?dirty_summary,
                 "motion trace: scheduler tick"
             );
         }
@@ -2718,6 +2906,13 @@ impl ShojiWM {
                     self.handle_runtime_pointer_move_async_invocation(invocation, &loop_handle);
                 }
                 HostMessage::ReloadReady(result) => reload_ready = Some(result),
+                HostMessage::Schedule(schedule) => self.apply_runtime_schedule(schedule),
+                HostMessage::FramePacing(config) => {
+                    if config != self.frame_pacing {
+                        info!(outputs = ?config.outputs, "frame pacing changed");
+                    }
+                    self.frame_pacing = config;
+                }
             }
         }
         // Swap at a quiet point of the loop rather than wherever the queue
@@ -2785,6 +2980,7 @@ impl ShojiWM {
 
     pub fn warmup_decoration_runtime(&mut self) {
         let snapshot = WaylandWindowSnapshot {
+            output_name: None,
             id: "__warmup__".into(),
             title: "warmup".into(),
             app_id: Some("shoji_wm.warmup".into()),
@@ -4647,6 +4843,7 @@ impl ShojiWM {
             );
         }
         self.needs_redraw = true;
+        self.redraw_all_outputs = true;
         // Intentionally no `loop_signal.wakeup()` — this mirrors niri's `queue_redraw`
         // (a pure state transition). All callers run inside event-loop dispatch
         // callbacks (Wayland commits, input, DRM VBlank/timer, XWayland), so dispatch

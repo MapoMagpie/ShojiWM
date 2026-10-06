@@ -22,10 +22,10 @@ mod message;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub use handle::RuntimeHandle;
-pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost};
+pub use host::{HostMessage, RuntimeConfigDelta, RuntimeHost, RuntimeSchedule};
 pub use message::{
     CompositionPatch, DecorationRequest, OVERLAY_STAGE_INDEX, PAINT_STAGE_INDEX, SHADER_INPUT_STAGE_INDEX, EffectRequest, InputRequest, RuntimeEvent, RuntimeReply, RuntimeRequest,
-    WindowRequest, WorkspaceRequest,
+    SchedulerTickRequest, WindowRequest, WorkspaceRequest,
 };
 
 /// Error type shared by every runtime.

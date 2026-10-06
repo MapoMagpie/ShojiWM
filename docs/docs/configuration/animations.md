@@ -247,3 +247,7 @@ long enough to play the animation before destroying it.
 
 They can be combined: drive the window's entrance with `scheduleAnimation` while
 a focus glow on the border is driven by a signal variable.
+
+Signal-driven animations advance on the clock of the window's output, once per
+frame of that output. For your own per-frame or timed work, see
+[Frame Timing & Polls](./timing.md).

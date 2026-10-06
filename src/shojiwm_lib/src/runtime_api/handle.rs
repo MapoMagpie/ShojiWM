@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use super::{
     ConfigRuntime, DecorationRequest, EffectRequest, InputRequest, NullRuntime, ReloadPreparation,
-    RuntimeError, RuntimeEvent, RuntimeHost, RuntimeReply, RuntimeRequest, WindowRequest,
+    RuntimeError, RuntimeEvent, RuntimeHost, RuntimeReply, RuntimeRequest, SchedulerTickRequest,
+    WindowRequest,
     WorkspaceRequest,
 };
 use crate::{
@@ -215,8 +216,24 @@ impl RuntimeHandle {
         }
     }
 
+    /// A wall-clock timer tick with no output rendering frames: everything
+    /// in the runtime advances to `now_ms`.
     pub fn scheduler_tick(&mut self, now_ms: f64) -> Result<DecorationSchedulerTick, RuntimeError> {
-        match self.request(now_ms, RuntimeRequest::SchedulerTick)? {
+        self.scheduler_tick_with(
+            now_ms,
+            SchedulerTickRequest {
+                output: None,
+                frame_outputs: &[],
+            },
+        )
+    }
+
+    pub fn scheduler_tick_with(
+        &mut self,
+        now_ms: f64,
+        tick: SchedulerTickRequest<'_>,
+    ) -> Result<DecorationSchedulerTick, RuntimeError> {
+        match self.request(now_ms, RuntimeRequest::SchedulerTick(tick))? {
             RuntimeReply::SchedulerTick(tick) => Ok(tick),
             RuntimeReply::Unhandled | RuntimeReply::Done => Ok(DecorationSchedulerTick::default()),
             other => Err(mismatch("scheduler tick", &other)),

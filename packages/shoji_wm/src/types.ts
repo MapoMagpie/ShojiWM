@@ -16,6 +16,8 @@ export interface WaylandWindowSnapshot {
   readonly parentId?: string;
   readonly icon?: WindowIcon;
   readonly interaction: WindowCompositionInteractionSnapshot;
+  /** Output whose frames drive this window's runtime work. / このウィンドウのランタイム処理を駆動する出力。 */
+  readonly outputName?: string;
 }
 
 export type WindowDecorationMode = "client" | "server";
@@ -213,6 +215,31 @@ export interface WaylandWindow {
   readonly icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   /** Current pointer/drag interaction state for use in composition code. / 合成コードで使用するポインター・ドラッグの現在のインタラクション状態。 */
   readonly interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
+  /**
+   * The output this window belongs to: the one containing its center, else
+   * the one it overlaps, else the nearest. Its frames drive the window's
+   * animations and polls. `undefined` only while no output exists.
+   *
+   * このウィンドウが属する出力（中心を含む出力、なければ重なる出力、なければ最寄りの
+   * 出力）。この出力のフレームがウィンドウのアニメーションと poll を駆動します。
+   * 出力が 1 つも無い間だけ `undefined`。
+   */
+  readonly output: import("./signals").ReadonlySignal<string | undefined>;
+  /**
+   * `createPoll` bound to this window's output; follows the window when it
+   * moves to another output.
+   * このウィンドウの出力に結び付いた `createPoll`。ウィンドウが別の出力へ移ると追従します。
+   *
+   * @example
+   * ```ts
+   * window.createPoll(16, (handle) => step(handle.nowMs));
+   * ```
+   */
+  createPoll(
+    intervalMs: number,
+    callback: import("./scheduler").PollCallback,
+    options?: { dirty?: import("./scheduler").PollDirtyMode },
+  ): import("./scheduler").PollHandle;
   /** Ask the client to close the window. / クライアントにウィンドウを閉じるよう要求します。 */
   close(): void;
   /** Ask the client to maximize. / クライアントに最大化を要求します。 */
@@ -1085,7 +1112,47 @@ export interface CompositorRenderingConfig {
    * 一度だけ解決）。デフォルトのままにするなら `null` を返します。
    */
   surfacePolicy?: (surface: SurfacePolicyTarget) => SurfacePolicy | null;
+  /**
+   * How frames are paced, for every output or per output (a function of the
+   * output, re-evaluated as signals it reads change).
+   *
+   * - `"throughput"` (default): render the next frame while the previous one
+   *   waits for its vblank (render-ahead / triple buffering). A frame gets up
+   *   to one extra refresh period, so heavy frames stop missing vblanks, at
+   *   the cost of one frame of latency while frames are continuous. Isolated
+   *   updates (typing) are not delayed.
+   * - `"low-latency"`: render each frame only once the previous one is on
+   *   screen.
+   *
+   * The compositor always uses low latency for tearing and fullscreen
+   * (direct scanout) windows, whatever this says. Animations and polls step
+   * on each output's own frame clock either way, so their timing does not
+   * change with this setting.
+   *
+   * フレームの出し方。全出力共通、または出力ごと（出力を受け取る関数。読んだ signal の
+   * 変化で再評価）に指定します。
+   *
+   * - `"throughput"`（既定）: 前のフレームが vblank を待っている間に次のフレームを描画
+   *   します（先行描画／トリプルバッファ）。1 フレームに最大 1 リフレッシュ分の余裕が
+   *   増え重いフレームでも vblank を逃しにくくなる代わりに、連続描画中は 1 フレーム遅延が
+   *   増えます。単発の更新（タイピングなど）は遅れません。
+   * - `"low-latency"`: 前のフレームが表示されてから次を描画します。
+   *
+   * テアリング中とフルスクリーン（ダイレクトスキャンアウト）のウィンドウでは、設定に
+   * 関係なく常に低遅延になります。アニメーションと poll はどちらでも出力ごとのフレーム
+   * 時計で進むため、この設定でタイミングは変わりません。
+   *
+   * @example Low latency on AC power only / AC 電源のときだけ低遅延
+   * ```ts
+   * COMPOSITOR.rendering.framePacing = () =>
+   *   onBattery() ? "throughput" : "low-latency";
+   * ```
+   */
+  framePacing?: FramePacing | ((output: OutputInfo) => FramePacing);
 }
+
+/** Frame pacing of an output; see `COMPOSITOR.rendering.framePacing`. / 出力のフレームの出し方。 */
+export type FramePacing = "throughput" | "low-latency";
 
 export interface OutputMode {
   width: number;
@@ -2799,6 +2866,7 @@ export interface ReactiveWaylandWindowSignals {
   parentId: import("./signals").ReadonlySignal<string | undefined>;
   icon: import("./signals").ReadonlySignal<WindowIcon | undefined>;
   interaction: import("./signals").ReadonlySignal<WindowCompositionInteractionSnapshot>;
+  output: import("./signals").ReadonlySignal<string | undefined>;
   transformOriginX: import("./signals").Signal<number>;
   transformOriginY: import("./signals").Signal<number>;
   transformTranslateX: import("./signals").Signal<number>;

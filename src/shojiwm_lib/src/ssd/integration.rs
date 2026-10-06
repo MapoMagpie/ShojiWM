@@ -7886,7 +7886,12 @@ fn window_snapshot_requires_runtime_refresh(
     previous: &WaylandWindowSnapshot,
     next: &WaylandWindowSnapshot,
 ) -> bool {
-    previous.is_focused != next.is_focused || previous.interaction != next.interaction
+    previous.is_focused != next.is_focused
+        || previous.interaction != next.interaction
+        // The runtime steps the window's animations and polls on this output's frames;
+        // a stale value (the first snapshot is taken before the window is mapped, with no
+        // output) would leave them on wall-clock timer ticks.
+        || previous.output_name != next.output_name
 }
 
 fn push_damage_pair(

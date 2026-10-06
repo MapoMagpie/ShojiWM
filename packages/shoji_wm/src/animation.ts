@@ -115,6 +115,19 @@ export type WindowAnimationController = AnimationController;
 interface AnimationEntry {
   progress: Signal<number>;
   timeline?: AnimationTimeline;
+  /** The output whose clock drives this entry; see {@link AnimationClock}. */
+  output?: () => string | undefined;
+}
+
+/**
+ * Where animations take their time from. Time is kept per output (the
+ * presentation time of the frames it shows), so an animation owned by a
+ * window or layer starts on, and advances with, the clock of the output it is
+ * on. Entries without an owner use the shared clock.
+ */
+export interface AnimationClock {
+  /** The time an animation starting now on `output` is anchored at. */
+  startTimeMs(output: string | undefined): number;
 }
 
 interface AnimationTimeline {
@@ -129,6 +142,17 @@ interface AnimationTimeline {
 const linear = (value: number) => value;
 const activeAnimationEntries = new Set<AnimationEntry>();
 let currentAnimationFrameMs = 0;
+let animationClock: AnimationClock | null = null;
+
+export function installAnimationClock(clock: AnimationClock | null): void {
+  animationClock = clock;
+}
+
+function animationStartTimeMs(entry: AnimationEntry): number {
+  return animationClock
+    ? animationClock.startTimeMs(entry.output?.())
+    : currentAnimationFrameMs;
+}
 const animationSnapEpsilon = 1e-4;
 
 /**
@@ -177,12 +201,13 @@ export function createAnimationController(markDirty: () => void): AnimationContr
 export function createAnimationControllerWithStore(
   markDirty: () => void,
   entries: Map<symbol, AnimationEntry>,
+  output?: () => string | undefined,
 ): AnimationController {
 
   const ensureEntry = (variable: AnimationVariable): AnimationEntry => {
     let entry = entries.get(variable.id);
     if (!entry) {
-      entry = { progress: signal(0) };
+      entry = { progress: signal(0), output };
       entries.set(variable.id, entry);
     }
     return entry;
@@ -223,7 +248,7 @@ export function createAnimationControllerWithStore(
 
       entry.progress.value = from;
       entry.timeline = {
-        startedAtMs: currentAnimationFrameMs,
+        startedAtMs: animationStartTimeMs(entry),
         durationMs: duration,
         from,
         to,
@@ -267,17 +292,38 @@ export function createWindowAnimationController(windowId: string): WindowAnimati
 export function createWindowAnimationControllerWithStore(
   windowId: string,
   entries: Map<symbol, AnimationEntry>,
+  output?: () => string | undefined,
 ): WindowAnimationController {
-  return createAnimationControllerWithStore(() => markWindowDirty(windowId), entries);
+  return createAnimationControllerWithStore(
+    () => markWindowDirty(windowId),
+    entries,
+    output,
+  );
 }
 
+/** Advance every running animation to `nowMs`. */
 export function advanceAnimationFrame(nowMs: number): boolean {
-  currentAnimationFrameMs = nowMs;
+  return advanceAnimations(nowMs, () => true);
+}
+
+/**
+ * Advance the running animations whose output `select` accepts (`undefined`
+ * for animations without an owner) to `nowMs`; returns whether any animation
+ * is still running afterwards.
+ */
+export function advanceAnimations(
+  nowMs: number,
+  select: (output: string | undefined) => boolean,
+): boolean {
+  currentAnimationFrameMs = Math.max(currentAnimationFrameMs, nowMs);
   if (activeAnimationEntries.size === 0) {
     return false;
   }
 
   for (const entry of Array.from(activeAnimationEntries)) {
+    if (!select(entry.output?.())) {
+      continue;
+    }
     const timeline = entry.timeline;
     if (!timeline) {
       activeAnimationEntries.delete(entry);
@@ -313,6 +359,18 @@ export function advanceAnimationFrame(nowMs: number): boolean {
 
 export function hasActiveAnimations(): boolean {
   return activeAnimationEntries.size > 0;
+}
+
+/**
+ * The outputs running animations are bound to; `undefined` stands for
+ * animations without an owner.
+ */
+export function activeAnimationOutputs(): Set<string | undefined> {
+  const outputs = new Set<string | undefined>();
+  for (const entry of activeAnimationEntries) {
+    outputs.add(entry.output?.());
+  }
+  return outputs;
 }
 
 /**

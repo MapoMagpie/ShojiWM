@@ -1048,6 +1048,8 @@ struct DeferredSubmit {
     total_cpu_elapsed: Duration,
     /// Monotonic time the render began (`SHOJI_LATENCY_TRACE` only).
     latency_render_started_at: Option<Duration>,
+    /// The vblank the frame was rendered for.
+    frame_target: Duration,
 }
 
 struct SurfaceData {
@@ -1149,6 +1151,23 @@ struct SurfaceData {
     /// cursor fast path patches the staged frame instead of committing.
     deferred_submit: Option<DeferredSubmit>,
     deferred_submit_generation: u64,
+    /// A frame rendered ahead (see [`render_ahead_allowed`]): rendered while the previous
+    /// frame's flip was still in flight and staged inside the `DrmCompositor` as
+    /// `next_frame`, it is submitted by `frame_finish` once that flip completes.
+    ahead_submit: Option<DeferredSubmit>,
+    /// The client buffers the ahead frame read; they become `held_client_buffers` when it
+    /// is submitted.
+    ahead_held_client_buffers: Vec<smithay::backend::renderer::utils::Buffer>,
+    /// An ahead render already ran for the flip in flight (it may have had no damage);
+    /// another one waits for the flip, so a burst of redraw requests does not re-render.
+    ahead_attempted: bool,
+    /// The vblank the newest submitted (or held) frame was rendered for; an ahead frame
+    /// targets the vblank after it. `None` while what is in flight is not a rendered
+    /// frame (a cursor-only commit) or nothing is.
+    in_flight_frame_target: Option<Duration>,
+    /// Whether the last render used the fullscreen fast path (a fullscreen window scanned
+    /// out or composited alone); render-ahead stays off for it.
+    fullscreen_fast_path_active: bool,
     /// DPMS off (see `crate::output_power`): nothing renders or commits on this surface.
     powered_off: bool,
     /// Whether the CRTC of a powered-off surface has been disabled yet. A flip that was in
@@ -1314,9 +1333,68 @@ fn report_tty_config_error(state: &mut ShojiWM, error: impl ToString) {
     }
 }
 
+/// `SHOJI_RENDER_AHEAD=0` turns render-ahead off everywhere (measurement and fallback).
+fn render_ahead_env_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("SHOJI_RENDER_AHEAD").is_none_or(|value| value != "0")
+    })
+}
+
+/// Whether the next frame of `surface` may be rendered now, while the previous one's
+/// flip is still in flight (render-ahead, a.k.a. triple buffering).
+///
+/// The kernel takes one flip per CRTC at a time, so a frame normally waits for the
+/// previous flip before it can even start rendering: CPU and GPU work together must fit
+/// between that vblank event and the driver's commit cutoff before the next vblank.
+/// Rendering ahead starts the frame as soon as the previous one is submitted and stages
+/// it until the flip completes (`frame_finish` submits it), which gives the frame up to
+/// a whole extra refresh period and lets one frame's GPU work overlap the next frame's
+/// CPU work, at the cost of one frame of latency while frames are continuous. A frame
+/// after an idle period is never ahead of anything, so sporadic updates (typing) keep
+/// their latency.
+///
+/// Always off for the tearing and fullscreen fast paths (a game wants its newest frame
+/// on screen now, and a scanned-out client buffer would be held for an extra frame),
+/// and per output when the config asks for low latency (`COMPOSITOR.rendering.framePacing`).
+fn render_ahead_allowed(surface: &SurfaceData, policy_allows: bool) -> bool {
+    policy_allows
+        && render_ahead_env_enabled()
+        && !surface.powered_off
+        && !surface.tearing_active
+        && !surface.fullscreen_fast_path_active
+        // A flip of a rendered frame is in flight (not a held frame or a cursor-only
+        // commit), and nothing is staged on top of it yet.
+        && surface.frame_pending
+        && surface.in_flight_frame_target.is_some()
+        && surface.deferred_submit.is_none()
+        && surface.ahead_submit.is_none()
+        && !surface.ahead_attempted
+}
+
+fn drop_ahead_frame(surface: &mut SurfaceData) {
+    surface.ahead_submit = None;
+    surface.ahead_held_client_buffers.clear();
+    surface.ahead_attempted = false;
+}
+
+/// The vblank the next render of `surface` is for: the one after the frame in flight
+/// when rendering ahead, otherwise the one predicted at the last flip.
+fn upcoming_frame_target(surface: &SurfaceData) -> Option<Duration> {
+    if surface.frame_pending && surface.redraw_state == TtyRedrawState::Queued {
+        surface
+            .in_flight_frame_target
+            .map(|target| target + surface.frame_duration)
+    } else {
+        surface.next_frame_target
+    }
+}
+
 fn reset_surface_after_tty_pause(surface: &mut SurfaceData) {
     surface.deferred_submit = None;
     surface.deferred_submit_generation = surface.deferred_submit_generation.wrapping_add(1);
+    drop_ahead_frame(surface);
+    surface.in_flight_frame_target = None;
     surface.frame_pending = false;
     // DRM access is gone, so no flip will release these: drop them now.
     surface.held_client_buffers.clear();
@@ -1376,6 +1454,7 @@ pub fn sync_output_power(state: &mut ShojiWM) {
 }
 
 fn power_off_surface(surface: &mut SurfaceData, session_active: bool) {
+    drop_ahead_frame(surface);
     if surface.deferred_submit.take().is_some() {
         // Staged for a deadline commit but never committed: nothing is in flight.
         surface.deferred_submit_generation = surface.deferred_submit_generation.wrapping_add(1);
@@ -2245,6 +2324,17 @@ fn frame_finish(
         TtyRedrawState::WaitingForVBlank { redraw_needed } => redraw_needed,
         _ => false,
     };
+    // The flip is done, so the next one may get a frame rendered ahead of it.
+    surface.ahead_attempted = false;
+    if let Some(ahead) = surface.ahead_submit.take() {
+        // A frame was rendered ahead while this flip was in flight; it goes next. It
+        // carries the cursor, so a pending fast-path move is superseded.
+        surface.held_client_buffers = std::mem::take(&mut surface.ahead_held_client_buffers);
+        surface.cursor_move_pending = false;
+        submit_ahead_frame(state, loop_handle, node, crtc, ahead, redraw_needed);
+        return;
+    }
+    surface.in_flight_frame_target = None;
     // A cursor fast-path move that hit `CursorMoveOutcome::Busy` waited for
     // this vblank; retry it below once the surface borrow ends. A full redraw
     // supersedes it — the render carries the cursor position anyway.
@@ -2428,6 +2518,7 @@ fn submit_deferred_frame(
     node: DrmNode,
     crtc: crtc::Handle,
     generation: u64,
+    deadline_scheduled: bool,
 ) {
     {
         let Some(surface) = state
@@ -2466,10 +2557,12 @@ fn submit_deferred_frame(
     match submit_error {
         None => {
             let now = Duration::from(state.clock.now());
-            // This commit was deadline-scheduled, so it participates in the
-            // margin adaptation (immediately-submitted frames do not — a late
-            // render, not the margin, decides those).
-            record_margin_learning_sample(surface, now);
+            // A deadline-scheduled commit participates in the margin adaptation
+            // (immediately-submitted frames do not — a late render, not the
+            // margin, decides those).
+            if deadline_scheduled {
+                record_margin_learning_sample(surface, now);
+            }
             surface.queued_at = Some(queue_started_at);
             surface.queued_cpu_duration = deferred.total_cpu_elapsed;
             surface.skipped_while_pending_count = 0;
@@ -2485,6 +2578,16 @@ fn submit_deferred_frame(
                     render_started_at: deferred.latency_render_started_at.unwrap_or(now),
                     committed_at: now,
                 });
+            }
+            // A flip is in flight again: redraws that waited for it can render ahead.
+            let redraw_waiting = surface.redraw_state
+                == TtyRedrawState::WaitingForVBlank {
+                    redraw_needed: true,
+                };
+            let policy_allows = state.frame_pacing.allows_render_ahead(&surface.output.name());
+            if redraw_waiting && render_ahead_allowed(surface, policy_allows) {
+                surface.redraw_state = TtyRedrawState::Queued;
+                render_queued_surface_after_frame_finish(state, loop_handle, node, crtc);
             }
         }
         Some(err) => {
@@ -2517,6 +2620,56 @@ fn submit_deferred_frame(
             state.schedule_redraw();
         }
     }
+}
+
+/// Submit a frame that was rendered ahead, now that the flip it waited for completed.
+/// Like any frame rendered while the pointer moves, it is held until the commit deadline
+/// so the cursor plane carries the freshest position (nothing renders ahead of a held
+/// frame: the `DrmCompositor` stages one frame at a time); otherwise it is committed
+/// right away, and a redraw that waited renders ahead of it at once.
+fn submit_ahead_frame(
+    state: &mut ShojiWM,
+    loop_handle: &LoopHandle<'_, ShojiWM>,
+    node: DrmNode,
+    crtc: crtc::Handle,
+    ahead: DeferredSubmit,
+    redraw_needed: bool,
+) {
+    let pointer_moving = state
+        .last_pointer_motion_at
+        .is_some_and(|at| at.elapsed() < Duration::from_secs(1));
+    let now = Duration::from(state.clock.now());
+    let Some(surface) = state
+        .tty_backends
+        .get_mut(&node)
+        .and_then(|backend| backend.surfaces.get_mut(&crtc))
+    else {
+        return;
+    };
+    surface.frame_pending = true;
+    surface.in_flight_frame_target = Some(ahead.frame_target);
+    surface.redraw_state = TtyRedrawState::WaitingForVBlank { redraw_needed };
+    surface.deferred_submit = Some(ahead);
+    let generation = surface.deferred_submit_generation.wrapping_add(1);
+    surface.deferred_submit_generation = generation;
+    if cursor_fast_path_enabled()
+        && surface.cursor_on_plane
+        && pointer_moving
+        && let Some(deadline) = commit_deadline(surface, now)
+        && deadline > now
+    {
+        let callback_loop_handle = loop_handle.clone();
+        if loop_handle
+            .insert_source(Timer::from_duration(deadline - now), move |_, _, state| {
+                submit_deferred_frame(state, &callback_loop_handle, node, crtc, generation, true);
+                TimeoutAction::Drop
+            })
+            .is_ok()
+        {
+            return;
+        }
+    }
+    submit_deferred_frame(state, loop_handle, node, crtc, generation, false);
 }
 
 /// Deadline for a commit that wants to land on the next vblank while carrying
@@ -2691,6 +2844,8 @@ fn fast_cursor_move_inner(
             record_margin_learning_sample(surface, Duration::from(clock.now()));
             surface.cursor_move_pending = false;
             surface.frame_pending = true;
+            // A cursor-only flip: no rendered frame to render ahead of.
+            surface.in_flight_frame_target = None;
             surface.queued_at = Some(Instant::now());
             surface.queued_cpu_duration = Duration::ZERO;
             surface.skipped_while_pending_count = 0;
@@ -3273,6 +3428,26 @@ fn capture_scene_texture_for_effect(
     .map(|snapshot| snapshot.texture)
 }
 
+/// Outputs that render frames on the TTY backend, each ticking its own runtime clock
+/// (see `SchedulerTickRequest`). Empty under other backends: their runtime work runs
+/// on wall-clock timer ticks.
+pub(crate) fn frame_tick_outputs(state: &ShojiWM) -> Vec<String> {
+    if !state.tty_session_active {
+        return Vec::new();
+    }
+    let mut outputs = state
+        .tty_backends
+        .values()
+        .flat_map(|backend| backend.surfaces.values())
+        .filter(|surface| !surface.powered_off)
+        .map(|surface| surface.output.name())
+        .filter(|name| state.runtime_output_render_enabled(name))
+        .collect::<Vec<_>>();
+    outputs.sort();
+    outputs.dedup();
+    outputs
+}
+
 fn queue_tty_redraws(state: &mut ShojiWM) {
     let gap_threshold_ms = animation_gap_threshold_ms();
     let renderable_outputs = state
@@ -3281,6 +3456,9 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
         .filter(|output| state.runtime_output_render_enabled(&output.name()))
         .map(Output::name)
         .collect::<std::collections::HashSet<_>>();
+    // `schedule_redraw` asks for every output; `schedule_output_redraw` for some.
+    let redraw_all = std::mem::take(&mut state.redraw_all_outputs);
+    let requested_outputs = std::mem::take(&mut state.pending_output_redraws);
     for backend in state.tty_backends.values_mut() {
         for surface in backend.surfaces.values_mut() {
             if surface.powered_off || !renderable_outputs.contains(&surface.output.name()) {
@@ -3291,6 +3469,9 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
                 }
                 continue;
             }
+            if !redraw_all && !requested_outputs.contains(&surface.output.name()) {
+                continue;
+            }
             let previous_state = surface.redraw_state;
             let tearing_active = surface.tearing_active;
             match surface.redraw_state {
@@ -3299,8 +3480,15 @@ fn queue_tty_redraws(state: &mut ShojiWM) {
                 }
                 TtyRedrawState::Queued => {}
                 TtyRedrawState::WaitingForVBlank { .. } => {
-                    surface.redraw_state = TtyRedrawState::WaitingForVBlank {
-                        redraw_needed: true,
+                    let policy_allows = state
+                        .frame_pacing
+                        .allows_render_ahead(&surface.output.name());
+                    surface.redraw_state = if render_ahead_allowed(surface, policy_allows) {
+                        TtyRedrawState::Queued
+                    } else {
+                        TtyRedrawState::WaitingForVBlank {
+                            redraw_needed: true,
+                        }
                     };
                 }
                 TtyRedrawState::WaitingForEstimatedVBlank { generation, .. } => {
@@ -3623,11 +3811,11 @@ fn render_surface(
         let frame_duration = surface.frame_duration;
         let fallback_frame_time = Duration::from(state.clock.now()) + frame_duration;
         let (frame_time, _) = sanitize_next_frame_target(
-            surface.next_frame_target,
+            upcoming_frame_target(surface),
             fallback_frame_time,
             frame_duration,
         );
-        if let Some(target) = surface.next_frame_target
+        if let Some(target) = upcoming_frame_target(surface)
             && target > fallback_frame_time + frame_duration * 2
         {
             warn!(
@@ -3638,11 +3826,13 @@ fn render_surface(
         }
         let frame_time_ms = frame_time.as_secs_f64() * 1000.0;
         // Usually already stepped for this frame right after the previous flip was queued.
+        let output_name = output.name();
         let preticked = state
-            .runtime_scheduler_pretick_ms
-            .take()
+            .runtime_scheduler_pretick
+            .remove(&output_name)
             .is_some_and(|pretick_ms| (pretick_ms - frame_time_ms).abs() < 1.0);
-        let ticked = preticked || state.tick_runtime_scheduler_for_frame(frame_time_ms);
+        let ticked =
+            preticked || state.tick_runtime_scheduler_for_frame(&output_name, frame_time_ms);
         motion_trace_frame_tick = Some((frame_time_ms, ticked));
         // Rust-side window animations (rect / offset / opacity) sample at the same time.
         state.animation_frame_time_ms = Some(frame_time_ms);
@@ -3746,7 +3936,7 @@ fn render_surface(
             .tty_backends
             .get(&node)
             .and_then(|backend| backend.surfaces.get(&crtc))
-            .and_then(|surface| surface.next_frame_target);
+            .and_then(upcoming_frame_target);
         let (frame_target, stale_frame_target) =
             sanitize_next_frame_target(raw_frame_target, fallback_frame_time, frame_duration);
         (
@@ -3870,7 +4060,16 @@ fn render_surface(
         let backend = tty_backends.get_mut(&node).unwrap();
         let surface = backend.surfaces.get_mut(&crtc).unwrap();
         let render_started_at = Instant::now();
-        let raw_frame_time = surface.next_frame_target.take();
+        // Rendering ahead: the flip of the previous frame is still in flight and this frame
+        // is for the vblank after it (see `render_ahead_allowed`). Its prediction for the
+        // following frame stays for the render after the flip.
+        let rendering_ahead = surface.frame_pending;
+        let raw_frame_time = if rendering_ahead {
+            surface.ahead_attempted = true;
+            upcoming_frame_target(surface)
+        } else {
+            surface.next_frame_target.take()
+        };
         let (frame_time, stale_frame_time) =
             sanitize_next_frame_target(raw_frame_time, fallback_frame_time, frame_duration);
         surface.last_frame_callback_at = Some(frame_time);
@@ -6878,6 +7077,7 @@ fn render_surface(
                     })
             });
         surface.tearing_active = should_tear;
+        surface.fullscreen_fast_path_active = fullscreen_scanout_candidate.is_some();
         let mut frame_flags = TTY_FRAME_FLAGS;
         if overlay_planes_disabled() {
             frame_flags = frame_flags.difference(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
@@ -7066,7 +7266,11 @@ fn render_surface(
         if !result.is_empty {
             // Submitted (now or deferred): hold until `frame_finish`. An empty frame is not
             // flipped, so nothing waits on it; the previous hold, if any, stays as it is.
-            surface.held_client_buffers = held_client_buffers;
+            if rendering_ahead {
+                surface.ahead_held_client_buffers = held_client_buffers;
+            } else {
+                surface.held_client_buffers = held_client_buffers;
+            }
         }
         surface.cursor_on_plane = result.cursor_plane_assigned;
         if direct_scanout_debug_enabled() {
@@ -7431,7 +7635,8 @@ fn render_surface(
             // the existing throttling treats the held frame as in-flight and
             // the cursor fast path patches it instead of committing.
             let mut deferred = false;
-            if !should_tear
+            if !rendering_ahead
+                && !should_tear
                 && cursor_fast_path_enabled()
                 && result.cursor_plane_assigned
                 && state
@@ -7453,6 +7658,7 @@ fn render_surface(
                                 node,
                                 crtc,
                                 generation,
+                                true,
                             );
                             TimeoutAction::Drop
                         })
@@ -7462,12 +7668,22 @@ fn render_surface(
                     }
                 }
             }
-            if deferred {
+            if rendering_ahead {
+                // Staged until the flip in flight completes; `frame_finish` submits it.
+                surface.ahead_submit = Some(DeferredSubmit {
+                    feedback: output_presentation_feedback,
+                    total_cpu_elapsed,
+                    latency_render_started_at: latency_anchor
+                        .map(|(anchor_mono, _, _)| anchor_mono),
+                    frame_target: frame_time,
+                });
+            } else if deferred {
                 surface.deferred_submit = Some(DeferredSubmit {
                     feedback: output_presentation_feedback,
                     total_cpu_elapsed,
                     latency_render_started_at: latency_anchor
                         .map(|(anchor_mono, _, _)| anchor_mono),
+                    frame_target: frame_time,
                 });
             } else {
                 // Even without the hold (late render or gate off), re-patch
@@ -7560,6 +7776,7 @@ fn render_surface(
                 surface.queued_cpu_duration = total_cpu_elapsed;
             }
             surface.frame_pending = true;
+            surface.in_flight_frame_target = Some(frame_time);
             surface.skipped_while_pending_count = 0;
             surface.frame_callback_timer_armed = false;
             surface.frame_callback_timer_generation =
@@ -7596,7 +7813,7 @@ fn render_surface(
             // next render instead, the runtime round trip — and a kinetic step lays out
             // every tile, so it grows with the window count — sat between the vblank and
             // the flip commit and made crowded workspaces miss vblanks. The next render
-            // finds it done (`runtime_scheduler_pretick_ms`) and only catches up when its
+            // finds it done (`runtime_scheduler_pretick`) and only catches up when its
             // frame turned out to be a different one.
             if ShojiWM::motion_trace_enabled() {
                 let wall_ms = callback_time.as_secs_f64() * 1000.0;
@@ -7612,8 +7829,11 @@ fn render_surface(
                 );
             }
             let next_frame_time_ms = (frame_time + frame_duration).as_secs_f64() * 1000.0;
-            if state.tick_runtime_scheduler_for_frame(next_frame_time_ms) {
-                state.runtime_scheduler_pretick_ms = Some(next_frame_time_ms);
+            let output_name = output.name();
+            if state.tick_runtime_scheduler_for_frame(&output_name, next_frame_time_ms) {
+                state
+                    .runtime_scheduler_pretick
+                    .insert(output_name, next_frame_time_ms);
             }
         } else {
             if frame_liveness_debug_enabled() {
@@ -7642,6 +7862,15 @@ fn render_surface(
             // version we only send callbacks to surfaces whose primary scanout output is this
             // output. That preserves the "next callback after no-damage" behaviour that visible
             // clients need without reintroducing the Firefox `primary=None` callback burst.
+            if rendering_ahead {
+                // Nothing changed since the frame in flight. Leave it to the render after
+                // its flip, which on no damage keeps clients' frame callbacks going through
+                // the estimated-vblank timer below; `ahead_attempted` keeps further redraw
+                // requests from re-rendering until then.
+                surface.redraw_state = TtyRedrawState::WaitingForVBlank {
+                    redraw_needed: true,
+                };
+            } else {
             let generation = surface.frame_callback_timer_generation.wrapping_add(1);
             surface.frame_callback_timer_generation = generation;
             surface.redraw_state = TtyRedrawState::WaitingForEstimatedVBlank {
@@ -7659,6 +7888,7 @@ fn render_surface(
                 );
             }
             schedule_estimated_vblank_callback(loop_handle, state, node, crtc, frame_time);
+            }
         }
 
         captured_blink_damage
@@ -13820,6 +14050,11 @@ fn connector_connected(
         cursor_margin_window_misses: 0,
         deferred_submit: None,
         deferred_submit_generation: 0,
+        ahead_submit: None,
+        ahead_held_client_buffers: Vec::new(),
+        ahead_attempted: false,
+        in_flight_frame_target: None,
+        fullscreen_fast_path_active: false,
         powered_off: false,
         power_cleared: false,
         power_generation: 0,
@@ -14149,6 +14384,8 @@ pub fn apply_tty_output_mode(
                 }
                 return Ok(true);
             }
+            // A frame rendered ahead is sized for the old mode.
+            drop_ahead_frame(surface);
             if surface.deferred_submit.take().is_some() {
                 // Staged for a deadline commit but not committed: nothing is in flight. Drop it
                 // (its timer sees the new generation and returns) and render the new mode now,

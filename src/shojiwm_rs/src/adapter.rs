@@ -939,7 +939,7 @@ impl ConfigRuntime for ReactiveRuntime {
                 // the predicted presentation time, up to a frame ahead of the
                 // wall-clock ticks between them, and stepping back would give
                 // timers and animations uneven steps.
-                RuntimeRequest::SchedulerTick => {
+                RuntimeRequest::SchedulerTick(_) => {
                     RuntimeReply::SchedulerTick(scheduler_tick(animation::now_ms()))
                 }
                 RuntimeRequest::Window(request) => match request {

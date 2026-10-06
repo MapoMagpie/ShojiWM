@@ -110,6 +110,11 @@ interface EmbeddedRuntimeBridge {
   setCachedWorkspaceString(workspace: string): void;
   setCachedWorkspaceNumber(workspace: number): void;
   finishNativeResponse(): void;
+  publishSchedule(schedule: {
+    outputDueMs: Record<string, number>;
+    timerDueMs?: number;
+  }): void;
+  publishFramePacing(pacing: Record<string, FramePacing>): void;
   log(level: "debug" | "info" | "warn" | "error", message: string): void;
 }
 
@@ -124,6 +129,8 @@ interface EmbeddedRuntimeRequest {
   fastWindowId(): string;
   fastForceFullReevaluation(): boolean;
   fastNowMs(): number;
+  fastSchedulerOutput(): string;
+  fastSchedulerFrameOutputs(): string;
   finishFast(): void;
 }
 
@@ -272,7 +279,10 @@ function findPreloadPath(configPath: string): string | null {
 }
 
 import {
-  advanceAnimationFrame,
+  activeAnimationOutputs,
+  advanceAnimations,
+  installAnimationClock,
+  type OutputPollCallback,
   beginKeyBindingRegistration,
   beginInputConfigurationRegistration,
   beginOutputConfigurationRegistration,
@@ -297,7 +307,6 @@ import {
   createWindowAnimationControllerWithStore,
   createCompositionEvaluationCache,
   type WindowCompositionContext,
-  createManagedPoll,
   consumeManagedWindowOnlyFastPathInvalidated,
   dropLayerDependencies,
   dropWindowDependencies,
@@ -355,6 +364,7 @@ import {
   updateInputState,
   updateLayerSnapshots,
   COMPOSITOR,
+  type FramePacing,
   type SurfacePolicy,
   type WaylandLayerSnapshot,
   type WaylandLayer,
@@ -373,6 +383,7 @@ import {
   type WindowTransform,
 } from "../packages/shoji_wm/src/index.ts";
 import { peekDirtyWindowNodeIds } from "../packages/shoji_wm/src/runtime-hooks.ts";
+import { currentOutputList } from "../packages/shoji_wm/src/output.ts";
 
 function debugSSD(
   message: string,
@@ -504,6 +515,10 @@ interface SchedulerTickRequest {
   requestId: number;
   kind: "schedulerTick";
   nowMs: number;
+  /** The output whose frame this tick is for; absent for a timer tick. */
+  output?: string;
+  /** Outputs that render frames and tick their own clock. */
+  frameOutputs?: string[];
   displayState?: Record<string, OutputStateSnapshot>;
   inputState?: Record<string, InputDeviceInfo>;
   keyboardLayout?: KeyboardLayoutChangeEvent;
@@ -1242,8 +1257,24 @@ let nextEffectUniformSlotId = 1;
 let runtimeDirty = false;
 let immediateDirtyPoll: PollHandle | null = null;
 let nextPollId = 1;
+// Time is kept per output. An output that renders frames (`frameOutputs`, as
+// the compositor last reported them) has its own clock: the presentation time
+// of its frames, advanced only by the frame ticks for that output. Polls and
+// animations bound to it step there, exactly once per frame and stamped with
+// the vblank the frame lands on, so their cadence on screen is the same from
+// run to run however far ahead of the wall clock frames are prepared (one
+// frame, or two while the compositor renders ahead). Work bound to an output
+// that renders no frames (powered off, gone, or every output under a backend
+// without frame ticks) runs on wall-clock timer ticks instead (`wallClockMs`).
+// `currentSchedulerTimeMs` is the latest time any clock has reached; it is
+// what work bound to no output at all sees.
 let currentSchedulerTimeMs = 0;
-let lastAnimationAdvanceMs: number | undefined;
+let wallClockMs = 0;
+const outputClockMs = new Map<string, number>();
+let frameOutputs = new Set<string>();
+// A tick runs work due within this much past its time; the compositor uses the
+// same tolerance when it decides whether to tick.
+const FRAME_DUE_TOLERANCE_MS = 0.5;
 
 const RENDER_COMPOSITION_CONTEXT: WindowCompositionContext = {
   phase: "render",
@@ -1284,6 +1315,15 @@ interface RuntimePoll {
   handle: PollHandle;
   nowMs: number;
   dirtyMode: PollDirtyMode;
+  /** Output the poll is bound to; absent for internal polls that run on any tick. */
+  output?: () => string | undefined;
+}
+
+interface RuntimePollGroup {
+  intervalMs: number;
+  callback: OutputPollCallback;
+  dirtyMode: PollDirtyMode;
+  members: Map<string, PollHandle>;
 }
 
 function installRuntimeConsoleBridge(embeddedBridge: EmbeddedRuntimeBridge) {
@@ -1307,22 +1347,76 @@ function hasRuntimeTimestamp(
   return "nowMs" in request;
 }
 
-function beginRuntimeTurn(requestNowMs: number): void {
-  // Monotonic: frame-driven scheduler ticks carry the frame's predicted
-  // presentation time, which runs up to a frame ahead of the wall-clock
-  // timestamps other requests carry. Letting those pull the clock back would
-  // hand polls and animations a negative or doubled step.
-  const nowMs = Math.max(currentSchedulerTimeMs, requestNowMs);
-  currentSchedulerTimeMs = nowMs;
-  if (lastAnimationAdvanceMs === nowMs) {
+function windowOutputName(windowId: string): string | undefined {
+  return cacheByWindowId.get(windowId)?.latestSnapshot.outputName;
+}
+
+function layerOutputName(layerId: string): string | undefined {
+  return cacheByLayerId.get(layerId)?.latestSnapshot.outputName;
+}
+
+function isFrameDriven(output: string | undefined): output is string {
+  return output !== undefined && frameOutputs.has(output);
+}
+
+/**
+ * The time work bound to `output` starting now is anchored at: the output's
+ * own clock while it renders frames (never behind the wall clock, so an output
+ * that has been idle does not hand a new animation a head start), the wall
+ * clock otherwise.
+ */
+function clockBaseMs(output: string | undefined): number {
+  if (isFrameDriven(output)) {
+    return Math.max(outputClockMs.get(output) ?? wallClockMs, wallClockMs);
+  }
+  return wallClockMs;
+}
+
+function beginRuntimeTurn(request: RuntimeRequestWithTimestamp): void {
+  // Every clock is monotonic: a frame tick carries its frame's presentation
+  // time, up to two frames ahead of the wall-clock stamps other requests
+  // carry, and a stamp from behind must never pull a clock back (that would
+  // hand polls and animations a negative or doubled step).
+  if (request.kind === "schedulerTick") {
+    updateFrameOutputs(request.frameOutputs ?? []);
+  }
+  const frameOutput =
+    request.kind === "schedulerTick" ? request.output : undefined;
+  if (frameOutput !== undefined) {
+    const nowMs = Math.max(
+      outputClockMs.get(frameOutput) ?? request.nowMs,
+      request.nowMs,
+    );
+    outputClockMs.set(frameOutput, nowMs);
+    currentSchedulerTimeMs = Math.max(currentSchedulerTimeMs, nowMs);
+    advanceAnimations(nowMs, (output) => output === frameOutput);
+  } else {
+    wallClockMs = Math.max(wallClockMs, request.nowMs);
+    currentSchedulerTimeMs = Math.max(currentSchedulerTimeMs, wallClockMs);
+    advanceAnimations(
+      wallClockMs,
+      (output) => output !== undefined && !isFrameDriven(output),
+    );
+  }
+  // A runtime turn may evaluate declarations or run user handlers, both of
+  // which can start animations; animations without an owner keep the shared
+  // clock and are synchronized at every turn boundary.
+  advanceAnimations(currentSchedulerTimeMs, (output) => output === undefined);
+}
+
+function updateFrameOutputs(names: string[]): void {
+  if (
+    names.length === frameOutputs.size &&
+    names.every((name) => frameOutputs.has(name))
+  ) {
     return;
   }
-  lastAnimationAdvanceMs = nowMs;
-  // A runtime turn may evaluate declarations or run user handlers, both of
-  // which can start animations. Synchronizing once at the turn boundary keeps
-  // every newly-created timeline anchored to the compositor timestamp for this
-  // request instead of the previous composition evaluation.
-  advanceAnimationFrame(nowMs);
+  frameOutputs = new Set(names);
+  for (const name of Array.from(outputClockMs.keys())) {
+    if (!frameOutputs.has(name)) {
+      outputClockMs.delete(name);
+    }
+  }
 }
 
 // --- Diagnostic counters (SHOJI_RUNTIME_STATS=1) -----------------------------
@@ -1366,12 +1460,17 @@ function startStatsLogger(): void {
 async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
   installRuntimeConsoleBridge(embeddedBridge);
   startStatsLogger();
+  schedulePublisher = embeddedBridge;
 
   installSchedulerBridge({
-    registerPoll(intervalMs, callback, dirtyMode) {
-      return registerPoll(intervalMs, callback, dirtyMode);
+    registerPoll(intervalMs, callback, dirtyMode, output) {
+      return registerPoll(intervalMs, callback, dirtyMode, output);
+    },
+    registerOutputPollGroup(intervalMs, callback, dirtyMode) {
+      return registerOutputPollGroup(intervalMs, callback, dirtyMode);
     },
   });
+  installAnimationClock({ startTimeMs: clockBaseMs });
   installRuntimeHooks({
     markRuntimeDirty() {
       if (statsEnabled) stats.markRuntimeDirty++;
@@ -1452,8 +1551,11 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
       if ("inputState" in request) {
         updateInputState(request.inputState);
       }
+      if ("displayState" in request) {
+        syncOutputPollGroups();
+      }
       if (hasRuntimeTimestamp(request)) {
-        beginRuntimeTurn(request.nowMs);
+        beginRuntimeTurn(request);
       }
       if (statsEnabled) {
         switch (request.kind) {
@@ -1645,7 +1747,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
                   events,
                   effectConfig,
                   request.snapshot,
-                  currentSchedulerTimeMs,
+                  clockBaseMs(request.snapshot.outputName),
                 )
               : evaluatePreconfigure(
                   composition,
@@ -1749,7 +1851,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
             if (request.keyboardLayout) {
               events.emitKeyboardLayoutChange(request.keyboardLayout);
             }
-            const tick = processSchedulerTick(currentSchedulerTimeMs);
+            const tick = processSchedulerTick(request.output);
             if (statsEnabled && tick.dirty) stats.schedulerTickDirty++;
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
@@ -3434,6 +3536,8 @@ function createRuntimeCacheEntry(
   const animation = createWindowAnimationControllerWithStore(
     snapshot.id,
     animationEntries as Map<symbol, never>,
+    // By id: the store outlives this cache entry (hot reload, preconfigure).
+    () => windowOutputName(snapshot.id),
   );
   const cache = createCompositionEvaluationCache(
     snapshot,
@@ -3501,6 +3605,7 @@ function createRuntimeLayerEntry(
     createWindowAnimationControllerWithStore(
       snapshot.id,
       animationEntries as Map<symbol, never>,
+      () => layerOutputName(snapshot.id),
     ),
   );
   return {
@@ -3709,12 +3814,23 @@ function registerPoll(
   intervalMs: number,
   callback: PollCallback,
   dirtyMode: PollDirtyMode,
+  output?: () => string | undefined,
 ): PollHandle {
   const pollId = nextPollId++;
   const normalizedIntervalMs = Math.max(1, Math.floor(intervalMs));
   let cancelled = false;
+  const baseMs = output ? clockBaseMs(output()) : currentSchedulerTimeMs;
 
-  const handle: PollHandle = {
+  const poll: RuntimePoll = {
+    intervalMs: normalizedIntervalMs,
+    nextRunAtMs: baseMs + normalizedIntervalMs,
+    callback,
+    handle: undefined as unknown as PollHandle,
+    nowMs: baseMs,
+    dirtyMode,
+    output,
+  };
+  poll.handle = {
     cancel() {
       cancelled = true;
       polls.delete(pollId);
@@ -3723,20 +3839,217 @@ function registerPoll(
       return cancelled;
     },
     get nowMs() {
+      return poll.nowMs;
+    },
+  };
+  polls.set(pollId, poll);
+
+  return poll.handle;
+}
+
+const outputPollGroups = new Set<RuntimePollGroup>();
+
+function registerOutputPollGroup(
+  intervalMs: number,
+  callback: OutputPollCallback,
+  dirtyMode: PollDirtyMode,
+): PollHandle {
+  const group: RuntimePollGroup = {
+    intervalMs,
+    callback,
+    dirtyMode,
+    members: new Map(),
+  };
+  let cancelled = false;
+  outputPollGroups.add(group);
+  syncOutputPollGroup(group);
+  return {
+    cancel() {
+      cancelled = true;
+      outputPollGroups.delete(group);
+      for (const member of group.members.values()) {
+        member.cancel();
+      }
+      group.members.clear();
+    },
+    get cancelled() {
+      return cancelled;
+    },
+    get nowMs() {
       return currentSchedulerTimeMs;
     },
   };
+}
 
-  polls.set(pollId, {
-    intervalMs: normalizedIntervalMs,
-    nextRunAtMs: currentSchedulerTimeMs + normalizedIntervalMs,
-    callback,
-    handle,
-    nowMs: currentSchedulerTimeMs,
-    dirtyMode,
-  });
+function syncOutputPollGroups(): void {
+  for (const group of outputPollGroups) {
+    syncOutputPollGroup(group);
+  }
+}
 
-  return handle;
+function syncOutputPollGroup(group: RuntimePollGroup): void {
+  const names = new Set(
+    currentOutputList()
+      .filter((output) => output.enabled)
+      .map((output) => output.name),
+  );
+  for (const [name, member] of Array.from(group.members)) {
+    if (!names.has(name) || member.cancelled) {
+      member.cancel();
+      group.members.delete(name);
+    }
+  }
+  for (const name of names) {
+    if (group.members.has(name)) {
+      continue;
+    }
+    group.members.set(
+      name,
+      registerPoll(
+        group.intervalMs,
+        (handle) => group.callback(handle, name),
+        group.dirtyMode,
+        () => name,
+      ),
+    );
+  }
+}
+
+/**
+ * Where a poll stands for a tick for `tickOutput` (`undefined` for a timer
+ * tick): the time it would run at, or `undefined` when this tick does not
+ * drive it. A poll bound to a frame-rendering output runs only on that
+ * output's frame ticks; one bound to an output without frames, only on timer
+ * ticks; an internal poll bound to nothing, on any tick.
+ */
+function pollTickTimeMs(
+  poll: RuntimePoll,
+  tickOutput: string | undefined,
+): number | undefined {
+  if (!poll.output) {
+    return tickOutput === undefined
+      ? wallClockMs
+      : outputClockMs.get(tickOutput) ?? wallClockMs;
+  }
+  const pollOutput = poll.output();
+  if (isFrameDriven(pollOutput)) {
+    return pollOutput === tickOutput
+      ? outputClockMs.get(pollOutput) ?? wallClockMs
+      : undefined;
+  }
+  return tickOutput === undefined ? wallClockMs : undefined;
+}
+
+/**
+ * When scheduled work next comes due (the compositor's `RuntimeSchedule`).
+ * `outputDueMs` holds, per frame-rendering output, the earliest due time on
+ * that output's clock (`0` while an animation bound to it runs: every frame);
+ * `timerDueMs` is when the next work only a timer tick runs comes due.
+ */
+function schedulerDueState(): {
+  outputDueMs: Record<string, number>;
+  timerDueMs?: number;
+} {
+  const outputDueMs: Record<string, number> = {};
+  let timerDueMs: number | undefined;
+  const wake = (atMs: number) => {
+    timerDueMs = timerDueMs === undefined ? atMs : Math.min(timerDueMs, atMs);
+  };
+  const due = (output: string, atMs: number) => {
+    const current = outputDueMs[output];
+    outputDueMs[output] = current === undefined ? atMs : Math.min(current, atMs);
+  };
+  for (const poll of polls.values()) {
+    if (poll.handle.cancelled) {
+      continue;
+    }
+    if (!poll.output) {
+      // Internal work bound to no output (the immediate dirty poll) runs on any
+      // tick: the next frame of whichever output renders first, or a timer tick
+      // when no output renders frames.
+      if (frameOutputs.size === 0) {
+        wake(poll.nextRunAtMs);
+      }
+      for (const output of frameOutputs) {
+        due(output, poll.nextRunAtMs);
+      }
+      continue;
+    }
+    const pollOutput = poll.output();
+    if (isFrameDriven(pollOutput)) {
+      due(pollOutput, poll.nextRunAtMs);
+    } else {
+      wake(poll.nextRunAtMs);
+    }
+  }
+  for (const output of activeAnimationOutputs()) {
+    if (isFrameDriven(output)) {
+      due(output, 0);
+    } else if (output === undefined && frameOutputs.size > 0) {
+      // Without an owner an animation keeps the shared clock, which every
+      // tick advances: the next frame of each rendering output will do.
+      for (const frameOutput of frameOutputs) {
+        due(frameOutput, 0);
+      }
+    } else {
+      wake(0);
+    }
+  }
+  return { outputDueMs, timerDueMs };
+}
+
+let lastPublishedSchedule: string | undefined;
+let lastPublishedFramePacing: string | undefined;
+let schedulePublisher: EmbeddedRuntimeBridge | null = null;
+
+/**
+ * Send the schedule (and the frame pacing, which shares the path) to the
+ * compositor when it changed, ahead of the response that changed it, so the
+ * compositor knows which output frames to tick.
+ */
+function publishScheduleIfChanged(): void {
+  if (!schedulePublisher) {
+    return;
+  }
+  const schedule = schedulerDueState();
+  const key = JSON.stringify(schedule);
+  if (key !== lastPublishedSchedule) {
+    lastPublishedSchedule = key;
+    schedulePublisher.publishSchedule(schedule);
+  }
+  const pacing = resolveFramePacing();
+  const pacingKey = JSON.stringify(pacing);
+  if (pacingKey !== lastPublishedFramePacing) {
+    lastPublishedFramePacing = pacingKey;
+    schedulePublisher.publishFramePacing(pacing);
+  }
+}
+
+/** `COMPOSITOR.rendering.framePacing`, resolved for every enabled output. */
+function resolveFramePacing(): Record<string, FramePacing> {
+  const config = COMPOSITOR.rendering?.framePacing;
+  const pacing: Record<string, FramePacing> = {};
+  if (config === undefined) {
+    return pacing;
+  }
+  for (const output of currentOutputList()) {
+    if (!output.enabled) {
+      continue;
+    }
+    let value: unknown = config;
+    if (typeof config === "function") {
+      try {
+        value = config(output);
+      } catch (error) {
+        console.error("COMPOSITOR.rendering.framePacing failed", error);
+        continue;
+      }
+    }
+    if (value === "throughput" || value === "low-latency") {
+      pacing[output.name] = value;
+    }
+  }
+  return pacing;
 }
 
 function ensureImmediateDirtyPoll(): void {
@@ -3757,7 +4070,7 @@ function ensureImmediateDirtyPoll(): void {
   debugSSD("runtime-immediate-dirty-poll-scheduled");
 }
 
-function processSchedulerTick(nowMs: number): {
+function processSchedulerTick(tickOutput: string | undefined): {
   dirty: boolean;
   runtimeDirty?: boolean;
   dirtyWindowIds: string[];
@@ -3773,7 +4086,8 @@ function processSchedulerTick(nowMs: number): {
       continue;
     }
 
-    if (poll.nextRunAtMs > nowMs) {
+    const nowMs = pollTickTimeMs(poll, tickOutput);
+    if (nowMs === undefined || poll.nextRunAtMs > nowMs + FRAME_DUE_TOLERANCE_MS) {
       continue;
     }
 
@@ -3810,7 +4124,7 @@ function collectRuntimeMutationState(): {
     }
     // Whole milliseconds: the compositor's timers take integers, and the
     // scheduler clock is fractional once frames drive it.
-    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - currentSchedulerTimeMs));
+    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - wallClockMs));
     nextPollInMs =
       nextPollInMs === undefined ? delay : Math.min(nextPollInMs, delay);
   }
@@ -4246,7 +4560,7 @@ function startClose(
       entry.pendingActions.push({ windowId, action: "finalizeClose" });
     } else {
       entry.closePoll?.cancel();
-      entry.closePoll = createManagedPoll(
+      entry.closePoll = registerPoll(
         durationMs,
         (handle) => {
           const current = cacheByWindowId.get(windowId);
@@ -4260,6 +4574,8 @@ function startClose(
           current.closePoll = undefined;
         },
         "none",
+        // Finalize on the frame the close animation ends on.
+        () => windowOutputName(windowId),
       );
     }
   }
@@ -4406,8 +4722,10 @@ function peekNextPollDelay(): number | undefined {
       continue;
     }
     // Whole milliseconds: the compositor's timers take integers, and the
-    // scheduler clock is fractional once frames drive it.
-    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - currentSchedulerTimeMs));
+    // scheduler clock is fractional once frames drive it. A hint only: due
+    // times on an output clock run ahead of the wall clock, which makes the
+    // compositor ask early and find the exact schedule in the tick's reply.
+    const delay = Math.max(1, Math.ceil(poll.nextRunAtMs - wallClockMs));
     nextPollInMs =
       nextPollInMs === undefined ? delay : Math.min(nextPollInMs, delay);
   }
@@ -4559,6 +4877,7 @@ function tryWriteNativeSchedulerResponse(
       output.addSchedulerDirtyLayerNode(layerId, nodeId);
     }
   }
+  publishScheduleIfChanged();
   output.finishNativeResponse();
   return true;
 }
@@ -4670,6 +4989,7 @@ function tryWriteNativeCachedResponse(
   } else if (typeof workspace === "number") {
     output.setCachedWorkspaceNumber(workspace);
   }
+  publishScheduleIfChanged();
   output.finishNativeResponse();
   return true;
 }
@@ -4719,6 +5039,7 @@ function writeInteractionEventResponse(
     response.processConfig === undefined &&
     (response.processActions?.length ?? 0) === 0
   ) {
+    publishScheduleIfChanged();
     output.writeInteractionResponse(response);
     return Promise.resolve();
   }
@@ -4736,6 +5057,7 @@ function writeResponseWithRuntimeUpdates(
     ...(updates.envUpdates ? { envUpdates: updates.envUpdates } : {}),
     ...(updates.cursorConfig ? { cursorConfig: updates.cursorConfig } : {}),
   };
+  publishScheduleIfChanged();
   output.writeResponse(JSON.stringify(responseWithRuntimeUpdates));
   return Promise.resolve();
 }
@@ -5335,10 +5657,14 @@ async function* readEmbeddedMessages(
       continue;
     }
     if (fastKind === 2) {
+      const output = envelope.fastSchedulerOutput();
+      const frameOutputs = envelope.fastSchedulerFrameOutputs();
       const request: SchedulerTickRequest = {
         requestId: envelope.fastRequestId(),
         kind: "schedulerTick",
         nowMs: envelope.fastNowMs(),
+        output: output === "" ? undefined : output,
+        frameOutputs: frameOutputs === "" ? [] : frameOutputs.split("\n"),
       };
       envelope.finishFast();
       yield request;

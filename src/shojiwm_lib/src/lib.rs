@@ -36,6 +36,7 @@ pub mod backend;
 pub mod config;
 pub mod config_error;
 pub mod cursor;
+pub mod frame_pacing;
 pub mod drawing;
 pub mod foreign_toplevel;
 pub mod grabs;

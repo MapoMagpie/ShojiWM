@@ -58,6 +58,24 @@ pub enum HostMessage {
     /// stays. A runtime may also send it unprompted, e.g. from a file
     /// watcher, to start a reload on its own.
     ReloadReady(Result<(), String>),
+    /// When the runtime's scheduled work next comes due; sent whenever that
+    /// changes. A runtime that never sends it keeps a single clock and is
+    /// ticked on every rendered frame and timer (see `SchedulerTickRequest`).
+    Schedule(RuntimeSchedule),
+    /// The frame pacing the config chose per output (`COMPOSITOR.rendering.framePacing`).
+    FramePacing(crate::frame_pacing::FramePacingConfig),
+}
+
+/// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)
+/// next needs a tick. All times are absolute, in monotonic milliseconds.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RuntimeSchedule {
+    /// Per frame-rendering output, the earliest due time on that output's
+    /// clock; `0` while something on it animates (every frame). An output
+    /// missing from the map has nothing scheduled.
+    pub output_due_ms: std::collections::HashMap<String, f64>,
+    /// The earliest due time of work only a wall-clock timer tick runs.
+    pub timer_due_ms: Option<f64>,
 }
 
 /// Config deltas that every runtime reply may carry. A runtime implementation
