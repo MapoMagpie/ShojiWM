@@ -192,6 +192,34 @@ impl PaintItem {
     pub fn is_custom(&self) -> bool {
         matches!(self.program, PaintProgram::Custom(_))
     }
+
+    /// A rect, relative to `geometry.draw`, where a built-in program is known
+    /// to output nothing: the box an outer shadow sits under, or the hollow
+    /// middle of a border without a fill. Drawing skips it, so a window's
+    /// shadow and frame cost only their rim instead of the whole window.
+    pub fn transparent_interior(&self) -> Option<PxRect> {
+        let g = &self.geometry;
+        let (rect, radius) = match self.program {
+            PaintProgram::Shadow(shadow) if !shadow.inset => (g.node, g.radius),
+            PaintProgram::Box { fill, .. }
+                if !fill || g.hole || self.background.a == 0 =>
+            {
+                (g.inner, g.inner_radius)
+            }
+            _ => return None,
+        };
+        // A corner arc stays outside the square cut `r * (1 - 1/sqrt 2)` in
+        // from its corner; one more pixel covers the antialiased edge.
+        let max_radius = radius.into_iter().max().unwrap_or(0).max(0) as f64;
+        let inset = (max_radius * (1.0 - std::f64::consts::FRAC_1_SQRT_2)).ceil() as i32 + 1;
+        let interior = PxRect {
+            x: rect.x - g.draw.x + inset,
+            y: rect.y - g.draw.y + inset,
+            w: rect.w - 2 * inset,
+            h: rect.h - 2 * inset,
+        };
+        (interior.w > 0 && interior.h > 0).then_some(interior)
+    }
 }
 
 /// The paint slots of one node, as stable-key suffixes.

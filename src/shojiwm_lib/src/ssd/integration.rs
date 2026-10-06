@@ -2922,8 +2922,13 @@ impl ShojiWM {
                             // the dominant CPU cost during heavy client commits
                             // (ufo-test at 4K@120Hz: ~25% of CPU in the SSD layout
                             // path).
+                            // A rect-driven window's result does not read the
+                            // fallback either, so it holds after a move too.
                             if !cached.client_rect_potentially_stale
-                                && cached.snapshot.position == snapshot.position
+                                && (cached.snapshot.position == snapshot.position
+                                    || managed_client_rect_ignores_fallback(
+                                        &cached.managed_window,
+                                    ))
                             {
                                 return Ok(cached.client_rect);
                             }
@@ -6004,6 +6009,17 @@ fn managed_client_rect_for_state(
     }
 
     managed_client_rect_for_root(tree, desired_root, scale)
+}
+
+/// Whether `managed_client_rect_for_state` derives the rect from the
+/// managed rect alone, without reading its fallback client rect.
+fn managed_client_rect_ignores_fallback(managed: &super::ManagedWindowState) -> bool {
+    managed.managed
+        && managed.force_rect_size
+        && managed.rect.is_some_and(|rect| {
+            let rect = managed_rect_snapshot_to_logical_rect(rect);
+            rect.width > 0 && rect.height > 0
+        })
 }
 
 fn managed_client_rect_from_current_insets(

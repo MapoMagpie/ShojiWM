@@ -151,13 +151,19 @@ fn ordered_paint_elements(
     alpha: f32,
 ) -> Result<Vec<(usize, DecorationSceneElements)>, DecorationSceneError> {
     let scopes = decoration.popup_scopes();
+    let to_output = crate::backend::paint::LayoutToOutput::new(decoration, scale);
+    let WindowDecorationState {
+        buffers,
+        paint_cache,
+        ..
+    } = decoration;
     let mut items = Vec::new();
-    for cached in decoration.buffers.clone() {
+    for cached in buffers.iter() {
         if !scopes.includes(part, &cached.stable_key) {
             continue;
         }
         if let Some(element) = crate::backend::paint::paint_element(
-            renderer, decoration, &cached, output_geo, scale, alpha,
+            renderer, to_output, paint_cache, cached, output_geo, alpha,
         )? {
             items.push((cached.order, DecorationSceneElements::Paint(element)));
         }

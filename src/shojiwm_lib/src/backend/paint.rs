@@ -354,6 +354,8 @@ pub struct StablePaintElement {
     geometry: Rectangle<i32, Physical>,
     alpha: f32,
     uniforms: Vec<Uniform<'static>>,
+    /// Where the program outputs nothing, in `area` pixels.
+    transparent_interior: Option<PxRect>,
 }
 
 impl PaintElementState {
@@ -383,18 +385,19 @@ impl PaintElementState {
             geometry,
             alpha: alpha.clamp(0.0, 1.0),
             uniforms: uniforms_for_item(item),
+            transparent_interior: item.transparent_interior(),
         })
     }
 }
 
-/// The element of one paint item of `decoration`, positioned relative to the
-/// root's physical origin. `None` when it is off the output or empty.
-pub fn paint_element(
+/// The element of one paint item, positioned relative to the root's physical
+/// origin (`to_output`). `None` when it is off the output or empty.
+pub(crate) fn paint_element(
     renderer: &mut GlesRenderer,
-    decoration: &mut WindowDecorationState,
+    to_output: LayoutToOutput,
+    paint_cache: &mut HashMap<String, PaintElementState>,
     cached: &crate::ssd::CachedDecorationBuffer,
     output_geo: Rectangle<i32, Logical>,
-    output_scale: Scale<f64>,
     alpha: f32,
 ) -> Result<Option<StablePaintElement>, ShaderEffectError> {
     let item = &cached.paint;
@@ -407,14 +410,14 @@ pub fn paint_element(
     if !visible {
         return Ok(None);
     }
-    let geometry = LayoutToOutput::new(decoration, output_scale).rect(item.geometry.draw);
+    let geometry = to_output.rect(item.geometry.draw);
     if geometry.size.w <= 0 || geometry.size.h <= 0 {
         return Ok(None);
     }
-    let state = decoration
-        .paint_cache
-        .entry(cached.stable_key.clone())
-        .or_default();
+    let state = match paint_cache.get_mut(&cached.stable_key) {
+        Some(state) => state,
+        None => paint_cache.entry(cached.stable_key.clone()).or_default(),
+    };
     state.element(renderer, item, geometry, alpha).map(Some)
 }
 
@@ -448,6 +451,30 @@ impl Element for StablePaintElement {
     }
 }
 
+impl StablePaintElement {
+    /// The transparent interior in `dst`-local pixels, mapped through the
+    /// `src` -> `dst` scaling (wrappers may crop or rescale the element) and
+    /// shrunk to whole pixels so the skipped area never holds a painted one.
+    fn interior_in(
+        &self,
+        src: Rectangle<f64, Buffer>,
+        dst_size: Size<i32, Physical>,
+    ) -> Option<Rectangle<i32, Physical>> {
+        let interior = self.transparent_interior?;
+        if src.size.w <= 0.0 || src.size.h <= 0.0 {
+            return None;
+        }
+        let sx = dst_size.w as f64 / src.size.w;
+        let sy = dst_size.h as f64 / src.size.h;
+        let left = ((interior.x as f64 - src.loc.x) * sx).ceil() as i32;
+        let top = ((interior.y as f64 - src.loc.y) * sy).ceil() as i32;
+        let right = ((interior.right() as f64 - src.loc.x) * sx).floor() as i32;
+        let bottom = ((interior.bottom() as f64 - src.loc.y) * sy).floor() as i32;
+        (right > left && bottom > top)
+            .then(|| Rectangle::new((left, top).into(), (right - left, bottom - top).into()))
+    }
+}
+
 impl RenderElement<GlesRenderer> for StablePaintElement {
     fn draw(
         &self,
@@ -458,6 +485,20 @@ impl RenderElement<GlesRenderer> for StablePaintElement {
         _opaque_regions: &[Rectangle<i32, Physical>],
         _cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        let rim_damage;
+        let damage = match self.interior_in(src, dst.size) {
+            Some(interior) => {
+                rim_damage = damage
+                    .iter()
+                    .flat_map(|rect| rect.subtract_rect(interior))
+                    .collect::<Vec<_>>();
+                &rim_damage[..]
+            }
+            None => damage,
+        };
+        if damage.is_empty() {
+            return Ok(());
+        }
         frame.render_pixel_shader_to(
             &self.program,
             src,
@@ -481,6 +522,7 @@ mod tests {
     use smithay::backend::allocator::Fourcc;
     use smithay::backend::egl::{EGLContext, EGLDisplay};
     use smithay::backend::renderer::damage::OutputDamageTracker;
+    use smithay::backend::renderer::element::utils::CropRenderElement;
     use smithay::backend::renderer::gles::GlesRenderbuffer;
     use smithay::backend::renderer::{Bind, Color32F, ExportMem, Offscreen};
 
@@ -517,6 +559,18 @@ mod tests {
     /// Lays `root` out and renders every paint item with the root's
     /// top-left at physical (20, 20), on a transparent black target.
     fn render(root: DecorationNode, scale: f64) -> Option<Pixels> {
+        render_with(root, scale, 1, true, false)
+    }
+
+    /// `stretch` draws every element at that multiple of its layout size;
+    /// `skip_interior: false` paints the transparent interiors too.
+    fn render_with(
+        root: DecorationNode,
+        scale: f64,
+        stretch: i32,
+        skip_interior: bool,
+        crop: bool,
+    ) -> Option<Pixels> {
         let mut renderer = try_renderer()?;
         let tree = DecorationTree::new(root);
         let layout = tree
@@ -527,15 +581,40 @@ mod tests {
             .map(|buffer| {
                 let draw = buffer.paint.geometry.draw;
                 let geometry = Rectangle::new(
-                    Point::from((draw.x + 20, draw.y + 20)),
-                    (draw.w, draw.h).into(),
+                    Point::from(((draw.x + 20) * stretch, (draw.y + 20) * stretch)),
+                    (draw.w * stretch, draw.h * stretch).into(),
                 );
-                PaintElementState::default()
+                let mut element = PaintElementState::default()
                     .element(&mut renderer, &buffer.paint, geometry, 1.0)
-                    .expect("paint element")
+                    .expect("paint element");
+                if !skip_interior {
+                    element.transparent_interior = None;
+                }
+                element
             })
             .collect::<Vec<_>>();
+        if crop {
+            // Wrappers hand `draw` a sub-rect of the source: keep the
+            // middle of the output only.
+            let elements = elements
+                .into_iter()
+                .filter_map(|element| {
+                    CropRenderElement::from_element(
+                        element,
+                        1.0,
+                        Rectangle::new((37, 41).into(), (70, 66).into()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            return draw_pixels(&mut renderer, &elements);
+        }
+        draw_pixels(&mut renderer, &elements)
+    }
 
+    fn draw_pixels<E: RenderElement<GlesRenderer>>(
+        renderer: &mut GlesRenderer,
+        elements: &[E],
+    ) -> Option<Pixels> {
         let size = Size::<i32, Physical>::from((OUT, OUT));
         let mut buffer: GlesRenderbuffer = renderer
             .create_buffer(Fourcc::Abgr8888, size.to_logical(1).to_buffer(1, Transform::Normal))
@@ -543,7 +622,7 @@ mod tests {
         let mut fb = renderer.bind(&mut buffer).ok()?;
         let mut tracker = OutputDamageTracker::new(size, 1.0, Transform::Normal);
         tracker
-            .render_output(&mut renderer, &mut fb, 0, &elements, Color32F::new(0.0, 0.0, 0.0, 0.0))
+            .render_output(renderer, &mut fb, 0, elements, Color32F::new(0.0, 0.0, 0.0, 0.0))
             .ok()?;
         let mapping = renderer
             .copy_framebuffer(
@@ -667,6 +746,51 @@ mod tests {
         assert_eq!(pixels.at(20, 20)[2], 0, "box corner is cut");
         assert_eq!(pixels.at(17, 40), [255, 0, 0, 255], "spread shadow left of the box");
         assert_eq!(pixels.at(15, 40), [0, 0, 0, 0], "beyond the spread");
+    }
+
+    #[test]
+    fn skipping_transparent_interiors_keeps_the_pixels() {
+        let node = || {
+            boxed(DecorationStyle {
+                width: Some(70.0),
+                height: Some(50.0),
+                border: Some(BorderStyle {
+                    width: 2.0,
+                    color: RED,
+                }),
+                border_radius: Some(10.0),
+                background: Some(Color::rgba(0, 0, 0, 0)),
+                box_shadow: vec![BoxShadow {
+                    offset_x: 3.0,
+                    offset_y: 5.0,
+                    blur: 12.0,
+                    spread: -2.0,
+                    color: Color::BLACK,
+                    inset: false,
+                }],
+                ..Default::default()
+            })
+        };
+        for (scale, stretch, crop) in [(1.0, 1, false), (1.5, 1, false), (1.25, 2, false), (1.5, 1, true)] {
+            let Some(skipped) = render_with(node(), scale, stretch, true, crop) else {
+                return;
+            };
+            let full = render_with(node(), scale, stretch, false, crop).expect("second render");
+            let diff = (0..OUT * OUT)
+                .map(|i| (i % OUT, i / OUT))
+                // Split quads interpolate the coordinates a hair differently.
+                .filter(|&(x, y)| {
+                    let (a, b) = (skipped.at(x, y), full.at(x, y));
+                    (0..4).any(|c| a[c].abs_diff(b[c]) > 1)
+                })
+                .map(|(x, y)| (x, y, skipped.at(x, y), full.at(x, y)))
+                .take(5)
+                .collect::<Vec<_>>();
+            assert!(
+                diff.is_empty(),
+                "interior skip changed pixels at scale {scale} stretch {stretch} crop {crop}: {diff:?}"
+            );
+        }
     }
 
     #[test]
