@@ -2284,9 +2284,9 @@ impl ShojiWM {
                 let previous_transform = decoration.visual_transform;
                 decoration.managed_window = next_managed_window.clone();
                 decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    decoration.visual_transform = next_managed_window.transform;
-                }
+                // Publish the static-seeded transform even when only rect channels remain;
+                // a cancelled opacity/offset channel must not leave its last sample behind.
+                decoration.visual_transform = next_managed_window.transform;
                 if rect_changed {
                     dirty_rect_window_ids.insert(window_id.clone());
                 }
@@ -2335,10 +2335,8 @@ impl ShojiWM {
                 let previous_transform = closing.decoration.visual_transform;
                 closing.decoration.managed_window = next_managed_window.clone();
                 closing.decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    closing.decoration.visual_transform = next_managed_window.transform;
-                    closing.transform = next_managed_window.transform;
-                }
+                closing.decoration.visual_transform = next_managed_window.transform;
+                closing.transform = next_managed_window.transform;
                 let next_root = transformed_root_rect(
                     closing.decoration.layout.root.rect,
                     closing.decoration.visual_transform,
