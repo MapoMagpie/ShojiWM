@@ -38,7 +38,7 @@ COMPOSITOR.rendering.composition = (output: OutputInfo) => CompositionRenderable
 
 | Prop | 型 | |
 | --- | --- | --- |
-| `windows` | *signal* `(WaylandWindow \| string)[]` | 指定したウィンドウ（オブジェクトか ID）だけを重なり順で描きます。**非表示でも描きます**。省略すると出力自身の重なり。 |
+| `windows` | *signal* `(WaylandWindow \| string)[]` | 指定したウィンドウ（オブジェクトか ID）だけを重なり順で描きます。**非表示でも描きます**（表示時と同じ姿で）。省略すると出力自身の重なり。 |
 | `offsetX`, `offsetY` | *signal* `number` | ウィンドウをずらす量（論理ピクセル）。 |
 
 `windows` を省略したノードは出力自身の重なりで、出力が表示しているものを閉じかけの
@@ -83,6 +83,8 @@ COMPOSITOR.rendering.composition = (output: OutputInfo) => CompositionRenderable
 | `antialias` | *signal* `boolean` | 4x マルチサンプルのエッジ（既定 true）。 |
 
 平面は奥から手前の順に描かれ、半透明の平面は奥のものの上にブレンドされます。
+テクスチャの完全に透明な部分（ウィンドウのテクスチャの影の余白など）は奥のものを
+隠しません。同じ深さの平面はちらつくので、重なる平面は z をずらしてください。
 
 ### `<Plane>`
 
@@ -158,6 +160,23 @@ const camera = {
   projection: perspective(50, width / height, 1, 10_000),
   view: lookAt([0, 300, 1600], [0, 0, 0]),
 };
+```
+
+### 当たり判定
+
+| ヘルパー | |
+| --- | --- |
+| `projectPoint(camera, viewport, [x, y, z])` | ワールドの点が写る位置 `{ x, y, depth }`（ビューポート左上からの論理ピクセル。`depth` は小さいほど手前）。カメラの後ろなら `null`。 |
+| `pickPlane(camera, viewport, planes, x, y)` | `(x, y)` の下で一番手前の平面の添字、無ければ `null`。`planes` には `<Plane>` と同じ `width`・`height`・`transform` を渡します。 |
+
+`viewport` は `<Scene3D>` の `{ width, height }` です。
+[入力グラブ](./keybindings-and-pointer.md#入力グラブ)と組み合わせると 3D の配置を
+クリックできるようになります:
+
+```ts
+const { width, height } = outputLogicalSize(output);
+const hit = pickPlane(screenCamera(output), { width, height }, planes,
+  event.position.x - output.position.x, event.position.y - output.position.y);
 ```
 
 ## 型

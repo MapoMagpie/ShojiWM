@@ -163,6 +163,9 @@ impl ConfigRuntime for TypeScriptRuntime {
                 InputRequest::GestureSwipe(event) => {
                     RuntimeReply::PointerHook(evaluator.gesture_swipe(event, now)?)
                 }
+                InputRequest::InputGrab { grab_id, event } => {
+                    RuntimeReply::PointerHook(evaluator.input_grab_event(grab_id, event, now)?)
+                }
             },
             RuntimeRequest::Effect(request) => match request {
                 EffectRequest::Background => {

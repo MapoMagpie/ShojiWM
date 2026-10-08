@@ -70,6 +70,19 @@ moment later — switch the game to windowed mode first, then press the key.
 | `Super` + `Ctrl` + `↑` / `↓` | Switch to the previous / next workspace |
 | `Super` + `Shift` + `↑` / `↓` | Move the focused window to the previous / next workspace |
 
+### Window switcher (Flip 3D)
+
+| Shortcut | Action |
+| --- | --- |
+| `Super` + `Tab` | Open the switcher with the previous window in front |
+| `Tab` / `Shift` + `Tab` (holding `Super`) | Next / previous window |
+| `←` `→` `↑` `↓`, mouse wheel, touchpad scroll, three-finger swipe | Flip through the windows |
+| Release `Super`, `Return`, `Space` | Switch to the front window |
+| Click a window | Switch to that window |
+| `Escape` | Back to the desktop unchanged |
+
+See [Flip 3D](#flip-3d) below.
+
 ### System (built into the compositor)
 
 These are hard-wired in the compositor itself, not defined by the config — so
@@ -115,6 +128,30 @@ and floating per workspace:
 
 The default config also exposes the workspace layout over an IPC socket so an
 external bar (shoji-bar-3) can render workspace indicators and react to changes.
+
+## Flip 3D
+
+`Super` + `Tab` opens a Windows Vista style window switcher
+(`packages/config/src/flip-3d.tsx`). Every window, on every workspace and
+minimized ones too, lifts off the desktop into a receding diagonal stack, most
+recently used in front; the bars stay on screen. Choosing a window switches to
+its workspace, restores it if it was minimized, and focuses it, while the stack
+settles back onto the desktop.
+
+- Opening and closing use the window manager's easing and start and end on
+  the windows' real positions, so the desktop morphs into the stack and back.
+- While the switcher is open it takes all input (an
+  [input grab](./keybindings-and-pointer.md#input-grab)): clicks and keys go to
+  the switcher, not to the windows behind it.
+- The front window glows white: its decoration's shadow turns white while it
+  is selected (`FLIP_3D.selectedWindowId`).
+- Window blur is switched off while the switcher is open (each window is drawn
+  alone into a texture there, with nothing under it to blur) and fades back in
+  as the stack settles.
+
+The stack's look (how many windows, spacing, tilt, timing) is set by the
+constants at the top of `flip-3d.tsx`. It is built from
+[output composition](./output-composition.md).
 
 ## Multi-monitor
 

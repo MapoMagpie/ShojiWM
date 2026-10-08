@@ -115,14 +115,15 @@ function zoomed(output: OutputInfo) {
 ## ウィンドウごとのテクスチャ
 
 テクスチャには 1 つのウィンドウだけを収めることもできます。テクスチャをウィンドウの
-大きさにし、`offsetX`/`offsetY` でウィンドウをテクスチャの角に合わせます。影のぶんの
-余白を取っておきます。
+大きさにし、`offsetX`/`offsetY` でウィンドウをテクスチャの角に合わせます。大きさには
+装飾込みのウィンドウ全体である `window.rect` を使い（`window.position` はタイトルバーを
+含まないクライアント領域です）、影のぶんの余白を取っておきます。
 
 ```tsx
 const MARGIN = 48;
 
 function windowTexture(output: OutputInfo, window: WaylandWindow) {
-  const { x, y, width, height } = window.position;
+  const { x, y, width, height } = window.rect;
   return renderTexture({
     key: `window-${window.id}`,
     width: width + MARGIN * 2,
@@ -145,62 +146,53 @@ function windowTexture(output: OutputInfo, window: WaylandWindow) {
 ### 3D ウィンドウスイッチャー
 
 ウィンドウごとのテクスチャがあれば、Windows Vista の「フリップ 3D」風のスイッチャーは
-平面を並べるだけです:
+平面の列として作れます。デフォルト設定に同梱されています:
+`packages/config/src/flip-3d.tsx`（`Super` + `Tab`、[Flip 3D](./default-config.md#flip-3d) 参照）。
+構成要素:
 
-```tsx
-const [selected, setSelected] = signal<number | null>(null);
+- **配置。** 各ウィンドウはそのテクスチャの `<Plane>` で、`screenCamera(output)` の
+  `<Scene3D>` 1 つに並べます。ウィンドウの*実位置の姿勢*（中心への平行移動、回転なし、
+  倍率 1）では平面がちょうど画面上のウィンドウに重なり、*スロットの姿勢*では列の中に
+  入ります。開くときは実位置→スロット、閉じるときはスロット→実位置へ補間するので、
+  デスクトップがそのまま列に変形して戻ります。補間するのは行列ではなく数値（位置・角度・
+  倍率・不透明度）です。
+- **入力。** 開いている間は[入力グラブ](./keybindings-and-pointer.md#入力グラブ)で
+  キーボード・クリック・ホイール・スワイプを受け取り、
+  [`pickPlane`](./output-composition-reference.md#当たり判定) でクリックをウィンドウに
+  変換します。`Super` + `Tab` から押し続けている `Super` を離すと、キーの離しとして届きます。
+- **切り替え。** 選んだウィンドウのアクティブ化は、ウィンドウマネージャー自身の
+  アニメーション（別ワークスペースへの切り替え、最小化からの復帰）*なしで*行い、
+  平面をウィンドウの新しい位置へ飛ばします。
+- **引き継ぎ。** すべての平面がウィンドウの上に重なったら `<DefaultComposition />` に
+  戻します。ease-out の曲線なら終わりより少し前に重なります。
 
-function flipComposition(output: OutputInfo, windows: WaylandWindow[]) {
-  const index = selected();
-  if (index === null || windows.length === 0) return null;
-  const { height } = outputLogicalSize(output);
-  // 選択中のウィンドウを手前に、次のものほど奥に。
-  const ordered = windows.map((_, i) => windows[(index + i) % windows.length]);
-  return (
-    <>
-      <Layers layers={["background", "bottom"]} />
-      <Scene3D camera={screenCamera(output, { distance: height * 0.6 })}>
-        {ordered.map((window, depth) => (
-          <Plane
-            texture={windowTexture(output, window)}
-            width={window.position.width + MARGIN * 2}
-            height={window.position.height + MARGIN * 2}
-            transform={transform3d()
-              .translate(depth * 90 - 150, depth * 40, -depth * 260)
-              .rotateY(-30)}
-          />
-        ))}
-      </Scene3D>
-      <Layers layers={["top", "overlay"]} />
-      <LayerPopups />
-    </>
-  );
+**ウィンドウごとのテクスチャの中のブラー。** テクスチャに単独で描いたウィンドウの下には
+何も無いので、そのウィンドウの backdrop ブラー（ガラスのタイトルバーなど）は空を
+ぼかしつつ、ウィンドウ 1 枚ごとにブラーのコストがかかります。スイッチャーを開いている間は、
+装飾がエフェクトを選ぶ箇所で signal を読んでエフェクトを外し、エフェクトの最後に強さを
+signal で受け取る段を付けて、引き継ぎの後にじわっと戻します:
+
+```glsl
+// backdrop-fade.frag: 0 = エフェクト無し（透明）、1 = そのままのエフェクト
+uniform float strength;
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
+    color.a = 1.0;
+    return color * strength;
 }
-
-COMPOSITOR.key.bind("flip-next", "Super+Tab", () =>
-  setSelected(((selected.peek() ?? -1) + 1) % Math.max(1, myWindows().length)));
-COMPOSITOR.key.bind("flip-pick", "Super+Return", () => {
-  const index = selected.peek();
-  if (index !== null) myWindows()[index]?.focus();
-  setSelected(null);
-});
 ```
 
-ほかのレシピと同じように `flipComposition(output, myWindows()) ?? <DefaultComposition />`
-で使います。`myWindows()` は手元のウィンドウ一覧です（ウィンドウマネージャーが持つ現在の
-ワークスペースのウィンドウなど）。並びのアニメーションは `createPoll` で平行移動を
-補間します。
-
-スイッチャーの表示中も、マウスはウィンドウの実際の位置に届きます。操作はキーボードで
-行ってください。
-
-**ウィンドウごとのテクスチャの中のブラー。** テクスチャにウィンドウが 1 つだけだと、
-その下には何も無いので、そのウィンドウの backdrop ブラー（ガラスのタイトルバーなど）は
-空をぼかすだけで、それでもウィンドウごとにブラー 1 回ぶんのコストがかかります。
-スイッチャーを開いている間は、エフェクトを選ぶ箇所で同じ signal を読んで、backdrop の
-無いエフェクトに切り替えてください:
-
-```ts
-COMPOSITOR.effect.window = (window) =>
-  selected() !== null ? { behind: TINT } : { behind: GLASS };
+```tsx
+const glass = compileEffect({
+  input: backdropSource(),
+  alpha: "preserve",
+  pipeline: [
+    dualKawaseBlur({ radius: 4, passes: 2 }),
+    shaderStage(loadShader("./src/effect/backdrop-fade.frag"), {
+      uniforms: { strength: backdropStrength },
+    }),
+  ],
+});
+// 装飾の中で:
+blurSuspended() ? <Box style={titlebar}>…</Box> : <ShaderEffect shader={glass} style={titlebar}>…</ShaderEffect>
 ```

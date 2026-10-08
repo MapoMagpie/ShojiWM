@@ -360,6 +360,7 @@ import {
   type RuntimeWindowActivateRequestEvent,
   type PointerMoveEvent,
   type GestureSwipeEvent,
+  dispatchInputGrabEvent,
   type RuntimeEventConfig,
   type RuntimePersistedState,
   updateOutputState,
@@ -660,6 +661,16 @@ interface GestureSwipeRequest {
   inputState?: Record<string, InputDeviceInfo>;
 }
 
+interface InputGrabRequest {
+  requestId: number;
+  kind: "inputGrab";
+  grabId: number;
+  event: Parameters<typeof dispatchInputGrabEvent>[1];
+  nowMs: number;
+  displayState?: Record<string, OutputStateSnapshot>;
+  inputState?: Record<string, InputDeviceInfo>;
+}
+
 interface GetEffectConfigRequest {
   requestId: number;
   kind: "getEffectConfig";
@@ -733,6 +744,7 @@ type RuntimeRequest =
   | WindowActivateRequest
   | PointerMoveRequest
   | GestureSwipeRequest
+  | InputGrabRequest
   | GetEffectConfigRequest
   | EvaluateLayerEffectsRequest
   | EvaluatePopupEffectsRequest
@@ -1036,6 +1048,7 @@ interface NativeInteractionSuccess {
     | "pointerMoveAsync"
     | "gestureSwipe"
     | "gestureSwipeAsync"
+    | "inputGrab"
     | "windowMove"
     | "windowResize";
   invoked: boolean;
@@ -1622,6 +1635,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
           case "lifecycleDisable":
           case "windowDecorationPolicy":
           case "workspaceActivate":
+          case "inputGrab":
             break;
         }
       }
@@ -2290,6 +2304,30 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               request.kind === "pointerMove"
                 ? invokePointerMove(events, request.event)
                 : await invokePointerMoveAsync(events, request.event);
+            const keyBindingConfig = pendingKeyBindingConfigPayload();
+            const pointerConfig = pendingPointerConfigPayload();
+            const inputConfig = pendingInputConfigPayload();
+            const eventConfig = pendingEventConfigPayload(events);
+            const processConfig = pendingProcessConfigPayload();
+            const processActions = pendingProcessActionsPayload();
+            await writeInteractionEventResponse(embeddedBridge, {
+              requestId: request.requestId,
+              ok: true,
+              kind: request.kind,
+              ...result,
+              displayConfig: pendingDisplayConfigPayload(),
+              workspaceConfig: pendingWorkspaceConfigPayload(),
+              keyBindingConfig,
+              pointerConfig,
+              inputConfig,
+              eventConfig,
+              processConfig,
+              processActions,
+            });
+          } else if (request.kind === "inputGrab") {
+            const result = interactionMutationResult(
+              dispatchInputGrabEvent(request.grabId, request.event),
+            );
             const keyBindingConfig = pendingKeyBindingConfigPayload();
             const pointerConfig = pendingPointerConfigPayload();
             const inputConfig = pendingInputConfigPayload();

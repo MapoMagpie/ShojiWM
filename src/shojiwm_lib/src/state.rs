@@ -172,6 +172,8 @@ pub struct RuntimeGestureSwipeState {
     pub last_timestamp: u64,
     pub velocity_x: f64,
     pub velocity_y: f64,
+    /// Began while an input grab was held: the whole gesture goes to the grab.
+    pub grabbed: bool,
 }
 
 /// Per-surface marker tracking whether we have already reinterpreted the cursor
@@ -448,6 +450,10 @@ pub struct ShojiWM {
     pub runtime_gesture_swipe_enabled: bool,
     pub runtime_gesture_swipe_async_enabled: bool,
     pub runtime_gesture_swipe: Option<RuntimeGestureSwipeState>,
+    /// The config's input grab (`COMPOSITOR.input.grab`), if one is held.
+    pub runtime_input_grab: Option<crate::runtime_input_grab::RuntimeInputGrabState>,
+    /// A key the grab took inside the keyboard filter, dispatched right after.
+    pub pending_input_grab_key_event: Option<crate::runtime_input_grab::InputGrabEventSnapshot>,
     pub current_keyboard_modifiers: ModifiersState,
     // Modifier-only tap detection (e.g. "Super"). If no other input occurs
     // between press and release, the release is treated as a tap.
@@ -1783,6 +1789,8 @@ impl ShojiWM {
             runtime_gesture_swipe_enabled: false,
             runtime_gesture_swipe_async_enabled: false,
             runtime_gesture_swipe: None,
+            runtime_input_grab: None,
+            pending_input_grab_key_event: None,
             current_keyboard_modifiers: ModifiersState::default(),
             tap_pressed_keys: 0,
             tap_armed_modifier: None,
@@ -2932,6 +2940,7 @@ impl ShojiWM {
                 HostMessage::OutputCompositions(compositions) => {
                     self.apply_output_compositions(compositions);
                 }
+                HostMessage::InputGrab(update) => self.apply_runtime_input_grab_update(update),
             }
         }
         // Swap at a quiet point of the loop rather than wherever the queue
@@ -3121,6 +3130,8 @@ impl ShojiWM {
         // leaving the textures to the watchdog deadline.
         self.finalize_all_closing_snapshots("config-hot-reload");
 
+        // The reloaded config knows nothing about a grab the old one held.
+        self.end_runtime_input_grab(None);
         self.sync_runtime_display_state();
         let reload_result = self.config_runtime.reload();
         self.drain_runtime_host_messages();

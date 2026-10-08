@@ -244,6 +244,8 @@ export {
   lookAt,
   screenCamera,
   outputLogicalSize,
+  projectPoint,
+  pickPlane,
   serializeOutputComposition,
 } from "./composition";
 export type {
@@ -261,6 +263,7 @@ export type {
   RenderTexture,
   RenderTextureOptions,
   ScreenCameraOptions,
+  PickablePlane,
   WireOutputComposition,
 } from "./composition";
 export type { OverlayOptions, OverlayHandle, OverlayEffectHandle, SnapshotSourceHandle } from "./overlay";
@@ -448,6 +451,20 @@ export {
   takePendingInputConfig,
   updateInputState,
 } from "./input";
+export {
+  dispatchInputGrabEvent,
+  resetInputGrab,
+  type InputGrab,
+  type InputGrabCancelReason,
+  type InputGrabKeyEvent,
+  type InputGrabModifiers,
+  type InputGrabOptions,
+  type InputGrabPoint,
+  type InputGrabPointerButtonEvent,
+  type InputGrabPointerMotionEvent,
+  type InputGrabScrollEvent,
+  type InputGrabState,
+} from "./input-grab";
 export {
   PROCESS_CONTROLLER,
   beginProcessConfigRegistration,

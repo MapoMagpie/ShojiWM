@@ -38,7 +38,7 @@ several nodes or in any order, e.g. Top below the windows.
 
 | Prop | Type | |
 | --- | --- | --- |
-| `windows` | *signal* `(WaylandWindow \| string)[]` | Exactly these windows (objects or ids), in stacking order, **drawn even when hidden**. Omit for the output's own stack. |
+| `windows` | *signal* `(WaylandWindow \| string)[]` | Exactly these windows (objects or ids), in stacking order, **drawn even when hidden** (as they would look shown). Omit for the output's own stack. |
 | `offsetX`, `offsetY` | *signal* `number` | Shift the windows, in logical pixels. |
 
 Without `windows`, the node is the output's own stack: what the output shows, with
@@ -82,6 +82,9 @@ layer of the composition.
 | `antialias` | *signal* `boolean` | 4x multisampled edges (default true). |
 
 Planes are drawn far to near; translucent planes blend over what lies behind them.
+Fully transparent parts of a texture (a window texture's empty shadow margin) do not
+hide what is behind them. Planes at the same depth fight; keep overlapping planes
+apart in z.
 
 ### `<Plane>`
 
@@ -158,6 +161,23 @@ const camera = {
   projection: perspective(50, width / height, 1, 10_000),
   view: lookAt([0, 300, 1600], [0, 0, 0]),
 };
+```
+
+### Picking
+
+| Helper | |
+| --- | --- |
+| `projectPoint(camera, viewport, [x, y, z])` | Where a world point lands, `{ x, y, depth }` in logical pixels from the viewport's top-left corner (`depth`: smaller is nearer), or `null` behind the camera. |
+| `pickPlane(camera, viewport, planes, x, y)` | Index of the nearest plane under `(x, y)`, or `null`. `planes` take the same `width`, `height` and `transform` as their `<Plane>`s. |
+
+`viewport` is `{ width, height }` of the `<Scene3D>`. With an
+[input grab](./keybindings-and-pointer.md#input-grab), this makes a 3D layout
+clickable:
+
+```ts
+const { width, height } = outputLogicalSize(output);
+const hit = pickPlane(screenCamera(output), { width, height }, planes,
+  event.position.x - output.position.x, event.position.y - output.position.y);
 ```
 
 ## Types

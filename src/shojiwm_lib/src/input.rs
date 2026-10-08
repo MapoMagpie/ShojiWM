@@ -37,6 +37,10 @@ use crate::{
         PointerMoveEventSnapshot, PointerMovePointSnapshot, ResizeEdges, RuntimeWindowAction,
         WindowAction, WindowMoveSourceSnapshot, WindowResizeSourceSnapshot,
     },
+    runtime_input_grab::{
+        InputGrabEventSnapshot, InputGrabStateSnapshot, RuntimeInputGrabState,
+        RuntimeInputGrabUpdate,
+    },
     state::{ShojiWM, TrackedDecorationInteractionTarget},
 };
 
@@ -457,7 +461,185 @@ impl ShojiWM {
         })
     }
 
-    fn dispatch_gesture_swipe_events(&mut self, event: GestureSwipeEventSnapshot) {
+    fn input_grab_modifiers(&self) -> PointerModifierStateSnapshot {
+        PointerModifierStateSnapshot {
+            logo: self.current_keyboard_modifiers.logo,
+            alt: self.current_keyboard_modifiers.alt,
+            ctrl: self.current_keyboard_modifiers.ctrl,
+            shift: self.current_keyboard_modifiers.shift,
+        }
+    }
+
+    fn input_grab_now_ms(&self) -> u64 {
+        std::time::Duration::from(self.clock.now()).as_millis() as u64
+    }
+
+    /// Start, replace or end the config's input grab.
+    pub(crate) fn apply_runtime_input_grab_update(&mut self, update: RuntimeInputGrabUpdate) {
+        if !update.active {
+            if self
+                .runtime_input_grab
+                .as_ref()
+                .is_some_and(|grab| grab.id == update.id)
+            {
+                self.end_runtime_input_grab(None);
+            }
+            return;
+        }
+        if self.session_lock_active {
+            // The lock owns input; tell the config its grab never started.
+            self.runtime_input_grab = Some(RuntimeInputGrabState {
+                id: update.id,
+                held_keys: Default::default(),
+            });
+            self.end_runtime_input_grab(Some("sessionLock"));
+            return;
+        }
+        if let Some(grab) = self.runtime_input_grab.as_mut() {
+            grab.id = update.id;
+            return;
+        }
+        let held_keys = self
+            .seat
+            .get_keyboard()
+            .map(|keyboard| keyboard.pressed_keys())
+            .unwrap_or_default();
+        self.runtime_input_grab = Some(RuntimeInputGrabState {
+            id: update.id,
+            held_keys,
+        });
+        info!(grab_id = update.id, "input grab started");
+
+        // Clients lose the pointer for the duration: hover states clear and
+        // the cursor goes back to the default arrow.
+        let pointer = self.seat.get_pointer().unwrap();
+        let location = pointer.current_location();
+        self.pointer_contents = Default::default();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.input_grab_now_ms() as u32,
+            },
+        );
+        pointer.frame(self);
+        // A point off every output: decoration hover handlers see a leave.
+        self.update_decoration_hover_target(Point::from((-1.0e9, -1.0e9)));
+        self.cursor_override = None;
+        self.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
+        self.schedule_redraw();
+    }
+
+    /// Drop the input grab, if any. With a `cancel_reason` the config is told
+    /// the compositor ended it.
+    pub(crate) fn end_runtime_input_grab(&mut self, cancel_reason: Option<&str>) {
+        let Some(grab) = self.runtime_input_grab.take() else {
+            return;
+        };
+        info!(grab_id = grab.id, reason = cancel_reason, "input grab ended");
+        if let Some(reason) = cancel_reason {
+            let event = InputGrabEventSnapshot::Cancel {
+                reason: reason.to_owned(),
+            };
+            let now_ms = self.input_grab_now_ms();
+            match self.config_runtime.input_grab_event(grab.id, &event, now_ms) {
+                Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
+                Err(error) => warn!(?error, "runtime input grab cancel failed"),
+            }
+        }
+        self.refresh_pointer_focus(self.input_grab_now_ms() as u32);
+        self.schedule_redraw();
+    }
+
+    /// Deliver `event` to the input grab. A runtime error ends the grab so a
+    /// broken handler cannot keep input away from the desktop.
+    fn dispatch_input_grab_event(&mut self, event: InputGrabEventSnapshot) {
+        let Some(grab_id) = self.runtime_input_grab.as_ref().map(|grab| grab.id) else {
+            return;
+        };
+        let now_ms = self.input_grab_now_ms();
+        match self.config_runtime.input_grab_event(grab_id, &event, now_ms) {
+            Ok(invocation) => self.handle_runtime_pointer_move_invocation(invocation),
+            Err(error) => {
+                warn!(?error, "runtime input grab event failed; releasing the grab");
+                self.end_runtime_input_grab(Some("error"));
+            }
+        }
+    }
+
+    fn input_grab_pointer_point(&self) -> (PointerMovePointSnapshot, Option<String>) {
+        let position = self
+            .seat
+            .get_pointer()
+            .map(|pointer| pointer.current_location())
+            .unwrap_or_default();
+        let output_name = self.output_at_point(position).map(|output| output.name());
+        (
+            PointerMovePointSnapshot {
+                x: position.x,
+                y: position.y,
+            },
+            output_name,
+        )
+    }
+
+    /// Pointer motion under a grab: move the cursor, focus nothing.
+    fn input_grab_pointer_motion(
+        &mut self,
+        previous: Point<f64, Logical>,
+        pos: Point<f64, Logical>,
+        time_msec: u32,
+    ) {
+        let pointer = self.seat.get_pointer().unwrap();
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: time_msec,
+            },
+        );
+        pointer.frame(self);
+        let (position, output_name) = self.input_grab_pointer_point();
+        self.dispatch_input_grab_event(InputGrabEventSnapshot::PointerMotion {
+            position,
+            delta: PointerMovePointSnapshot {
+                x: pos.x - previous.x,
+                y: pos.y - previous.y,
+            },
+            output_name,
+            modifiers: self.input_grab_modifiers(),
+            timestamp: u64::from(time_msec),
+        });
+        self.request_redraw_for_pointer_motion();
+    }
+
+    fn input_grab_pointer_button(&mut self, button: u32, state: ButtonState, time_msec: u32) {
+        let (position, output_name) = self.input_grab_pointer_point();
+        self.dispatch_input_grab_event(InputGrabEventSnapshot::PointerButton {
+            button,
+            button_name: crate::runtime_input_grab::button_name(button).map(str::to_owned),
+            state: match state {
+                ButtonState::Pressed => InputGrabStateSnapshot::Pressed,
+                ButtonState::Released => InputGrabStateSnapshot::Released,
+            },
+            position,
+            output_name,
+            modifiers: self.input_grab_modifiers(),
+            timestamp: u64::from(time_msec),
+        });
+    }
+
+    /// `grabbed`: the swipe began under an input grab. It then belongs to the
+    /// grab to its end; if the grab ends first, the rest is dropped.
+    fn dispatch_gesture_swipe_events(&mut self, event: GestureSwipeEventSnapshot, grabbed: bool) {
+        if grabbed {
+            self.dispatch_input_grab_event(InputGrabEventSnapshot::Swipe { event });
+            return;
+        }
         if !self.runtime_gesture_swipe_enabled && !self.runtime_gesture_swipe_async_enabled {
             return;
         }
@@ -596,6 +778,61 @@ impl ShojiWM {
                                 }
                             }
 
+                            // An input grab takes every key, except the
+                            // compositor's own escape hatches (quit, reload,
+                            // VT switch). Releases of keys held when the grab
+                            // started also reach the client that saw the press.
+                            if let Some(grab) = data.runtime_input_grab.as_mut() {
+                                data.tap_interrupted = true;
+                                let raw = handle.raw_latin_sym_or_raw_current_sym();
+                                let builtin = matches!(
+                                    key_phase,
+                                    crate::runtime_key_binding::RuntimeKeyBindingPhase::Press,
+                                ) && raw.is_some_and(|raw| {
+                                    let raw = raw.raw();
+                                    (modifiers.logo
+                                        && modifiers.shift
+                                        && !modifiers.ctrl
+                                        && !modifiers.alt
+                                        && (raw == keysyms::KEY_q || raw == keysyms::KEY_r))
+                                        || (modifiers.ctrl
+                                            && modifiers.alt
+                                            && (keysyms::KEY_F1..=keysyms::KEY_F12).contains(&raw))
+                                });
+                                if !builtin {
+                                    let released = matches!(
+                                        key_phase,
+                                        crate::runtime_key_binding::RuntimeKeyBindingPhase::Release,
+                                    );
+                                    let held_release =
+                                        released && grab.held_keys.remove(&handle.raw_code());
+                                    data.pending_input_grab_key_event =
+                                        Some(InputGrabEventSnapshot::Key {
+                                            key: raw
+                                                .map(smithay::input::keyboard::xkb::keysym_get_name)
+                                                .unwrap_or_default(),
+                                            keycode: handle.raw_code().raw(),
+                                            state: if released {
+                                                InputGrabStateSnapshot::Released
+                                            } else {
+                                                InputGrabStateSnapshot::Pressed
+                                            },
+                                            modifiers: PointerModifierStateSnapshot {
+                                                logo: modifiers.logo,
+                                                alt: modifiers.alt,
+                                                ctrl: modifiers.ctrl,
+                                                shift: modifiers.shift,
+                                            },
+                                            timestamp: u64::from(time),
+                                        });
+                                    return if held_release {
+                                        FilterResult::Forward
+                                    } else {
+                                        FilterResult::Intercept(KeyboardAction::Forward)
+                                    };
+                                }
+                            }
+
                             // An open `Auto` popup takes Escape before the
                             // focused client (light dismiss).
                             if matches!(
@@ -721,6 +958,10 @@ impl ShojiWM {
                     KeyboardAction::Forward => {}
                 }
 
+                if let Some(event) = self.pending_input_grab_key_event.take() {
+                    self.dispatch_input_grab_event(event);
+                }
+
                 // Fire any modifier-only tap bindings queued above (the release was already forwarded).
                 if !self.pending_tap_binding_ids.is_empty() {
                     let ids = std::mem::take(&mut self.pending_tap_binding_ids);
@@ -810,6 +1051,10 @@ impl ShojiWM {
                         SERIAL_COUNTER.next_serial(),
                         event.time_msec(),
                     );
+                    return;
+                }
+                if self.runtime_input_grab.is_some() {
+                    self.input_grab_pointer_motion(previous_pos, pos, event.time_msec());
                     return;
                 }
 
@@ -904,6 +1149,10 @@ impl ShojiWM {
                     self.forward_locked_pointer_motion(pos, serial, event.time_msec());
                     return;
                 }
+                if self.runtime_input_grab.is_some() {
+                    self.input_grab_pointer_motion(previous_pos, pos, event.time_msec());
+                    return;
+                }
 
                 self.pointer_contents = self.pointer_contents_at(pos);
                 let under = self.pointer_contents.surface.clone();
@@ -967,6 +1216,10 @@ impl ShojiWM {
                         serial,
                         event.time_msec(),
                     );
+                    return;
+                }
+                if self.runtime_input_grab.is_some() {
+                    self.input_grab_pointer_button(button, button_state, event.time_msec());
                     return;
                 }
 
@@ -1629,6 +1882,27 @@ impl ShojiWM {
                     let _ = self.display_handle.flush_clients();
                     return;
                 }
+                if self.runtime_input_grab.is_some() {
+                    let (position, output_name) = self.input_grab_pointer_point();
+                    self.dispatch_input_grab_event(InputGrabEventSnapshot::Scroll {
+                        delta_x: horizontal_amount,
+                        delta_y: vertical_amount,
+                        discrete_x: horizontal_amount_discrete,
+                        discrete_y: vertical_amount_discrete,
+                        source: match source {
+                            AxisSource::Wheel => "wheel",
+                            AxisSource::Finger => "finger",
+                            AxisSource::Continuous => "continuous",
+                            AxisSource::WheelTilt => "wheelTilt",
+                        }
+                        .to_owned(),
+                        position,
+                        output_name,
+                        modifiers: self.input_grab_modifiers(),
+                        timestamp: u64::from(event.time_msec()),
+                    });
+                    return;
+                }
 
                 // Mouse-wheel shortcuts use the same configurable runtime
                 // binding path as keyboard shortcuts. Touchpad/finger scrolling
@@ -1675,7 +1949,10 @@ impl ShojiWM {
                 pointer.frame(self);
             }
             InputEvent::GestureSwipeBegin { event, .. } => {
-                if !self.runtime_gesture_swipe_enabled && !self.runtime_gesture_swipe_async_enabled
+                let grabbed = self.runtime_input_grab.is_some();
+                if !grabbed
+                    && !self.runtime_gesture_swipe_enabled
+                    && !self.runtime_gesture_swipe_async_enabled
                 {
                     return;
                 }
@@ -1704,6 +1981,7 @@ impl ShojiWM {
                     last_timestamp: timestamp,
                     velocity_x: 0.0,
                     velocity_y: 0.0,
+                    grabbed,
                 });
                 self.dispatch_gesture_swipe_events(GestureSwipeEventSnapshot {
                     phase: GestureSwipePhaseSnapshot::Begin,
@@ -1718,10 +1996,16 @@ impl ShojiWM {
                     output_name,
                     device,
                     timestamp,
-                });
+                }, grabbed);
             }
             InputEvent::GestureSwipeUpdate { event, .. } => {
-                if !self.runtime_gesture_swipe_enabled && !self.runtime_gesture_swipe_async_enabled
+                let grabbed = self
+                    .runtime_gesture_swipe
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.grabbed);
+                if !grabbed
+                    && !self.runtime_gesture_swipe_enabled
+                    && !self.runtime_gesture_swipe_async_enabled
                 {
                     return;
                 }
@@ -1772,10 +2056,16 @@ impl ShojiWM {
                     output_name,
                     device,
                     timestamp,
-                });
+                }, grabbed);
             }
             InputEvent::GestureSwipeEnd { event, .. } => {
-                if !self.runtime_gesture_swipe_enabled && !self.runtime_gesture_swipe_async_enabled
+                let grabbed = self
+                    .runtime_gesture_swipe
+                    .as_ref()
+                    .is_some_and(|gesture| gesture.grabbed);
+                if !grabbed
+                    && !self.runtime_gesture_swipe_enabled
+                    && !self.runtime_gesture_swipe_async_enabled
                 {
                     self.runtime_gesture_swipe = None;
                     return;
@@ -1817,7 +2107,7 @@ impl ShojiWM {
                     output_name,
                     device,
                     timestamp,
-                });
+                }, grabbed);
             }
             _ => {}
         }
@@ -2942,7 +3232,7 @@ impl ShojiWM {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        if pointer.is_grabbed() {
+        if pointer.is_grabbed() || self.runtime_input_grab.is_some() {
             return;
         }
         if self.active_pointer_lock_focus(&pointer).is_some() {

@@ -68,3 +68,45 @@ COMPOSITOR.pointer.bindWindowMoveModifier('Super');
 `<WindowBorder interaction={{resizeHitArea: …}}>` の prop で設定します。
 [SSD コンポーネント](./components.md#windowborder) を参照してください。
 :::
+
+## 入力グラブ
+
+`COMPOSITOR.input.grab(handlers)` は、返されたグラブを解放するまで入力をすべて
+受け取ります。キー・ポインタのボタン・スクロール・スワイプがクライアントではなく
+ハンドラーに届きます。デフォルト設定の [Flip 3D](./default-config.md#flip-3d)
+スイッチャーのような、コンポジター自身が描くモーダルな UI のためのものです。
+
+```ts
+const grab = COMPOSITOR.input.grab({
+  onKey(event) {
+    // { key: "Escape", keycode, state: "pressed" | "released", modifiers, timestamp }
+    if (event.key === "Escape" && event.state === "pressed") grab.release();
+  },
+  onPointerMotion(event) {},  // { position, delta, outputName, modifiers }
+  onPointerButton(event) {},  // { button, buttonName: "left" | ..., state, position, outputName }
+  onScroll(event) {},         // { deltaX, deltaY, discreteX, discreteY, source, position }
+  onSwipe(event) {},          // GestureSwipeEvent
+  onCancel(reason) {},        // "sessionLock" | "error" | "replaced"
+});
+```
+
+- **すべてグラブに届きます。** 保持中はキーバインドが発火しません。例外はコンポジター
+  組み込みのもの（`Super` + `Shift` + `R` / `Q`、`Ctrl` + `Alt` + `F1`〜`F12`）です。
+  座標はグローバルな論理ピクセルです。
+- **ポインタはカーソルを動かし続けます。** その間クライアントはポインタフォーカスを
+  失い（ホバー状態が解除されます）、グラブが終わると戻ります。
+- **グラブ開始時に押されていたキー**は、離したイベントがグラブに加えて押下を受け取った
+  クライアントにも届きます。グラブを開くために押していた修飾キー（`Super` + `Tab` の
+  `Super`）がフォーカス中のウィンドウで押しっぱなしになりません。「押している間だけ
+  開く」UI はこの離したイベントで手を離したことを知れます。
+- **キー名**はショートカットと同じ xkb の keysym 名です: `"Tab"`・`"Return"`・
+  `"space"`・`"Escape"`・`"Left"`・`"Super_L"`・`"a"`。
+- **コンポジターは自らグラブを終了します。** 画面ロック時・ハンドラーが例外を投げたとき・
+  ホットリロード時です。壊れた設定でデスクトップを操作不能にしないためで、`onCancel` で
+  通知されます（リロード時はその設定が消えるので通知はありません）。別のグラブを始めると
+  現在のものは置き換えられ、その `onCancel` に `"replaced"` が届きます。
+- タッチ入力はグラブしません。
+
+ウィンドウを操作する呼び出し（`window.focus()`、ウィンドウマネージャー経由のアクティブ化）は
+キーバインドと同じようにハンドラー内で使えます。3D の配置では
+[`pickPlane`](./output-composition-reference.md#当たり判定) でポインタの下の平面を求められます。

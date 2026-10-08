@@ -45,7 +45,13 @@ uniform sampler2D tex;
 uniform float alpha;
 varying highp vec2 v_uv;
 void main() {
-    gl_FragColor = texture2D(tex, v_uv) * alpha;
+    vec4 color = texture2D(tex, v_uv) * alpha;
+    // Fully transparent texels (a texture's empty margin) must not write
+    // depth, or they would hide the planes behind them.
+    if (color.a < 1.0 / 255.0) {
+        discard;
+    }
+    gl_FragColor = color;
 }
 "#;
 
@@ -625,7 +631,10 @@ mod tests {
             .import_memory(&GREEN.repeat(16), Fourcc::Abgr8888, (4, 4).into(), false)
             .unwrap();
 
-        let inputs = vec![Some((rendered.clone(), 1)), Some((green, 1))];
+        let clear = renderer
+            .import_memory(&[0u8; 64], Fourcc::Abgr8888, (4, 4).into(), false)
+            .unwrap();
+        let inputs = vec![Some((rendered.clone(), 1)), Some((green, 1)), Some((clear, 1))];
         // A plane covering clip space with identity camera: the scene must
         // reproduce the input exactly, top stays top.
         let mut spec = Scene3dSpec {
@@ -649,6 +658,14 @@ mod tests {
         // Depth: the green plane is nearer (identity projection keeps z as
         // depth; smaller z is nearer), whatever the draw order.
         spec.objects = vec![plane(1, translate_z(-0.5)), plane(0, translate_z(0.5))];
+        target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
+        assert_eq!(rows(&mut renderer, target.texture.as_ref().unwrap())[1][1], GREEN);
+        spec.objects.reverse();
+        target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
+        assert_eq!(rows(&mut renderer, target.texture.as_ref().unwrap())[1][1], GREEN);
+
+        // A fully transparent plane in front hides nothing.
+        spec.objects = vec![plane(2, translate_z(-0.5)), plane(1, translate_z(0.5))];
         target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
         assert_eq!(rows(&mut renderer, target.texture.as_ref().unwrap())[1][1], GREEN);
         spec.objects.reverse();

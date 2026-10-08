@@ -10604,7 +10604,14 @@ fn window_scene_elements_for_capture(
     let visual_state = window_decorations
         .get(window)
         .map(|decoration| {
-            let transform = decoration.visual_transform;
+            // A hidden window picked by id shows untransformed (see the live path).
+            let forced = force_visible_on
+                .is_some_and(|output| decoration.managed_window_hidden_on_output(output));
+            let transform = if forced {
+                crate::ssd::WindowTransform::default()
+            } else {
+                decoration.visual_transform
+            };
             let rect = decoration.layout.root.rect;
             let logical_origin = Point::<f64, Logical>::from((
                 rect.x as f64 + rect.width as f64 * transform.origin.x,
@@ -10626,10 +10633,7 @@ fn window_scene_elements_for_capture(
                     transform.translate_y,
                 ))
                 .to_physical_precise_round(scale),
-                opacity: match force_visible_on {
-                    Some(output) if decoration.managed_window_hidden_on_output(output) => 1.0,
-                    _ => transform.opacity,
-                },
+                opacity: transform.opacity,
             }
         })
         .unwrap_or(WindowVisualState {
@@ -12921,19 +12925,21 @@ fn tty_window_stack_elements(
                     true,
                 );
             }
-            // Hiding a window also zeroes its opacity (even while an animation keeps
-            // it rendering); a plan that picks a hidden window by id (another
-            // workspace, say) shows it as it would look shown.
-            let visual_state = if force_visible
-                && window_decorations.get(window).is_some_and(|decoration| {
-                    decoration.managed_window_hidden_on_output(output.name().as_str())
-                }) {
-                WindowVisualState {
-                    opacity: 1.0,
-                    ..visual_state
-                }
-            } else {
-                visual_state
+            // Hiding a window also zeroes its opacity and may leave it transformed
+            // (a minimize animation's end pose); a plan that picks a hidden window by
+            // id (another workspace, a minimized window) shows it as it would look
+            // shown, untransformed at its rect.
+            let visual_state = match window_decorations.get(window).filter(|decoration| {
+                force_visible
+                    && decoration.managed_window_hidden_on_output(output.name().as_str())
+            }) {
+                Some(decoration) => window_visual_state(
+                    decoration.layout.root.rect,
+                    crate::ssd::WindowTransform::default(),
+                    output_geo,
+                    scale,
+                ),
+                None => visual_state,
             };
             let snap_scale = Scale::from((
                 scale.x * visual_state.scale.x.max(0.0),

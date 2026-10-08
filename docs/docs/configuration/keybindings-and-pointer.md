@@ -75,3 +75,47 @@ Interactive resize hit areas are configured per-window via the
 `<WindowBorder interaction={{resizeHitArea: …}}>` prop — see
 [SSD Components](./components.md#windowborder).
 :::
+
+## Input grab
+
+`COMPOSITOR.input.grab(handlers)` takes all input until the returned grab is
+released: keys, pointer buttons, scrolling and swipes go to your handlers
+instead of the clients. It is for modal UIs the compositor draws itself, such
+as the default config's [Flip 3D](./default-config.md#flip-3d) switcher.
+
+```ts
+const grab = COMPOSITOR.input.grab({
+  onKey(event) {
+    // { key: "Escape", keycode, state: "pressed" | "released", modifiers, timestamp }
+    if (event.key === "Escape" && event.state === "pressed") grab.release();
+  },
+  onPointerMotion(event) {},  // { position, delta, outputName, modifiers }
+  onPointerButton(event) {},  // { button, buttonName: "left" | ..., state, position, outputName }
+  onScroll(event) {},         // { deltaX, deltaY, discreteX, discreteY, source, position }
+  onSwipe(event) {},          // a GestureSwipeEvent
+  onCancel(reason) {},        // "sessionLock" | "error" | "replaced"
+});
+```
+
+- **Everything goes to the grab.** Key bindings do not fire while it is held,
+  except the compositor's own (`Super` + `Shift` + `R` / `Q`, `Ctrl` + `Alt` +
+  `F1`–`F12`). Positions are global logical pixels.
+- **The pointer still moves the cursor.** Clients lose pointer focus for the
+  duration (hover states clear) and get it back when the grab ends.
+- **Keys held when the grab starts** deliver their release to the client that
+  saw the press, as well as to the grab, so a modifier held to open the grab
+  (`Super` in `Super` + `Tab`) is not left stuck in the focused window. Its
+  release is also how a "hold to keep open" UI notices the user let go.
+- **Key names** are xkb keysym names, as in shortcuts: `"Tab"`, `"Return"`,
+  `"space"`, `"Escape"`, `"Left"`, `"Super_L"`, `"a"`.
+- **The compositor ends the grab on its own** when the screen locks, when a
+  handler throws, and on hot reload, so a broken config cannot keep the desktop
+  unreachable. `onCancel` tells you (not on reload: that config is gone).
+  Starting another grab replaces the current one, whose `onCancel` gets
+  `"replaced"`.
+- Touch input is not grabbed.
+
+Calls that act on windows (`window.focus()`, activating a window through your
+window manager) work in the handlers as they do in key bindings. Inside a 3D
+layout, [`pickPlane`](./output-composition-reference.md#picking) finds the
+plane under the pointer.

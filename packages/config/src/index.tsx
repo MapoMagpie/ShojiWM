@@ -26,6 +26,7 @@ import {
   popupSource,
   Popup,
   type ReadonlySignal,
+  DefaultComposition,
 } from "shoji_wm";
 import type { CompositionRenderable, ManagedWindowRect } from "shoji_wm/types";
 import { createIpcServer } from "shoji_wm/ipc";
@@ -47,6 +48,7 @@ import {
   WINDOW_STATE_WORKSPACE_OPACITY,
 } from "./window-manager";
 import { ISLAND_GLASS } from "./effect/island-glass";
+import { createFlip3D } from "./flip-3d";
 
 COMPOSITOR.env.apply({
   QT_QPA_PLATFORM: "wayland;xcb",
@@ -77,12 +79,49 @@ COMPOSITOR.window.decoration.configure((_window, context) => {
 COMPOSITOR.rendering.framePacing = "throughput";
 
 const HYBRID_WINDOW_MANAGER = new HybridWindowManager(naturalRootRect);
+
+// Flip 3D window switcher (Super+Tab, see ./flip-3d.tsx).
+const FLIP_3D = createFlip3D({
+  windowManager: HYBRID_WINDOW_MANAGER,
+  stackOrder: (window) =>
+    window.state[WINDOW_STATE_FULLSCREEN]()
+      ? FULLSCREEN_Z_INDEX
+      : windowZIndex(window),
+});
+COMPOSITOR.rendering.composition = (output) =>
+  FLIP_3D.compose(output) ?? <DefaultComposition />;
+
+// Window backdrop effects end with this stage so they can fade back in after
+// the switcher closes.
+const backdropFade = () =>
+  shaderStage(loadShader("./src/effect/backdrop-fade.frag"), {
+    uniforms: { strength: FLIP_3D.backdropStrength },
+  });
 const HOT_RELOAD_WINDOW_MANAGER_STATE = "config.hybrid-window-manager";
 const FULLSCREEN_Z_INDEX = 2_000_000_000;
 const FLOATING_WINDOW_Z_INDEX_BASE = 1_500_000_000;
 const WINDOW_STACK_Z_INDEX_RANGE = 100_000_000;
 const FOCUSED_TILED_WINDOW_Z_INDEX = 1_000_000_000;
 const REORDERING_TILED_WINDOW_Z_INDEX = -2_000_000_000;
+
+/** Where a (non-fullscreen) window sits in the stack; higher is on top. */
+function windowZIndex(window: WaylandWindow): number {
+  const stackZIndex = HYBRID_WINDOW_MANAGER.getWindowZIndex(window)();
+  if (!window.state[WINDOW_STATE_WORKSPACE_TILED]()) {
+    return stackZIndex;
+  }
+  const stackOffset = Math.max(
+    -WINDOW_STACK_Z_INDEX_RANGE,
+    Math.min(WINDOW_STACK_Z_INDEX_RANGE, stackZIndex),
+  );
+  if (!window.state[WINDOW_STATE_TILED]()) {
+    return FLOATING_WINDOW_Z_INDEX_BASE + stackOffset;
+  }
+  if (window.state[WINDOW_STATE_TILE_REORDERING]()) {
+    return REORDERING_TILED_WINDOW_Z_INDEX;
+  }
+  return window.isFocused() ? FOCUSED_TILED_WINDOW_Z_INDEX : stackOffset;
+}
 
 COMPOSITOR.onDisable((event) => {
   if (event.isReloading) {
@@ -406,6 +445,9 @@ COMPOSITOR.key.bind("screenshot-freeze", "Super+Ctrl+P", () => {
 COMPOSITOR.key.bind("toggle-tiling-mode", "Super+S", () => {
   HYBRID_WINDOW_MANAGER.toggleCurrentWorkspaceTiling();
   scheduleWorkspaceBroadcast();
+});
+COMPOSITOR.key.bind("flip-3d", "Super+Tab", () => {
+  FLIP_3D.open(HYBRID_WINDOW_MANAGER.getCurrentMonitorName());
 });
 COMPOSITOR.key.bind("close-focused-window", "Super+Q", () => {
   HYBRID_WINDOW_MANAGER.closeFocusedWindow();
@@ -808,25 +850,7 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   // force no corner rounding CSD
   const tiled = true;
 
-  const stackZIndex = HYBRID_WINDOW_MANAGER.getWindowZIndex(window);
-  const zIndex = computed(() => {
-    if (!window.state[WINDOW_STATE_WORKSPACE_TILED]()) {
-      return stackZIndex();
-    }
-    const stackOffset = Math.max(
-      -WINDOW_STACK_Z_INDEX_RANGE,
-      Math.min(WINDOW_STACK_Z_INDEX_RANGE, stackZIndex()),
-    );
-    if (!window.state[WINDOW_STATE_TILED]()) {
-      return FLOATING_WINDOW_Z_INDEX_BASE + stackOffset;
-    }
-    if (window.state[WINDOW_STATE_TILE_REORDERING]()) {
-      return REORDERING_TILED_WINDOW_Z_INDEX;
-    }
-    return window.isFocused()
-      ? FOCUSED_TILED_WINDOW_Z_INDEX
-      : stackOffset;
-  });
+  const zIndex = computed(() => windowZIndex(window));
   const minimizeVisualIdle = window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE];
   const inactive = computed(
     () => minimizeVisualIdle() || (!workspaceVisible() && !tileDragging()),
@@ -836,10 +860,14 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
     focused ? "#d7ba7d" : "#4f5666",
   );
   // A soft drop shadow under the frame; the focused window floats a bit higher.
-  const windowShadow = window.isFocused((focused) =>
-    focused
-      ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
-      : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
+  // The window in front of the Flip 3D stack glows white instead (it fits in
+  // the switcher's texture margin).
+  const windowShadow = computed(() =>
+    FLIP_3D.selectedWindowId() === window.id
+      ? [{ blur: 28, spread: 4, color: "#ffffffd0" }]
+      : window.isFocused()
+        ? [{ y: 10, blur: 32, spread: -2, color: "#00000090" }]
+        : [{ y: 4, blur: 16, spread: -2, color: "#00000060" }],
   );
   const titlebarBackground = window.isFocused((focused) =>
     focused ? "#1f243080" : "#2a2f3a80",
@@ -872,15 +900,21 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
           glass_tint: 0.9,
         },
       }),
+      backdropFade(),
     ],
+    alpha: "preserve",
   });
 
   const titleOnlyShader = compileEffect({
     input: backdropSource(),
     capturePadding: 24,
     invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+    alpha: "preserve",
+    pipeline: [dualKawaseBlur({ radius: 4, passes: 2 }), backdropFade()],
   });
+  // No backdrop effects while the Flip 3D switcher shows the windows as
+  // textures: there is nothing under a window there to blur.
+  const blurSuspended = FLIP_3D.blurSuspended();
 
   const appIcon = (
     <AppIcon icon={window.icon} style={{ width: 16, height: 16 }} />
@@ -903,19 +937,28 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const maximizeButton = <MaximizeButton window={window} />;
   const closeButton = <CloseButton window={window} />;
 
+  const titlebarContent = [
+    appIcon,
+    label,
+    minimizeButton,
+    maximizeButton,
+    closeButton,
+  ];
   var innerComponents = (
     <Box direction="column">
-      <ShaderEffect
-        shader={titleOnlyShader}
-        direction="row"
-        style={titlebarStyle}
-      >
-        {appIcon}
-        {label}
-        {minimizeButton}
-        {maximizeButton}
-        {closeButton}
-      </ShaderEffect>
+      {blurSuspended ? (
+        <Box direction="row" style={titlebarStyle}>
+          {titlebarContent}
+        </Box>
+      ) : (
+        <ShaderEffect
+          shader={titleOnlyShader}
+          direction="row"
+          style={titlebarStyle}
+        >
+          {titlebarContent}
+        </ShaderEffect>
+      )}
       <ClientWindow />
     </Box>
   );
@@ -923,16 +966,17 @@ COMPOSITOR.window.composition = (window: WaylandWindow) => {
   const TERMINALS = ["kitty", "ghostty"];
 
   if (TERMINALS.includes(window.appId() ?? "")) {
-    innerComponents = (
+    const terminalContent = [
+      <Box direction="row" style={titlebarStyle}>
+        {titlebarContent}
+      </Box>,
+      <ClientWindow />,
+    ];
+    innerComponents = blurSuspended ? (
+      <Box direction="column">{terminalContent}</Box>
+    ) : (
       <ShaderEffect shader={backgroundShader} direction="column">
-        <Box direction="row" style={titlebarStyle}>
-          {appIcon}
-          {label}
-          {minimizeButton}
-          {maximizeButton}
-          {closeButton}
-        </Box>
-        <ClientWindow />
+        {terminalContent}
       </ShaderEffect>
     );
   }

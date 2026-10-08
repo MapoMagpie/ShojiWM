@@ -137,7 +137,7 @@ const UNMAXIMIZE_GRAB_ANIMATION_DURATION = 90;
 // See `lastRestoreAtMs`: a restore and an activate closer together than this
 // are one taskbar click, so the minimize-raise toggle must not fire.
 const RESTORE_ACTIVATE_GRACE_MS = 100;
-const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);
+export const WINDOW_MANAGEMENT_EASING = cubicBezier(0.1, 0.9, 0.2, 1.0);
 const WINDOW_OPEN_EASING = cubicBezier(0.1, 1.1, 0.1, 1.1);
 const WINDOW_CLOSE_EASING = cubicBezier(0.3, -0.3, 0, 1);
 const WINDOW_MINIMIZE_RECT_EASING = cubicBezier(0.3, -0.3, 0, 1);
@@ -421,6 +421,9 @@ export class HybridWindowManager {
   // Tracks MRU focus time per window id so the dock can pick "the most recent
   // window of an app" deterministically. Updated by recordFocus().
   private readonly lastFocusedAt = new Map<string, number>();
+  // Set while `activateWindowById({ instant: true })` runs: state changes it
+  // makes skip their animations.
+  private instantTransitions = false;
   private readonly pendingInitialFocusByWindowId = new Map<string, number>();
   private readonly tileabilityByWindowId = new Map<string, boolean>();
   private readonly tileabilitySubscriptionsByWindowId = new Map<
@@ -1440,7 +1443,11 @@ export class HybridWindowManager {
         event.window.state[WINDOW_STATE_MINIMIZE_VISUAL_IDLE].set(true);
       }
       markWindowCompositionDirty(event.window);
-      scheduleMinimizeAnimation(event.window, event.minimized);
+      scheduleMinimizeAnimation(
+        event.window,
+        event.minimized,
+        this.instantTransitions,
+      );
     }
     if (workspace?.isTiled) {
       if (!event.minimized && workspace.shouldTile(event.window)) {
@@ -1729,7 +1736,7 @@ export class HybridWindowManager {
   public switchWorkspaceTo(
     monitor: string,
     targetIndex: number,
-    options: { focusActiveAfter?: boolean } = {},
+    options: { focusActiveAfter?: boolean; instant?: boolean } = {},
   ) {
     this.workspaceGesture = null;
     this.syncWorkspaces();
@@ -1757,22 +1764,28 @@ export class HybridWindowManager {
       workspace.setVisible(workspace.isActive());
     }
 
-    fromWorkspace.animateWorkspaceTransition({
-      fromOffsetY: 0,
-      toOffsetY: -direction * distance,
-      fromOpacity: 1,
-      toOpacity: 0,
-      visibleAfter: false,
-    });
-    toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
-    toWorkspace.applyLayout();
-    toWorkspace.animateWorkspaceTransition({
-      fromOffsetY: direction * distance,
-      toOffsetY: 0,
-      fromOpacity: 0,
-      toOpacity: 1,
-      visibleAfter: true,
-    });
+    if (options.instant) {
+      fromWorkspace.showInstantly(false);
+      toWorkspace.showInstantly(true);
+      toWorkspace.applyLayout({ animate: false });
+    } else {
+      fromWorkspace.animateWorkspaceTransition({
+        fromOffsetY: 0,
+        toOffsetY: -direction * distance,
+        fromOpacity: 1,
+        toOpacity: 0,
+        visibleAfter: false,
+      });
+      toWorkspace.prepareWorkspaceTransition(direction * distance, 0);
+      toWorkspace.applyLayout();
+      toWorkspace.animateWorkspaceTransition({
+        fromOffsetY: direction * distance,
+        toOffsetY: 0,
+        fromOpacity: 0,
+        toOpacity: 1,
+        visibleAfter: true,
+      });
+    }
     // Callers that explicitly want to focus a *different* window after the
     // transition (e.g. dock activation) opt out of the implicit focus so the
     // resulting onFocus callback chain does not stomp on their pan.
@@ -1909,6 +1922,35 @@ export class HybridWindowManager {
     return undefined;
   }
 
+  /**
+   * Every managed window across all workspaces, most recently focused first
+   * (the focused window leads).
+   */
+  public listWindowsByRecentUse(): WaylandWindow[] {
+    const lastUse = (window: WaylandWindow) =>
+      read(window.isFocused)
+        ? Number.POSITIVE_INFINITY
+        : (this.lastFocusedAt.get(window.id) ?? 0);
+    return this.listWindows()
+      .map((window, order) => ({ window, order, at: lastUse(window) }))
+      .sort((a, b) => b.at - a.at || a.order - b.order)
+      .map(({ window }) => window);
+  }
+
+  /**
+   * Whether `window` is on screen on `monitor` right now: its workspace is the
+   * active one there and it is not minimized.
+   */
+  public isWindowShownOn(window: WaylandWindow, monitor: string): boolean {
+    const workspace = this.findWorkspaceForWindow(window);
+    return (
+      workspace !== undefined &&
+      workspace.monitor === monitor &&
+      workspace.isActive() &&
+      !window.state[WINDOW_STATE_MINIMIZED]()
+    );
+  }
+
   /** Every managed window across all workspaces (debug/IPC use). */
   public listWindows(): WaylandWindow[] {
     const windows: WaylandWindow[] = [];
@@ -1928,7 +1970,17 @@ export class HybridWindowManager {
    *
    * Returns true if the window existed.
    */
-  public activateWindowById(windowId: string): boolean {
+  public activateWindowById(
+    windowId: string,
+    options: {
+      /**
+       * Jump there without the window manager's own animations and without
+       * the minimize-raise toggle: the caller (e.g. the Flip 3D switcher)
+       * animates the change itself.
+       */
+      instant?: boolean;
+    } = {},
+  ): boolean {
     const window = this.findWindowById(windowId);
     if (!window) {
       return false;
@@ -1937,15 +1989,21 @@ export class HybridWindowManager {
     if (!workspace) {
       return false;
     }
+    const instant = options.instant === true;
 
     if (window.state[WINDOW_STATE_MINIMIZED]()) {
-      this.onWindowMinimizeRequest({
-        window,
-        minimized: false,
-        source: "api",
-        timestamp: Date.now(),
-      });
-    } else if (this.minimizeOnReactivate(window, workspace)) {
+      this.instantTransitions = instant;
+      try {
+        this.onWindowMinimizeRequest({
+          window,
+          minimized: false,
+          source: "api",
+          timestamp: Date.now(),
+        });
+      } finally {
+        this.instantTransitions = false;
+      }
+    } else if (!instant && this.minimizeOnReactivate(window, workspace)) {
       // Minimize-raise toggle: an IPC activation is always a dock/taskbar
       // gesture, so re-activating the focused window minimizes it.
       return true;
@@ -1957,12 +2015,13 @@ export class HybridWindowManager {
     // onFocus → focusWindow → applyLayout cycle that overrides our pan.
     this.switchWorkspaceTo(workspace.monitor, workspace.index, {
       focusActiveAfter: false,
+      instant,
     });
 
     // Always pan to the target inside the workspace (force-center even if it
     // is already on-screen). This is the "go to this window" gesture.
     if (workspace.isTiled) {
-      workspace.panToWindow(window);
+      workspace.panToWindow(window, { animate: !instant });
     }
 
     // Focus last so it overrides switchWorkspaceTo's focusActiveWindow().
@@ -3823,6 +3882,14 @@ export class Workspace {
     }
   }
 
+  /** `setVisible` that also stops a running workspace slide/fade. */
+  public showInstantly(visible: boolean) {
+    for (const window of this.windows) {
+      cancelWorkspaceVisualAnimation(window);
+    }
+    this.setVisible(visible);
+  }
+
   public prepareWorkspaceTransition(offsetY: number, opacity: number) {
     this.visibilityAnimationToken += 1;
     for (const window of this.windows) {
@@ -4263,7 +4330,7 @@ export class Workspace {
    * normal `scrollToWindow` which is a no-op when already visible) and animate
    * the layout. Used by dock clicks and any other "jump to window" gesture.
    */
-  public panToWindow(window: WaylandWindow) {
+  public panToWindow(window: WaylandWindow, options: { animate?: boolean } = {}) {
     if (!this.isTiled) {
       return;
     }
@@ -4272,7 +4339,7 @@ export class Workspace {
     }
     this.activeWindowId = window.id;
     this.scrollToWindow(window, { force: true });
-    this.applyLayout();
+    this.applyLayout({ animate: options.animate ?? true });
   }
 
   public focusWindowUnderPointer(
@@ -5551,7 +5618,19 @@ function scheduleCloseAnimation(window: WaylandWindow): void {
 function scheduleMinimizeAnimation(
   window: WaylandWindow,
   minimized: boolean,
+  instant = false,
 ): void {
+  if (instant) {
+    // Replace whatever the channel holds with its end pose.
+    const rest = minimized ? { x: 0, y: 120, width: 0, height: 0 } : { x: 0, y: 0, width: 0, height: 0 };
+    const opacity = minimized ? 0 : 1;
+    window.scheduleAnimation({
+      channel: MINIMIZE_ANIMATION_CHANNEL,
+      rect: { from: rest, to: rest, duration: 1, mode: "add" },
+      opacity: { from: opacity, to: opacity, duration: 1, mode: "override" },
+    });
+    return;
+  }
   window.scheduleAnimation({
     channel: MINIMIZE_ANIMATION_CHANNEL,
     rect: {

@@ -1012,6 +1012,8 @@ impl ConfigRuntime for ReactiveRuntime {
                         let invoked = batch(|| emit(|listeners| listeners.gesture_swipe.clone(), |listener| listener(event)));
                         RuntimeReply::PointerHook(pointer_hook(invoked))
                     }
+                    // The Rust SDK does not start input grabs.
+                    InputRequest::InputGrab { .. } => RuntimeReply::Unhandled,
                 },
                 RuntimeRequest::Effect(request) => match request {
                     EffectRequest::Background => RuntimeReply::BackgroundEffect(

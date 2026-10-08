@@ -118,6 +118,7 @@ export interface Scene3DProps extends CompositionRect {
   clearColor?: MaybeSignal<CompositionColor>;
   /** Multisampled edges (default true). / エッジのアンチエイリアス（既定 true）。 */
   antialias?: MaybeSignal<boolean>;
+
   children?: CompositionRenderable | CompositionRenderable[];
 }
 
@@ -350,6 +351,115 @@ export function screenCamera(
     projection: perspective(fov, width / Math.max(height, 1), Math.max(distance / 100, 0.1), depth),
     view: lookAt([0, 0, distance], [0, 0, 0]),
   };
+}
+
+/**
+ * Where a world point lands on a scene's viewport, in logical pixels from its
+ * top-left corner, with its depth (NDC z, smaller is nearer). `null` behind
+ * the camera.
+ * ワールドの点がビューポートのどこに写るか（左上からの論理ピクセル）と深度。
+ * カメラの後ろなら `null`。
+ */
+export function projectPoint(
+  camera: Camera,
+  viewport: { width: number; height: number },
+  point: Vec3,
+): { x: number; y: number; depth: number } | null {
+  const clip = transformPoint(multiplyMat4(camera.projection, camera.view), point);
+  if (clip[3] <= 1e-6) {
+    return null;
+  }
+  const ndcX = clip[0] / clip[3];
+  const ndcY = clip[1] / clip[3];
+  return {
+    x: ((ndcX + 1) / 2) * viewport.width,
+    y: ((1 - ndcY) / 2) * viewport.height,
+    depth: clip[2] / clip[3],
+  };
+}
+
+function transformPoint(matrix: Mat4, point: Vec3): [number, number, number, number] {
+  const [x, y, z] = point;
+  return [
+    matrix[0] * x + matrix[4] * y + matrix[8] * z + matrix[12],
+    matrix[1] * x + matrix[5] * y + matrix[9] * z + matrix[13],
+    matrix[2] * x + matrix[6] * y + matrix[10] * z + matrix[14],
+    matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15],
+  ];
+}
+
+/** A plane as `pickPlane` sees it: the same numbers as its `<Plane>` props. */
+export interface PickablePlane {
+  width: number;
+  height: number;
+  transform?: Mat4 | Transform3D;
+}
+
+/**
+ * Hit-test planes the way a `<Scene3D>` with `camera` draws them: the index
+ * of the nearest plane under `(x, y)` (logical pixels from the viewport's
+ * top-left corner), or `null`. Use it to make a 3D layout clickable under an
+ * input grab.
+ * `camera` で描いた `<Scene3D>` の平面を当たり判定します。`(x, y)`（ビューポート
+ * 左上からの論理ピクセル）の下で一番手前の平面の添字、無ければ `null`。
+ */
+export function pickPlane(
+  camera: Camera,
+  viewport: { width: number; height: number },
+  planes: readonly PickablePlane[],
+  x: number,
+  y: number,
+): number | null {
+  let best: { index: number; depth: number } | null = null;
+  planes.forEach((plane, index) => {
+    const matrix =
+      plane.transform instanceof Transform3D
+        ? plane.transform.matrix
+        : (plane.transform ?? IDENTITY);
+    const halfWidth = plane.width / 2;
+    const halfHeight = plane.height / 2;
+    const corners: Vec3[] = [
+      [-halfWidth, halfHeight, 0],
+      [halfWidth, halfHeight, 0],
+      [halfWidth, -halfHeight, 0],
+      [-halfWidth, -halfHeight, 0],
+    ];
+    const projected = corners.map((corner) => {
+      const world = transformPoint(matrix, corner);
+      return projectPoint(camera, viewport, [world[0], world[1], world[2]]);
+    });
+    if (projected.some((point) => point === null)) {
+      return;
+    }
+    const quad = projected as { x: number; y: number; depth: number }[];
+    if (!pointInConvexQuad(quad, x, y)) {
+      return;
+    }
+    const depth = quad.reduce((sum, point) => sum + point.depth, 0) / 4;
+    if (!best || depth < best.depth) {
+      best = { index, depth };
+    }
+  });
+  return (best as { index: number; depth: number } | null)?.index ?? null;
+}
+
+function pointInConvexQuad(quad: readonly { x: number; y: number }[], x: number, y: number): boolean {
+  let sign = 0;
+  for (let i = 0; i < quad.length; i++) {
+    const a = quad[i];
+    const b = quad[(i + 1) % quad.length];
+    const cross = (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x);
+    if (cross === 0) {
+      continue;
+    }
+    const side = Math.sign(cross);
+    if (sign === 0) {
+      sign = side;
+    } else if (side !== sign) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -235,6 +235,7 @@ impl SessionLockHandler for ShojiWM {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
+        self.end_runtime_input_grab(Some("sessionLock"));
         crate::backend::overlay::close_all("Session locked");
         self.output_overlays.clear();
         self.session_lock_active = true;

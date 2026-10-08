@@ -115,13 +115,15 @@ function zoomed(output: OutputInfo) {
 ## Per-window textures
 
 A texture can frame a single window: size it to the window and shift the window to
-the texture's corner with `offsetX`/`offsetY`. Leave a margin for shadows.
+the texture's corner with `offsetX`/`offsetY`. Use `window.rect`, the whole
+decorated window (`window.position` is the client area without the title bar), and
+leave a margin for shadows.
 
 ```tsx
 const MARGIN = 48;
 
 function windowTexture(output: OutputInfo, window: WaylandWindow) {
-  const { x, y, width, height } = window.position;
+  const { x, y, width, height } = window.rect;
   return renderTexture({
     key: `window-${window.id}`,
     width: width + MARGIN * 2,
@@ -144,60 +146,52 @@ another workspace.
 ### A 3D window switcher
 
 With one texture per window, a Windows Vista "Flip 3D" style switcher is a row of
-planes:
+planes. The default config ships one: `packages/config/src/flip-3d.tsx`
+(`Super` + `Tab`, see [Flip 3D](./default-config.md#flip-3d)). Its parts:
 
-```tsx
-const [selected, setSelected] = signal<number | null>(null);
-
-function flipComposition(output: OutputInfo, windows: WaylandWindow[]) {
-  const index = selected();
-  if (index === null || windows.length === 0) return null;
-  const { height } = outputLogicalSize(output);
-  // The selected window in front, the next ones further back.
-  const ordered = windows.map((_, i) => windows[(index + i) % windows.length]);
-  return (
-    <>
-      <Layers layers={["background", "bottom"]} />
-      <Scene3D camera={screenCamera(output, { distance: height * 0.6 })}>
-        {ordered.map((window, depth) => (
-          <Plane
-            texture={windowTexture(output, window)}
-            width={window.position.width + MARGIN * 2}
-            height={window.position.height + MARGIN * 2}
-            transform={transform3d()
-              .translate(depth * 90 - 150, depth * 40, -depth * 260)
-              .rotateY(-30)}
-          />
-        ))}
-      </Scene3D>
-      <Layers layers={["top", "overlay"]} />
-      <LayerPopups />
-    </>
-  );
-}
-
-COMPOSITOR.key.bind("flip-next", "Super+Tab", () =>
-  setSelected(((selected.peek() ?? -1) + 1) % Math.max(1, myWindows().length)));
-COMPOSITOR.key.bind("flip-pick", "Super+Return", () => {
-  const index = selected.peek();
-  if (index !== null) myWindows()[index]?.focus();
-  setSelected(null);
-});
-```
-
-Use it like the others: `flipComposition(output, myWindows()) ?? <DefaultComposition />`.
-`myWindows()` is your window list, e.g. the current workspace's windows from your
-window manager. Animate the row by easing the translation from a `createPoll`.
-
-While the switcher is shown, the mouse still reaches the windows where they really
-are; drive it from the keyboard.
+- **Layout.** Each window is a `<Plane>` of its texture in one `<Scene3D>` with
+  `screenCamera(output)`. A window's *real pose* (translation to its centre, no
+  turn, scale 1) puts the plane exactly where the window is on screen; its *slot
+  pose* puts it in the stack. Opening interpolates real → slot, closing slot → real,
+  so the desktop morphs into the stack and back. Interpolate the numbers (position,
+  angle, scale, opacity), not the matrices.
+- **Input.** An [input grab](./keybindings-and-pointer.md#input-grab) takes the
+  keyboard, clicks, wheel and swipes while the switcher is open, and
+  [`pickPlane`](./output-composition-reference.md#picking) turns a click into a window.
+  Releasing `Super` (held since `Super` + `Tab`) arrives as a key release.
+- **Switching.** Ask the window manager to activate the chosen window *without* its
+  own animations (another workspace, a restore from minimized) and let the planes fly
+  to the windows' new positions.
+- **Hand-off.** Return to `<DefaultComposition />` once every plane sits on its
+  window, which with an ease-out curve happens a little before the end.
 
 **Blur inside per-window textures.** A window alone in its texture has nothing below
 it, so a backdrop blur on it (a glass titlebar, say) blurs empty space while still
-costing a blur per window. Switch those windows to an effect without a backdrop while
-the switcher is open, by reading the same signal where you pick the effect:
+costing a blur per window. Switch those effects off while the switcher is open by
+reading a signal where the decoration picks them, and give the effects a last stage
+whose strength is a signal, so they fade back in after the hand-off:
 
-```ts
-COMPOSITOR.effect.window = (window) =>
-  selected() !== null ? { behind: TINT } : { behind: GLASS };
+```glsl
+// backdrop-fade.frag: 0 = no effect (transparent), 1 = the effect as it is
+uniform float strength;
+vec4 shader_main(EffectContext effect) {
+    vec4 color = texture2D(tex, effect.texture_uv);
+    color.a = 1.0;
+    return color * strength;
+}
+```
+
+```tsx
+const glass = compileEffect({
+  input: backdropSource(),
+  alpha: "preserve",
+  pipeline: [
+    dualKawaseBlur({ radius: 4, passes: 2 }),
+    shaderStage(loadShader("./src/effect/backdrop-fade.frag"), {
+      uniforms: { strength: backdropStrength },
+    }),
+  ],
+});
+// in the decoration:
+blurSuspended() ? <Box style={titlebar}>…</Box> : <ShaderEffect shader={glass} style={titlebar}>…</ShaderEffect>
 ```

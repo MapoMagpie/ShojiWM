@@ -114,15 +114,19 @@ COMPOSITOR.rendering.composition = (output) => {
 `<Windows />` without props is the output's own stack: what it shows right now,
 closing windows and decoration popups included. `<Windows windows={[...]} />` draws
 exactly the given windows (objects or ids) in stacking order, **even when they are
-hidden**: the windows of another workspace, a minimized window.
+hidden**: the windows of another workspace, a minimized window. A hidden window is
+drawn as it would look shown, at its rect without the transform or fade that hides
+it.
 
 - Windows shown only through a composition still get frame callbacks, so clients keep
   rendering while hidden. Windows outside the composition's area are skipped and get
   none.
 - Input is not affected. It still goes to windows by their real position and
   visibility, whatever the composition draws. A plan that moves windows on screen
-  (an exposé, a 3D switcher) should take over the keyboard with bindings while it is
-  shown, and the window manager decides what is visible afterwards.
+  (an exposé, a 3D switcher) takes over input with an
+  [input grab](./keybindings-and-pointer.md#input-grab) while it is shown, hit-tests
+  its own layout ([`pickPlane`](./output-composition-reference.md#picking)), and
+  lets the window manager decide what is visible afterwards.
 
 ## Backdrop effects
 

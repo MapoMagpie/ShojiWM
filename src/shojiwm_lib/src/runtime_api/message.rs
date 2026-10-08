@@ -125,6 +125,12 @@ pub enum InputRequest<'a> {
     KeyBinding { binding_id: &'a str },
     PointerMove(&'a PointerMoveEventSnapshot),
     GestureSwipe(&'a GestureSwipeEventSnapshot),
+    /// Input taken by the config's input grab `grab_id`. Answered like a
+    /// pointer hook; a runtime that does not grab answers `Unhandled`.
+    InputGrab {
+        grab_id: u64,
+        event: &'a crate::runtime_input_grab::InputGrabEventSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]

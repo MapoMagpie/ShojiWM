@@ -70,6 +70,9 @@ pub enum HostMessage {
     OutputCompositions(
         std::collections::HashMap<String, crate::backend::composition::OutputComposition>,
     ),
+    /// Start or end the config's input grab (`COMPOSITOR.input.grab`). While
+    /// it is held, input arrives as `InputRequest::InputGrab`.
+    InputGrab(crate::runtime_input_grab::RuntimeInputGrabUpdate),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)

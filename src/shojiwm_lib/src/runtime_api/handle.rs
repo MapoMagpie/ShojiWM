@@ -435,6 +435,15 @@ impl RuntimeHandle {
         self.post(now_ms as f64, RuntimeEvent::GestureSwipe(event));
     }
 
+    pub fn input_grab_event(
+        &mut self,
+        grab_id: u64,
+        event: &crate::runtime_input_grab::InputGrabEventSnapshot,
+        now_ms: u64,
+    ) -> Result<DecorationPointerMoveAsyncInvocation, RuntimeError> {
+        self.pointer_hook_reply("input grab", now_ms, InputRequest::InputGrab { grab_id, event })
+    }
+
     pub fn background_effect_config(
         &mut self,
     ) -> Result<Option<BackgroundEffectConfig>, RuntimeError> {

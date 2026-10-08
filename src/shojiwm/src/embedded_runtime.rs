@@ -212,6 +212,19 @@ pub enum NativeInteractionRequest {
         #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
         input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
     },
+    InputGrab {
+        #[serde(rename = "requestId")]
+        request_id: u64,
+        #[serde(rename = "grabId")]
+        grab_id: u64,
+        event: shojiwm_lib::runtime_input_grab::InputGrabEventSnapshot,
+        #[serde(rename = "nowMs")]
+        now_ms: u64,
+        #[serde(rename = "displayState", skip_serializing_if = "Option::is_none")]
+        display_state: Option<std::collections::BTreeMap<String, WaylandOutputSnapshot>>,
+        #[serde(rename = "inputState", skip_serializing_if = "Option::is_none")]
+        input_state: Option<std::collections::BTreeMap<String, RuntimeInputDeviceSnapshot>>,
+    },
     WindowMove {
         #[serde(rename = "requestId")]
         request_id: u64,
@@ -409,6 +422,7 @@ pub enum NativeInteractionKind {
     PointerMoveAsync,
     GestureSwipe,
     GestureSwipeAsync,
+    InputGrab,
     WindowMove,
     WindowResize,
 }
@@ -420,6 +434,7 @@ impl NativeInteractionKind {
             Self::PointerMoveAsync => "pointerMoveAsync",
             Self::GestureSwipe => "gestureSwipe",
             Self::GestureSwipeAsync => "gestureSwipeAsync",
+            Self::InputGrab => "inputGrab",
             Self::WindowMove => "windowMove",
             Self::WindowResize => "windowResize",
         }
@@ -664,6 +679,20 @@ fn op_shoji_output_power(
         ));
     }
     Ok(())
+}
+
+/// `COMPOSITOR.input.grab`: start (`active`) or end the config's input grab. Sent like
+/// any other host side effect, so a key binding that opens a grab has it in place before
+/// the next input event.
+#[op2(fast)]
+fn op_shoji_input_grab(id: u32, active: bool) {
+    if let Ok(slot) = WAKE_HOST.lock()
+        && let Some(host) = slot.as_ref()
+    {
+        host.send(shojiwm_lib::runtime_api::HostMessage::InputGrab(
+            shojiwm_lib::runtime_input_grab::RuntimeInputGrabUpdate { id: u64::from(id), active },
+        ));
+    }
 }
 
 /// The runtime's schedule (`RuntimeSchedule`), published whenever it changes.
@@ -2239,6 +2268,7 @@ fn native_interaction_kind(value: &str) -> Result<NativeInteractionKind, std::io
         "pointerMoveAsync" => Ok(NativeInteractionKind::PointerMoveAsync),
         "gestureSwipe" => Ok(NativeInteractionKind::GestureSwipe),
         "gestureSwipeAsync" => Ok(NativeInteractionKind::GestureSwipeAsync),
+        "inputGrab" => Ok(NativeInteractionKind::InputGrab),
         "windowMove" => Ok(NativeInteractionKind::WindowMove),
         "windowResize" => Ok(NativeInteractionKind::WindowResize),
         _ => Err(std::io::Error::new(
@@ -2381,6 +2411,7 @@ extension!(
         op_shoji_process_id,
         op_shoji_wake_compositor,
         op_shoji_output_power,
+        op_shoji_input_grab,
     ],
     objects = [
         ShojiRuntimeBridge,

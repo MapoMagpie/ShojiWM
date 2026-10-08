@@ -1910,6 +1910,26 @@ export interface InputController {
    * 登録済みの `configure` ファクトリーを即時再実行します。
    */
   reconfigure(): void;
+  /**
+   * Take all keyboard, pointer button, scroll and swipe input until the
+   * returned grab is released, for modal UIs drawn by the compositor (a
+   * window switcher). Clients lose the pointer meanwhile; the cursor still
+   * moves. Key bindings do not fire while a grab is held. The compositor ends
+   * the grab itself (`onCancel`) when the screen locks or a handler throws.
+   * 返り値のグラブを解放するまで、キーボード・ポインタボタン・スクロール・スワイプの
+   * 入力をすべて受け取ります（ウィンドウスイッチャーなどのモーダル UI 用）。
+   * その間クライアントはポインタを失い、キーバインドは発火しません。
+   *
+   * @example
+   * ```ts
+   * const grab = COMPOSITOR.input.grab({
+   *   onKey(event) {
+   *     if (event.key === "Escape" && event.state === "pressed") grab.release();
+   *   },
+   * });
+   * ```
+   */
+  grab(options: import("./input-grab").InputGrabOptions): import("./input-grab").InputGrab;
 }
 
 /** Desktop cursor theme and logical size. / デスクトップカーソルのテーマと論理サイズ。 */
