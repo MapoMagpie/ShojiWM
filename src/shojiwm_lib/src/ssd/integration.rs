@@ -2020,6 +2020,36 @@ impl ShojiWM {
         self.request_tty_maintenance("managed-window-animation-scheduled");
     }
 
+    /// Drops a cancelled channel's last opacity/offset sample from a closing
+    /// snapshot whose other channels keep running. Closing snapshots only take
+    /// a new transform from channels that sample one (see
+    /// `advance_managed_window_animations`), so without this the cancelled
+    /// sample would stay. A surviving opacity/offset channel resamples on the
+    /// next advance.
+    fn reset_closing_transform_to_static(&mut self, window_id: &str) {
+        let Some(closing) = self.closing_window_snapshots.get_mut(window_id) else {
+            return;
+        };
+        let previous_root = transformed_root_rect(
+            closing.decoration.layout.root.rect,
+            closing.decoration.visual_transform,
+        );
+        let previous_transform = closing.decoration.visual_transform;
+        closing.decoration.visual_transform = closing.decoration.static_visual_transform;
+        closing.transform = closing.decoration.static_visual_transform;
+        let next_root = transformed_root_rect(
+            closing.decoration.layout.root.rect,
+            closing.decoration.visual_transform,
+        );
+        if previous_transform != closing.decoration.visual_transform || previous_root != next_root {
+            push_damage_pair(
+                &mut self.pending_decoration_damage,
+                Some(previous_root),
+                next_root,
+            );
+        }
+    }
+
     fn reset_managed_window_animation_state_to_static(&mut self, window_id: &str) {
         let mut reset_live = false;
         for (_, decoration) in self.window_decorations.iter_mut() {
@@ -2110,9 +2140,12 @@ impl ShojiWM {
                 "managed animation: cancel"
             );
         }
+        let mut cancelled_transform_channel = false;
         if let Some(channel) = channel {
             if let Some(channels) = self.managed_window_animations.get_mut(window_id) {
-                channels.remove(channel);
+                cancelled_transform_channel = channels.remove(channel).is_some_and(|active| {
+                    active.animation.offset.is_some() || active.animation.opacity.is_some()
+                });
                 if channels.is_empty() {
                     self.managed_window_animations.remove(window_id);
                 }
@@ -2127,6 +2160,8 @@ impl ShojiWM {
         self.set_managed_window_animation_active(window_id, active);
         if !active {
             self.reset_managed_window_animation_state_to_static(window_id);
+        } else if cancelled_transform_channel {
+            self.reset_closing_transform_to_static(window_id);
         }
         if should_log_cancel {
             info!(
@@ -2335,8 +2370,15 @@ impl ShojiWM {
                 let previous_transform = closing.decoration.visual_transform;
                 closing.decoration.managed_window = next_managed_window.clone();
                 closing.decoration.managed_window_animation_active = animation_still_active;
-                closing.decoration.visual_transform = next_managed_window.transform;
-                closing.transform = next_managed_window.transform;
+                // Unlike live windows, a closing snapshot keeps the last opacity/offset
+                // sample once those channels finish: the static transform is the TS
+                // pre-close state (opacity 1), and adopting it while a rect channel is
+                // still running would flash the window back in. Cancelled channels are
+                // reverted in `cancel_managed_window_animation` instead.
+                if transform_changed {
+                    closing.decoration.visual_transform = next_managed_window.transform;
+                    closing.transform = next_managed_window.transform;
+                }
                 let next_root = transformed_root_rect(
                     closing.decoration.layout.root.rect,
                     closing.decoration.visual_transform,
