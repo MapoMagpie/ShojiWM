@@ -2,7 +2,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io,
-    hash::{Hash, Hasher},
     sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU32, Ordering}},
     time::{Duration, Instant},
 };
@@ -261,17 +260,6 @@ fn invalidated(policy: &EffectInvalidationPolicy, source_changed: bool) -> bool 
     }
 }
 
-fn source_signature<E: RenderElement<GlesRenderer>>(elements: &[E], scale: Scale<f64>) -> u64 {
-    let mut hash = super::signature::SignatureHasher::default();
-    snapshot::render_element_scene_signature(elements, scale).hash(&mut hash);
-    // Opacity and transforms can animate without a buffer commit or geometry change.
-    for element in elements {
-        element.alpha().to_bits().hash(&mut hash);
-        super::signature::hash_debug(&mut hash, &element.transform());
-    }
-    hash.finish()
-}
-
 impl OutputOverlays {
     pub(crate) fn clear(&mut self) { self.slots.clear(); }
 
@@ -378,7 +366,7 @@ impl Instance {
             (state.effect.clone(), state.revision)
         };
         let live = effect.uses_backdrop_input();
-        let signature = if live { source_signature(behind, scale) } else { 0 };
+        let signature = if live { snapshot::render_element_scene_signature(behind, scale) } else { 0 };
         if self.cached.is_none() || self.revision != revision
             || invalidated(&effect.invalidate, self.source_signature != signature)
         {

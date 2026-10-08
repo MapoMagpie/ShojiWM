@@ -1983,10 +1983,9 @@ impl ShojiWM {
                     animation,
                 },
             );
-        let _ = self.advance_managed_window_animations(started_at_ms);
-        let mut just_scheduled = std::collections::HashSet::new();
-        just_scheduled.insert(inserted_window_id.clone());
-        self.apply_managed_window_rects(&just_scheduled, true);
+        let mut dirty_rect_window_ids = self.advance_managed_window_animations(started_at_ms);
+        dirty_rect_window_ids.insert(inserted_window_id.clone());
+        self.apply_managed_window_rects(&dirty_rect_window_ids, true);
         if (managed_animation_debug_enabled()
             || hot_reload_debug_enabled()
             || minimize_debug_enabled())
@@ -2285,9 +2284,9 @@ impl ShojiWM {
                 let previous_transform = decoration.visual_transform;
                 decoration.managed_window = next_managed_window.clone();
                 decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    decoration.visual_transform = next_managed_window.transform;
-                }
+                // Publish the static-seeded transform even when only rect channels remain;
+                // a cancelled opacity/offset channel must not leave its last sample behind.
+                decoration.visual_transform = next_managed_window.transform;
                 if rect_changed {
                     dirty_rect_window_ids.insert(window_id.clone());
                 }
@@ -2336,10 +2335,8 @@ impl ShojiWM {
                 let previous_transform = closing.decoration.visual_transform;
                 closing.decoration.managed_window = next_managed_window.clone();
                 closing.decoration.managed_window_animation_active = animation_still_active;
-                if transform_changed {
-                    closing.decoration.visual_transform = next_managed_window.transform;
-                    closing.transform = next_managed_window.transform;
-                }
+                closing.decoration.visual_transform = next_managed_window.transform;
+                closing.transform = next_managed_window.transform;
                 let next_root = transformed_root_rect(
                     closing.decoration.layout.root.rect,
                     closing.decoration.visual_transform,
