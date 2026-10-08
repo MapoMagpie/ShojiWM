@@ -70,6 +70,7 @@ COMPOSITOR.window.composition = (window) => (
 | `process` / `env` | プログラムの起動と環境変数 | [プロセスと環境変数](./processes-and-env.md) |
 | `window` | ウィンドウごとの装飾（合成関数） | [ウィンドウの合成](./window-composition.md) |
 | `effect` | GPU エフェクト：背景ブラー、ウィンドウ／レイヤー／ポップアップごとのシェーダー | [エフェクト](./effects.md) |
+| `rendering` | 出力の組み立て方（`composition`: 並べ替え・レンダーテクスチャ・3D）とフレームペーシング | [出力の合成と 3D](./output-composition.md)、[出力](./outputs.md) |
 | `debug` | FPS カウンターなどのデバッグオーバーレイ | [ライフサイクルとイベント](./lifecycle-and-events.md) |
 
 合成関数の内側で使う部品にも、それぞれページがあります。

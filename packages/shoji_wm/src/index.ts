@@ -227,6 +227,42 @@ import { resolveAssetPath } from "./shader";
 import { overlay } from "./overlay";
 export type { CompositorEffectController } from "./types";
 export { compileOverlayEffect, snapshotSource, installOverlayBridge } from "./overlay";
+export {
+  Layers,
+  Windows,
+  LayerPopups,
+  TextureView,
+  Solid,
+  Scene3D,
+  Plane,
+  DefaultComposition,
+  renderTexture,
+  Transform3D,
+  transform3d,
+  multiplyMat4,
+  perspective,
+  lookAt,
+  screenCamera,
+  outputLogicalSize,
+  serializeOutputComposition,
+} from "./composition";
+export type {
+  LayerName,
+  Mat4,
+  Camera,
+  CompositionColor,
+  CompositionRect,
+  LayersProps,
+  WindowsProps,
+  TextureViewProps,
+  SolidProps,
+  Scene3DProps,
+  PlaneProps,
+  RenderTexture,
+  RenderTextureOptions,
+  ScreenCameraOptions,
+  WireOutputComposition,
+} from "./composition";
 export type { OverlayOptions, OverlayHandle, OverlayEffectHandle, SnapshotSourceHandle } from "./overlay";
 import { serializeCompositionTree } from "./serialize";
 export {
@@ -543,6 +579,7 @@ export type {
   WindowCompositionFunction,
   WindowCompositionPhase,
   CompositionChild,
+  CompositionRenderable,
   CompositionElementNode,
   ReactiveWaylandWindow,
   ReactiveWaylandWindowHandle,

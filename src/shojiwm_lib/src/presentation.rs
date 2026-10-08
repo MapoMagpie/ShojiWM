@@ -453,6 +453,16 @@ impl ShojiWM {
     }
 
     fn window_frame_processing_applies_to_output(&self, window: &Window, output: &Output) -> bool {
+        // A custom composition drawing the window by id (into a render
+        // texture, say) shows it even while the config hides it.
+        if let Some(ids) = self.composition_windows.get(&output.name())
+            && self
+                .window_decorations
+                .get(window)
+                .is_some_and(|decoration| ids.contains(&decoration.snapshot.id))
+        {
+            return true;
+        }
         if !self.window_allows_render(window) {
             return false;
         }

@@ -682,6 +682,8 @@ type PublishedSchedule = Arc<Mutex<PublishedHostState>>;
 struct PublishedHostState {
     schedule: Option<shojiwm_lib::runtime_api::RuntimeSchedule>,
     frame_pacing: Option<shojiwm_lib::frame_pacing::FramePacingConfig>,
+    output_compositions:
+        Option<HashMap<String, shojiwm_lib::backend::composition::OutputComposition>>,
 }
 
 struct BridgeRegistration {
@@ -1139,6 +1141,16 @@ impl ShojiRuntimeBridge {
             slot.frame_pacing = Some(shojiwm_lib::frame_pacing::FramePacingConfig {
                 outputs: pacing,
             });
+        }
+    }
+
+    // `COMPOSITOR.rendering.composition` for every output; published like the schedule.
+    fn publish_output_compositions(
+        &self,
+        #[serde] compositions: HashMap<String, shojiwm_lib::backend::composition::OutputComposition>,
+    ) {
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.output_compositions = Some(compositions);
         }
     }
 
@@ -2916,6 +2928,9 @@ impl EmbeddedRuntime {
         }
         if let Some(pacing) = slot.frame_pacing.take() {
             messages.push(HostMessage::FramePacing(pacing));
+        }
+        if let Some(compositions) = slot.output_compositions.take() {
+            messages.push(HostMessage::OutputCompositions(compositions));
         }
         messages
     }

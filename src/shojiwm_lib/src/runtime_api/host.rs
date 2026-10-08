@@ -64,6 +64,12 @@ pub enum HostMessage {
     Schedule(RuntimeSchedule),
     /// The frame pacing the config chose per output (`COMPOSITOR.rendering.framePacing`).
     FramePacing(crate::frame_pacing::FramePacingConfig),
+    /// Every output's custom composition (`COMPOSITOR.rendering.composition`).
+    /// Replaces the previous set: outputs missing from it use the default
+    /// stacking again.
+    OutputCompositions(
+        std::collections::HashMap<String, crate::backend::composition::OutputComposition>,
+    ),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)

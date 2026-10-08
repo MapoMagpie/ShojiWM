@@ -1149,6 +1149,30 @@ export interface CompositorRenderingConfig {
    * ```
    */
   framePacing?: FramePacing | ((output: OutputInfo) => FramePacing);
+  /**
+   * How each output is put together. Return the default stacking
+   * (`<DefaultComposition />`) or rearrange it: render parts into textures
+   * with `renderTexture`, draw them flat with `<TextureView>` or in 3D with
+   * `<Scene3D>`/`<Plane>`, show windows of hidden workspaces with
+   * `<Windows windows={...} />`. Re-evaluated only when signals it reads
+   * change. Session lock, cursor and error overlays always stay on top.
+   * Without it every output uses the default stacking.
+   *
+   * 各出力の組み立て方。既定の重なり（`<DefaultComposition />`）を返すか、
+   * 組み替えます: `renderTexture` で一部をテクスチャに描き、`<TextureView>` で平面に、
+   * `<Scene3D>`/`<Plane>` で 3D に描き、`<Windows windows={...} />` で非表示の
+   * ワークスペースのウィンドウも表示できます。読んだ signal が変わったときだけ
+   * 再評価されます。ロック画面・カーソル・エラー表示は常に最前面です。
+   * 未設定ならすべての出力が既定の重なりです。
+   *
+   * @example
+   * ```tsx
+   * COMPOSITOR.rendering.composition = (output) => <DefaultComposition />;
+   * ```
+   */
+  composition?: (
+    output: OutputInfo,
+  ) => import("./types").CompositionRenderable | import("./types").CompositionRenderable[];
 }
 
 /** Frame pacing of an output; see `COMPOSITOR.rendering.framePacing`. / 出力のフレームの出し方。 */

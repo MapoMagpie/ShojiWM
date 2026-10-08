@@ -923,6 +923,20 @@ impl WindowDecorationState {
                 .is_none_or(|outputs| outputs.iter().any(|output| output == output_name))
     }
 
+    /// Whether the config hides the window on `output_name` (not shown, idle,
+    /// or kept off that output), regardless of an animation that may still
+    /// keep it rendering for a moment.
+    pub fn managed_window_hidden_on_output(&self, output_name: &str) -> bool {
+        self.managed_window.managed
+            && (!self.managed_window.visible
+                || self.managed_window.idle
+                || self
+                    .managed_window
+                    .visible_outputs
+                    .as_ref()
+                    .is_some_and(|outputs| !outputs.iter().any(|output| output == output_name)))
+    }
+
     pub fn managed_window_allows_input(&self) -> bool {
         self.managed_window_allows_render() && self.managed_window.interactive
     }

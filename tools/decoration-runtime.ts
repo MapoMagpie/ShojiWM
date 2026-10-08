@@ -115,6 +115,7 @@ interface EmbeddedRuntimeBridge {
     timerDueMs?: number;
   }): void;
   publishFramePacing(pacing: Record<string, FramePacing>): void;
+  publishOutputCompositions(compositions: Record<string, WireOutputComposition>): void;
   log(level: "debug" | "info" | "warn" | "error", message: string): void;
 }
 
@@ -345,6 +346,7 @@ import {
   type KeyboardLayoutChangeEvent,
   type WindowCompositionFunction,
   type OutputStateSnapshot,
+  type OutputInfo,
   type WorkspaceConfig,
   emitWorkspaceActivate,
   type PollCallback,
@@ -384,6 +386,11 @@ import {
 } from "../packages/shoji_wm/src/index.ts";
 import { peekDirtyWindowNodeIds } from "../packages/shoji_wm/src/runtime-hooks.ts";
 import { currentOutputList } from "../packages/shoji_wm/src/output.ts";
+import {
+  serializeOutputComposition,
+  type WireOutputComposition,
+} from "../packages/shoji_wm/src/composition.ts";
+import { effect as watchSignals } from "../packages/shoji_wm/src/signals.ts";
 
 function debugSSD(
   message: string,
@@ -4011,6 +4018,8 @@ function publishScheduleIfChanged(): void {
   if (!schedulePublisher) {
     return;
   }
+  // First: evaluating a composition can register polls the schedule must see.
+  publishOutputCompositionsIfChanged(schedulePublisher);
   const schedule = schedulerDueState();
   const key = JSON.stringify(schedule);
   if (key !== lastPublishedSchedule) {
@@ -4022,6 +4031,112 @@ function publishScheduleIfChanged(): void {
   if (pacingKey !== lastPublishedFramePacing) {
     lastPublishedFramePacing = pacingKey;
     schedulePublisher.publishFramePacing(pacing);
+  }
+}
+
+/** One output's `COMPOSITOR.rendering.composition`, evaluated lazily. */
+interface OutputCompositionSlot {
+  /** The output snapshot it was evaluated for; a change re-evaluates. */
+  outputKey: string;
+  dispose: (() => void) | null;
+  /** A signal it read changed since the last evaluation. */
+  dirty: boolean;
+  plan: WireOutputComposition | null;
+}
+
+const outputCompositionSlots = new Map<string, OutputCompositionSlot>();
+let outputCompositionConfig: unknown;
+let outputCompositionVersion = 0;
+let publishedOutputCompositionVersion = -1;
+let lastPublishedCompositions: string | undefined;
+
+/**
+ * Evaluate a composition and track the signals it read. When one changes the
+ * slot only turns dirty: the next publish evaluates it once, however many
+ * signals changed in between, so a composition never runs per signal write.
+ */
+function evaluateOutputComposition(
+  slot: OutputCompositionSlot,
+  output: OutputInfo,
+  compose: NonNullable<NonNullable<typeof COMPOSITOR.rendering>["composition"]>,
+): void {
+  slot.dispose?.();
+  let first = true;
+  slot.dispose = watchSignals(() => {
+    if (!first) {
+      // Reading nothing here leaves the effect without dependencies.
+      slot.dirty = true;
+      ensureImmediateDirtyPoll();
+      return;
+    }
+    first = false;
+    try {
+      slot.plan = serializeOutputComposition(compose(output));
+    } catch (error) {
+      console.error(`COMPOSITOR.rendering.composition failed for ${output.name}`, error);
+      slot.plan = null;
+    }
+  });
+  slot.dirty = false;
+  outputCompositionVersion++;
+}
+
+/** Send every output's composition when any of them changed. */
+function publishOutputCompositionsIfChanged(publisher: EmbeddedRuntimeBridge): void {
+  const config = COMPOSITOR.rendering?.composition;
+  if (config !== outputCompositionConfig) {
+    for (const slot of outputCompositionSlots.values()) {
+      slot.dispose?.();
+    }
+    outputCompositionSlots.clear();
+    outputCompositionConfig = config;
+    outputCompositionVersion++;
+  }
+  if (typeof config === "function") {
+    const seen = new Set<string>();
+    for (const output of currentOutputList()) {
+      if (!output.enabled) {
+        continue;
+      }
+      seen.add(output.name);
+      const outputKey = JSON.stringify(output);
+      let slot = outputCompositionSlots.get(output.name);
+      if (!slot || slot.outputKey !== outputKey) {
+        slot?.dispose?.();
+        slot = { outputKey, dispose: null, dirty: true, plan: null };
+        outputCompositionSlots.set(output.name, slot);
+      }
+      if (slot.dirty) {
+        evaluateOutputComposition(slot, output, config);
+      }
+    }
+    for (const [name, slot] of outputCompositionSlots) {
+      if (!seen.has(name)) {
+        slot.dispose?.();
+        outputCompositionSlots.delete(name);
+        outputCompositionVersion++;
+      }
+    }
+  }
+  if (outputCompositionVersion === publishedOutputCompositionVersion) {
+    return;
+  }
+  publishedOutputCompositionVersion = outputCompositionVersion;
+  const compositions: Record<string, WireOutputComposition> = {};
+  for (const [name, slot] of outputCompositionSlots) {
+    if (slot.plan) {
+      compositions[name] = slot.plan;
+    }
+  }
+  const key = JSON.stringify(compositions);
+  if (key === lastPublishedCompositions) {
+    return;
+  }
+  lastPublishedCompositions = key;
+  try {
+    publisher.publishOutputCompositions(compositions);
+  } catch (error) {
+    console.error("COMPOSITOR.rendering.composition was rejected", error);
   }
 }
 

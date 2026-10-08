@@ -295,6 +295,19 @@ pub fn layer_surfaces_for_output(
     (upper, lower)
 }
 
+/// Mapped layer surfaces of `kinds` (front to back), each layer front to back.
+pub fn layer_surfaces_on(
+    output: &smithay::output::Output,
+    kinds: &[WlrLayer],
+) -> Vec<LayerSurface> {
+    let map = layer_map_for_output(output);
+    kinds
+        .iter()
+        .flat_map(|layer| map.layers_on(*layer).rev().cloned())
+        .filter(layer_surface_is_mapped)
+        .collect()
+}
+
 /// Layer surfaces ordered for the dedicated popup pass.
 ///
 /// Render-element vectors are front-to-back in ShojiWM, so an overlay popup

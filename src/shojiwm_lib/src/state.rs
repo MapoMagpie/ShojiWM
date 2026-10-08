@@ -478,6 +478,18 @@ pub struct ShojiWM {
     pub output_capture_mirrors: HashMap<String, crate::backend::tty::OutputCaptureMirror>,
     pub(crate) output_overlays: crate::backend::overlay::OutputOverlays,
     output_overlay_timer_active: bool,
+    /// Custom compositions by output (`COMPOSITOR.rendering.composition`);
+    /// outputs missing here use the default stacking.
+    pub output_compositions:
+        HashMap<String, std::sync::Arc<crate::backend::composition::OutputComposition>>,
+    /// GPU state of each output's composition (render textures, 3D scenes).
+    pub(crate) composition_targets:
+        HashMap<String, crate::backend::composition::CompositionTargets>,
+    /// Effect caches of render textures not being built right now.
+    pub(crate) composition_scope_caches: crate::backend::composition_caches::ScopeCaches,
+    /// Windows each output's composition drew by id last frame (possibly
+    /// hidden ones); they keep getting frame callbacks and redraws.
+    pub(crate) composition_windows: HashMap<String, HashSet<String>>,
     pub pointer_contents: PointerContents,
     /// Hovered decoration nodes: one, or a chain while the pointer is inside an
     /// interactive `<Popup>` (see `ssd::popup`).
@@ -604,7 +616,7 @@ pub struct ShojiWM {
     pub xwayland_refresh_override_mhz: Arc<AtomicI32>,
 }
 
-fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, Logical>) -> bool {
+pub(crate) fn logical_rect_intersects_output(rect: LogicalRect, output_geo: Rectangle<i32, Logical>) -> bool {
     let left = rect.x.max(output_geo.loc.x);
     let top = rect.y.max(output_geo.loc.y);
     let right = (rect.x + rect.width).min(output_geo.loc.x + output_geo.size.w);
@@ -1793,6 +1805,10 @@ impl ShojiWM {
             output_capture_mirrors: HashMap::new(),
             output_overlays: crate::backend::overlay::OutputOverlays::default(),
             output_overlay_timer_active: false,
+            output_compositions: HashMap::new(),
+            composition_targets: HashMap::new(),
+            composition_scope_caches: Default::default(),
+            composition_windows: HashMap::new(),
             pointer_contents: PointerContents::default(),
             decoration_hover_targets: Vec::new(),
             popup_input: Default::default(),
@@ -2912,6 +2928,9 @@ impl ShojiWM {
                         info!(outputs = ?config.outputs, "frame pacing changed");
                     }
                     self.frame_pacing = config;
+                }
+                HostMessage::OutputCompositions(compositions) => {
+                    self.apply_output_compositions(compositions);
                 }
             }
         }
@@ -4624,6 +4643,87 @@ impl ShojiWM {
                 .elements()
                 .filter(|window| self.window_intersects_output(window, output)),
         )
+    }
+
+    /// Install the custom compositions the config published (all outputs at once).
+    pub fn apply_output_compositions(
+        &mut self,
+        compositions: HashMap<String, crate::backend::composition::OutputComposition>,
+    ) {
+        let mut next = HashMap::new();
+        for (output, plan) in compositions {
+            if let Err(error) = plan.validate() {
+                warn!(output = %output, %error, "ignoring invalid output composition");
+                continue;
+            }
+            let plan = match self.output_compositions.get(&output) {
+                Some(current) if **current == plan => current.clone(),
+                _ => std::sync::Arc::new(plan),
+            };
+            next.insert(output, plan);
+        }
+        let mut changed: Vec<String> = self
+            .output_compositions
+            .keys()
+            .filter(|output| !next.contains_key(*output))
+            .cloned()
+            .collect();
+        changed.extend(next.iter().filter_map(|(output, plan)| {
+            let same = self
+                .output_compositions
+                .get(output)
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, plan));
+            (!same).then(|| output.clone())
+        }));
+        if changed.is_empty() {
+            return;
+        }
+        debug!(outputs = ?changed, "output compositions changed");
+        self.output_compositions = next;
+        for output in changed {
+            self.schedule_output_redraw(&output);
+        }
+    }
+
+    /// Every mapped window, top to bottom, with the area it draws (as
+    /// `window_intersects_output` measures it), for compositions that pick
+    /// windows by id.
+    pub fn windows_top_to_bottom_all(&self) -> Vec<(Window, Option<LogicalRect>)> {
+        self.sorted_windows_top_to_bottom(self.space.elements())
+            .into_iter()
+            .map(|window| {
+                let bounds = match self
+                    .window_decorations
+                    .get(window)
+                    .filter(|decoration| decoration.managed_window.managed)
+                {
+                    Some(decoration) => Some(self.window_visual_bounds(window, decoration)),
+                    None => self.window_bbox_rect(window),
+                };
+                (window.clone(), bounds)
+            })
+            .collect()
+    }
+
+    /// The composition plan `output_name` renders with.
+    pub fn output_composition_plan(
+        &self,
+        output_name: &str,
+    ) -> std::sync::Arc<crate::backend::composition::OutputComposition> {
+        self.output_compositions
+            .get(output_name)
+            .cloned()
+            .unwrap_or_else(crate::backend::composition::OutputComposition::default_plan)
+    }
+
+    /// Whether some output's composition drew `window` by id last frame.
+    pub fn window_drawn_by_composition(&self, window: &Window) -> bool {
+        !self.composition_windows.is_empty()
+            && self.window_decorations.get(window).is_some_and(|decoration| {
+                self.composition_windows
+                    .values()
+                    .any(|ids| ids.contains(&decoration.snapshot.id))
+            })
     }
 
     fn sorted_windows_top_to_bottom<'a, I>(&self, windows: I) -> Vec<&'a Window>

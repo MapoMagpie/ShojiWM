@@ -70,6 +70,7 @@ own page in this section:
 | `process`, `env` | Spawning programs and environment variables | [Processes & Environment](./processes-and-env.md) |
 | `window` | Per-window decoration (the composition function) | [Window composition](./window-composition.md) |
 | `effect` | GPU effects: background blur, per-window/layer/popup shaders | [Effects](./effects.md) |
+| `rendering` | How each output is put together (`composition`: reordering, render textures, 3D) and frame pacing | [Output composition](./output-composition.md), [Outputs](./outputs.md) |
 | `debug` | Debug overlays such as the FPS counter | [Lifecycle & Events](./lifecycle-and-events.md) |
 
 Building blocks used inside the composition function have their own pages too:

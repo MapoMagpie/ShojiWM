@@ -679,7 +679,7 @@ impl CompositorHandler for ShojiWM {
                 );
             }
             self.window_commit_times.insert(window.clone(), commit_time);
-            if self.window_allows_render(&window) {
+            if self.window_allows_render(&window) || self.window_drawn_by_composition(&window) {
                 self.snapshot_dirty_window_ids.insert(snapshot.id.clone());
                 self.window_source_damage
                     .extend(

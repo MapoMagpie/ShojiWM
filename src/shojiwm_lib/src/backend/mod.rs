@@ -1,6 +1,8 @@
 pub mod async_assets;
 pub mod clipped_memory;
 pub mod clipped_surface;
+pub mod composition;
+pub mod composition_caches;
 pub mod damage;
 pub mod damage_blink;
 pub mod decoration;
@@ -9,6 +11,7 @@ pub mod icon;
 pub mod overlay;
 pub mod image_copy_capture_render;
 pub mod paint;
+pub mod scene3d;
 pub mod screencopy_render;
 pub mod shader_effect;
 pub mod signature;
