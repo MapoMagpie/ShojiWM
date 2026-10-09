@@ -3038,6 +3038,10 @@ vec4 shader_main(EffectContext effect) {
 // Same as compile_display_texture_program but keeps the texture's alpha
 // channel. Used for effects whose pipeline intentionally produces transparent
 // regions (e.g. layer-source masks).
+//
+// The pipeline's output is premultiplied, and the wrapper premultiplies what
+// shader_main returns: undo it here, or partially covered pixels get alpha
+// twice and darken (a dark rim around antialiased effect edges).
 fn compile_display_texture_program_preserve_alpha(
     renderer: &mut GlesRenderer,
 ) -> Result<GlesTexProgram, ShaderEffectError> {
@@ -3051,7 +3055,10 @@ fn compile_display_texture_program_preserve_alpha(
             wrap_backdrop_shader_source(
                 r#"
 vec4 shader_main(EffectContext effect) {
-    return texture2D(tex, effect.texture_uv);
+    vec4 color = texture2D(tex, effect.texture_uv);
+    if (color.a <= 0.0)
+        return vec4(0.0);
+    return vec4(color.rgb / color.a, color.a);
 }
 "#,
             ),
