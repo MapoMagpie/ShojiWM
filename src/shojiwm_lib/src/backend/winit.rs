@@ -2716,6 +2716,7 @@ fn backdrop_items_capture_scene(
                         capture_origin_physical,
                         scale,
                         layer,
+                        true,
                     ));
                 }
             }
@@ -2737,6 +2738,9 @@ fn layer_surface_scene_elements_for_capture(
     capture_origin_physical: Point<i32, smithay::utils::Physical>,
     scale: smithay::utils::Scale<f64>,
     layer_surface: &smithay::desktop::LayerSurface,
+    // A backdrop mask wants the layer's own silhouette: its popups carry
+    // their own behind effect and are composited above it.
+    include_popups: bool,
 ) -> Vec<WinitRenderElements> {
     let capture_visual = WindowVisualState {
         origin: smithay::utils::Point::from((0, 0)),
@@ -2750,7 +2754,11 @@ fn layer_surface_scene_elements_for_capture(
         opacity: 1.0,
     };
     transform_window_elements(
-        window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0),
+        if include_popups {
+            window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
+        } else {
+            window_render::layer_surface_root_elements(renderer, output, layer_surface, scale, 1.0)
+        },
         capture_visual,
         WinitRenderElements::Window,
         WinitRenderElements::TransformedWindow,
@@ -2959,6 +2967,7 @@ fn lower_layer_scene_elements(
                 capture_origin_physical,
                 scale,
                 lower_layer,
+                true,
             ));
         }
         backdrop_scene.extend(backdrop_items_capture_scene(
@@ -3046,6 +3055,7 @@ fn lower_layer_scene_elements(
                     layer_source_origin,
                     scale,
                     layer_surface,
+                    false,
                 );
                 let signature =
                     crate::backend::snapshot::render_element_scene_signature(&scene, scale);
@@ -3322,6 +3332,7 @@ fn configured_background_effect_elements_for_layer(
                 capture_origin_physical,
                 scale,
                 upper_layer,
+                true,
             ));
         }
         backdrop_scene.extend(backdrop_items_capture_scene(
@@ -3507,6 +3518,7 @@ fn configured_background_effect_elements_for_layer(
                 layer_source_origin,
                 scale,
                 layer_surface,
+                false,
             );
             let signature =
                 crate::backend::snapshot::render_element_scene_signature(&scene, scale);

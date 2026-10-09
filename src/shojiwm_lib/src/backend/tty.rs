@@ -8905,6 +8905,7 @@ fn backdrop_items_capture_scene(
                         capture_origin_physical,
                         scale,
                         layer,
+                        true,
                     ) {
                         scene.append(&mut elements);
                     }
@@ -8928,6 +8929,9 @@ fn layer_surface_scene_elements_for_capture(
     capture_origin_physical: Point<i32, smithay::utils::Physical>,
     scale: smithay::utils::Scale<f64>,
     layer_surface: &smithay::desktop::LayerSurface,
+    // A backdrop mask wants the layer's own silhouette: its popups carry
+    // their own behind effect and are composited above it.
+    include_popups: bool,
 ) -> Result<Vec<TtyRenderElements>, Box<dyn std::error::Error>> {
     let capture_visual = WindowVisualState {
         origin: smithay::utils::Point::from((0, 0)),
@@ -8941,7 +8945,11 @@ fn layer_surface_scene_elements_for_capture(
         opacity: 1.0,
     };
     Ok(transform_window_elements(
-        window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0),
+        if include_popups {
+            window_render::layer_surface_elements(renderer, output, layer_surface, scale, 1.0)
+        } else {
+            window_render::layer_surface_root_elements(renderer, output, layer_surface, scale, 1.0)
+        },
         capture_visual,
         TtyRenderElements::Window,
         TtyRenderElements::TransformedWindow,
@@ -9185,6 +9193,7 @@ fn configured_background_effect_elements_for_layer(
                 capture_origin_physical,
                 scale,
                 upper_layer,
+                true,
             ) {
                 backdrop_scene.append(&mut layer_elements);
             }
@@ -9255,6 +9264,7 @@ fn configured_background_effect_elements_for_layer(
             layer_source_origin,
             scale,
             layer_surface,
+            false,
         )?;
         // The signature (element ids, commit counters, geometry) is what
         // `renderToIfDirty({ dependsOn: [layerSource()] })` compares.
@@ -9739,6 +9749,7 @@ fn lower_layer_scene_elements(
                     layer_source_origin,
                     scale,
                     layer_surface,
+                    false,
                 )?;
                 // The signature (element ids, commit counters, geometry) is what
                 // `renderToIfDirty({ dependsOn: [layerSource()] })` compares.
