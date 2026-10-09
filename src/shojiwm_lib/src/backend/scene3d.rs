@@ -43,12 +43,19 @@ const FRAGMENT_SHADER: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D tex;
 uniform float alpha;
+// 0: the opaque pass, which draws only opaque texels and writes depth.
+// 1: the blend pass, which draws everything else without writing depth, so
+// a shadow or a fading plane never hides what is drawn after it.
+uniform float blend_pass;
+// 1 when the plane is fully opaque and so takes part in the opaque pass.
+// Decided on the CPU: with mediump (fp16) `alpha`, 0.9999 would read as 1.
+uniform float opaque_plane;
 varying highp vec2 v_uv;
 void main() {
-    vec4 color = texture2D(tex, v_uv) * alpha;
-    // Fully transparent texels (a texture's empty margin) must not write
-    // depth, or they would hide the planes behind them.
-    if (color.a < 1.0 / 255.0) {
+    vec4 texel = texture2D(tex, v_uv);
+    vec4 color = texel * alpha;
+    bool solid = opaque_plane > 0.5 && texel.a >= 254.5 / 255.0;
+    if (blend_pass < 0.5 ? !solid : (solid || color.a < 1.0 / 255.0)) {
         discard;
     }
     gl_FragColor = color;
@@ -68,6 +75,8 @@ struct Scene3dProgram {
     uniform_flip_v: ffi::types::GLint,
     uniform_tex: ffi::types::GLint,
     uniform_alpha: ffi::types::GLint,
+    uniform_blend_pass: ffi::types::GLint,
+    uniform_opaque_plane: ffi::types::GLint,
 }
 
 #[derive(Default)]
@@ -294,6 +303,8 @@ fn scene_program(renderer: &mut GlesRenderer) -> Result<Scene3dProgram, GlesErro
             uniform_flip_v: uniform(c"flip_v"),
             uniform_tex: uniform(c"tex"),
             uniform_alpha: uniform(c"alpha"),
+            uniform_blend_pass: uniform(c"blend_pass"),
+            uniform_opaque_plane: uniform(c"opaque_plane"),
         })
     })??;
     *renderer
@@ -455,7 +466,11 @@ unsafe fn draw_scene(
         gl.FrontFace(if FLIP_OUTPUT_Y { ffi::CW } else { ffi::CCW });
         let view_projection = multiply(&flip, &multiply(&spec.projection, &spec.view));
 
-        // Far to near, so translucent planes blend over what lies behind them.
+        // Opaque texels first, with depth; then every translucent texel
+        // (shadows, faded planes) far to near over them without depth, so
+        // they blend over what lies behind them and hide nothing. Sorting by
+        // centre is only approximate for turned planes, which is why
+        // translucent texels must not write depth.
         let mut planes: Vec<_> = spec
             .objects
             .iter()
@@ -477,11 +492,22 @@ unsafe fn draw_scene(
         gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
         gl.VertexAttribPointer(attrib, 2, ffi::FLOAT, ffi::FALSE, 0, corners.as_ptr().cast());
         gl.ActiveTexture(ffi::TEXTURE0);
-        for (_, object) in planes {
+        for (blend_pass, (_, object)) in planes
+            .iter()
+            .map(|plane| (false, plane))
+            .chain(planes.iter().map(|plane| (true, plane)))
+        {
             let Object3d::Plane { texture, width, height, model, opacity, double_sided } = object;
+            let opaque_plane = *opacity >= 1.0;
+            if !blend_pass && !opaque_plane {
+                continue;
+            }
             let Some(Some((texture, _))) = inputs.get(*texture) else {
                 continue;
             };
+            gl.DepthMask(if blend_pass { ffi::FALSE } else { ffi::TRUE });
+            gl.Uniform1f(program.uniform_blend_pass, if blend_pass { 1.0 } else { 0.0 });
+            gl.Uniform1f(program.uniform_opaque_plane, if opaque_plane { 1.0 } else { 0.0 });
             if *double_sided {
                 gl.Disable(ffi::CULL_FACE);
             } else {
@@ -521,6 +547,7 @@ unsafe fn draw_scene(
         }
 
         // Leave the state the way Smithay's renderer expects it.
+        gl.DepthMask(ffi::TRUE);
         gl.Disable(ffi::DEPTH_TEST);
         gl.Disable(ffi::CULL_FACE);
         gl.FrontFace(ffi::CCW);
@@ -634,7 +661,16 @@ mod tests {
         let clear = renderer
             .import_memory(&[0u8; 64], Fourcc::Abgr8888, (4, 4).into(), false)
             .unwrap();
-        let inputs = vec![Some((rendered.clone(), 1)), Some((green, 1)), Some((clear, 1))];
+        // Half-transparent black, like a window's shadow.
+        let shadow = renderer
+            .import_memory(&[0, 0, 0, 128].repeat(16), Fourcc::Abgr8888, (4, 4).into(), false)
+            .unwrap();
+        let inputs = vec![
+            Some((rendered.clone(), 1)),
+            Some((green, 1)),
+            Some((clear, 1)),
+            Some((shadow, 1)),
+        ];
         // A plane covering clip space with identity camera: the scene must
         // reproduce the input exactly, top stays top.
         let mut spec = Scene3dSpec {
@@ -671,6 +707,35 @@ mod tests {
         spec.objects.reverse();
         target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
         assert_eq!(rows(&mut renderer, target.texture.as_ref().unwrap())[1][1], GREEN);
+
+        // A fading plane in front, drawn first, still lets the opaque plane
+        // behind it show through.
+        let mut faint = plane(0, translate_z(-0.5));
+        if let Object3d::Plane { opacity, .. } = &mut faint {
+            *opacity = 0.1;
+        }
+        spec.objects = vec![faint, plane(1, translate_z(0.5))];
+        target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
+        let blended = rows(&mut renderer, target.texture.as_ref().unwrap())[1][1];
+        assert!(blended[1] > 200 && blended[0] < 40, "faint plane hid green: {blended:?}");
+
+        // A translucent texel (a shadow) in front, drawn first, does not hide
+        // the opaque plane behind it either.
+        spec.objects = vec![plane(3, translate_z(-0.5)), plane(1, translate_z(0.5))];
+        target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
+        let shaded = rows(&mut renderer, target.texture.as_ref().unwrap())[1][1];
+        assert!(shaded[1] > 100 && shaded[3] == 255, "shadow hid green: {shaded:?}");
+
+        // A plane a hair short of opaque (the end of a fade) is drawn whole,
+        // even where the shader's mediump opacity rounds up to 1.
+        let mut almost = plane(1, IDENTITY);
+        if let Object3d::Plane { opacity, .. } = &mut almost {
+            *opacity = 0.99999;
+        }
+        spec.objects = vec![almost];
+        target.render(&mut renderer, &spec, &inputs, (4, 4).into()).unwrap();
+        let almost_rows = rows(&mut renderer, target.texture.as_ref().unwrap());
+        assert!(almost_rows[1][1][1] > 250, "nearly opaque plane vanished: {almost_rows:?}");
 
         // Multisampled path resolves to the same picture.
         spec.antialias = true;
