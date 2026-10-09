@@ -600,12 +600,18 @@ HYBRID_WINDOW_MANAGER.configureWorkspaceGestureSpeed({
   workspaceScrollSnapBreakoutPx: 48,
 });
 
-COMPOSITOR.effect.background_effect = compileEffect({
+// Blur behind the regions clients ask for (ext-background-effect). Off while
+// Flip 3D is shown, then faded back in like the window backdrops.
+const BACKGROUND_BLUR = compileEffect({
   input: backdropSource(),
   capturePadding: 24,
   invalidate: { kind: "on-source-damage-box", damagePadding: 8 },
-  pipeline: [dualKawaseBlur({ radius: 4, passes: 2 })],
+  alpha: "preserve",
+  pipeline: [dualKawaseBlur({ radius: 4, passes: 2 }), backdropFade()],
 });
+COMPOSITOR.effect.background_effect = computed(() =>
+  FLIP_3D.blurSuspended() ? null : BACKGROUND_BLUR,
+);
 
 const LAYER_BLUR_MASK = compileLayerEffect({
   input: backdropSource(),

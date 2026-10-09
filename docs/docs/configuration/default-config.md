@@ -145,9 +145,10 @@ settles back onto the desktop.
   the switcher, not to the windows behind it.
 - The front window glows white: its decoration's shadow turns white while it
   is selected (`FLIP_3D.selectedWindowId`).
-- Window blur is switched off while the switcher is open (each window is drawn
-  alone into a texture there, with nothing under it to blur) and fades back in
-  as the stack settles.
+- Window blur, and the blur behind regions clients request
+  (`ext-background-effect-v1`), is switched off while the switcher is open
+  (each window is drawn alone into a texture there, with nothing under it to
+  blur) and fades back in as the stack settles.
 
 The stack's look (how many windows, spacing, tilt, timing) is set by the
 constants at the top of `flip-3d.tsx`. It is built from

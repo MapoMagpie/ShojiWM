@@ -8,7 +8,7 @@ ShojiWM は GPU シェーダーエフェクトを次の場所で実行でき、`
 
 | フィールド | 型 | 適用先 |
 | --- | --- | --- |
-| `background_effect` | `CompiledEffectHandle \| null` | クライアントが要求した領域の背後（`ext-background-effect-v1`） |
+| `background_effect` | `MaybeSignal<CompiledEffectHandle \| null>` | クライアントが要求した領域の背後（`ext-background-effect-v1`） |
 | `window` | `(window) => WindowEffectAssignment \| null` | トップレベルウィンドウごと |
 | `layer` | `(layer) => LayerEffectAssignment \| null` | レイヤーシェルサーフェスごと（バー・ドック） |
 | `popup` | `(popup) => PopupEffectAssignment \| null` | ポップアップごと（メニュー・ツールチップ） |
@@ -35,6 +35,23 @@ COMPOSITOR.effect.background_effect = compileEffect({
   invalidate: {kind: 'on-source-damage-box', damagePadding: 8},
   pipeline: [dualKawaseBlur({radius: 4, passes: 2})],
 });
+```
+
+値には Signal を使え、エフェクト内のシェーダーユニフォームにも Signal を使えます。
+変化は次のフレームから反映されます。たとえばエフェクトを切ったり、アニメーションさせたりできます。
+
+```ts
+const blur = compileEffect({
+  input: backdropSource(),
+  alpha: 'preserve',
+  pipeline: [
+    dualKawaseBlur({radius: 4, passes: 2}),
+    shaderStage(loadShader('./src/effect/backdrop-fade.frag'), {
+      uniforms: {strength}, // 0〜1 の Signal
+    }),
+  ],
+});
+COMPOSITOR.effect.background_effect = computed(() => (paused() ? null : blur));
 ```
 
 ## ウィンドウ／レイヤー／ポップアップごとのエフェクト

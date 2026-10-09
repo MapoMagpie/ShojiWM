@@ -116,6 +116,7 @@ interface EmbeddedRuntimeBridge {
   }): void;
   publishFramePacing(pacing: Record<string, FramePacing>): void;
   publishOutputCompositions(compositions: Record<string, WireOutputComposition>): void;
+  publishBackgroundEffect(effect: CompiledEffectHandle | null): void;
   log(level: "debug" | "info" | "warn" | "error", message: string): void;
 }
 
@@ -301,6 +302,7 @@ import {
   hasActiveAnimations,
   hasActiveAnimationsInStore,
   type CompiledEffectHandle,
+  type MaybeSignal,
   type LayerEffectAssignment,
   type PopupEffectAssignment,
   createReactiveLayer,
@@ -1153,7 +1155,7 @@ interface RuntimePopupEffectAssignment {
 }
 
 interface RuntimeEffectConfig {
-  background_effect: CompiledEffectHandle | null;
+  background_effect: MaybeSignal<CompiledEffectHandle | null>;
   window?: (
     window: ReturnType<typeof createCompositionEvaluationCache>["window"],
   ) => WindowEffectAssignment | null;
@@ -2055,7 +2057,7 @@ async function main(configPath: string, embeddedBridge: EmbeddedRuntimeBridge) {
               requestId: request.requestId,
               ok: true,
               kind: "getEffectConfig",
-              backgroundEffect: effectConfig.background_effect,
+              backgroundEffect: resolveBackgroundEffect(effectConfig),
               displayConfig: pendingDisplayConfigPayload(),
               workspaceConfig: pendingWorkspaceConfigPayload(),
             });
@@ -3815,7 +3817,8 @@ function evaluatePopupEffects(
 
 function resolveSignals<T>(value: T): T {
   if (isSignal(value)) {
-    return read(value) as T;
+    // A signal may hold more signals (a computed effect with signal uniforms).
+    return resolveSignals(read(value)) as T;
   }
   if (Array.isArray(value)) {
     return value.map((item) => resolveSignals(item)) as T;
@@ -4058,6 +4061,7 @@ function publishScheduleIfChanged(): void {
   }
   // First: evaluating a composition can register polls the schedule must see.
   publishOutputCompositionsIfChanged(schedulePublisher);
+  publishBackgroundEffectIfChanged(schedulePublisher);
   const schedule = schedulerDueState();
   const key = JSON.stringify(schedule);
   if (key !== lastPublishedSchedule) {
@@ -4117,6 +4121,44 @@ function evaluateOutputComposition(
   });
   slot.dirty = false;
   outputCompositionVersion++;
+}
+
+// `COMPOSITOR.effect.background_effect` as last sent to the compositor, and
+// whether one of the signals it read has changed since.
+let backgroundEffectWatch: (() => void) | undefined;
+let backgroundEffectConfig: RuntimeEffectConfig | undefined;
+let backgroundEffectDirty = false;
+
+/**
+ * Resolve the background effect's signals and watch them: the compositor reads
+ * the effect once (`getEffectConfig`), and later values are published.
+ */
+function resolveBackgroundEffect(
+  config: RuntimeEffectConfig,
+): CompiledEffectHandle | null {
+  backgroundEffectWatch?.();
+  backgroundEffectConfig = config;
+  backgroundEffectDirty = false;
+  let resolved: CompiledEffectHandle | null = null;
+  let first = true;
+  backgroundEffectWatch = watchSignals(() => {
+    if (!first) {
+      // Reading nothing here leaves the effect without dependencies.
+      backgroundEffectDirty = true;
+      ensureImmediateDirtyPoll();
+      return;
+    }
+    first = false;
+    resolved = (resolveSignals(config.background_effect) as CompiledEffectHandle | null) ?? null;
+  });
+  return resolved;
+}
+
+function publishBackgroundEffectIfChanged(publisher: EmbeddedRuntimeBridge): void {
+  if (!backgroundEffectDirty || !backgroundEffectConfig) {
+    return;
+  }
+  publisher.publishBackgroundEffect(resolveBackgroundEffect(backgroundEffectConfig));
 }
 
 /** Send every output's composition when any of them changed. */
@@ -4947,7 +4989,7 @@ function resolveEffectConfig(
       loaded.default as
         | {
             effect?: {
-              background_effect?: CompiledEffectHandle | null;
+              background_effect?: MaybeSignal<CompiledEffectHandle | null>;
               window?: RuntimeEffectConfig["window"];
               layer?: RuntimeEffectConfig["layer"];
               popup?: RuntimeEffectConfig["popup"];

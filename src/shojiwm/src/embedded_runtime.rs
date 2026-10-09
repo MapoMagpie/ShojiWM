@@ -713,6 +713,7 @@ struct PublishedHostState {
     frame_pacing: Option<shojiwm_lib::frame_pacing::FramePacingConfig>,
     output_compositions:
         Option<HashMap<String, shojiwm_lib::backend::composition::OutputComposition>>,
+    background_effect: Option<Option<BackgroundEffectConfig>>,
 }
 
 struct BridgeRegistration {
@@ -1181,6 +1182,24 @@ impl ShojiRuntimeBridge {
         if let Ok(mut slot) = self.schedule.lock() {
             slot.output_compositions = Some(compositions);
         }
+    }
+
+    // `COMPOSITOR.effect.background_effect` re-resolved after one of its signals changed;
+    // published like the schedule.
+    fn publish_background_effect(
+        &self,
+        #[serde] effect: Option<WireCompiledEffect>,
+    ) -> Result<(), std::io::Error> {
+        let effect = effect
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|error: shojiwm_lib::ssd::DecorationBridgeError| {
+                std::io::Error::other(error.to_string())
+            })?;
+        if let Ok(mut slot) = self.schedule.lock() {
+            slot.background_effect = Some(effect);
+        }
+        Ok(())
     }
 
     fn create_overlay(&self, #[string] output: String, #[string] placement: String,
@@ -2962,6 +2981,9 @@ impl EmbeddedRuntime {
         }
         if let Some(compositions) = slot.output_compositions.take() {
             messages.push(HostMessage::OutputCompositions(compositions));
+        }
+        if let Some(effect) = slot.background_effect.take() {
+            messages.push(HostMessage::BackgroundEffect(effect));
         }
         messages
     }

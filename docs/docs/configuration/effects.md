@@ -9,7 +9,7 @@ ShojiWM can run GPU shader effects in these places, configured via
 
 | Field | Type | Applies to |
 | --- | --- | --- |
-| `background_effect` | `CompiledEffectHandle \| null` | Behind client-requested regions (`ext-background-effect-v1`) |
+| `background_effect` | `MaybeSignal<CompiledEffectHandle \| null>` | Behind client-requested regions (`ext-background-effect-v1`) |
 | `window` | `(window) => WindowEffectAssignment \| null` | Per toplevel window |
 | `layer` | `(layer) => LayerEffectAssignment \| null` | Per layer-shell surface (bars, docks) |
 | `popup` | `(popup) => PopupEffectAssignment \| null` | Per popup (menus, tooltips) |
@@ -37,6 +37,24 @@ COMPOSITOR.effect.background_effect = compileEffect({
   invalidate: {kind: 'on-source-damage-box', damagePadding: 8},
   pipeline: [dualKawaseBlur({radius: 4, passes: 2})],
 });
+```
+
+The value may be a signal, and the shader uniforms inside the effect may be
+signals too; the compositor picks up a change on the next frame. This turns the
+effect off or animates it, for example:
+
+```ts
+const blur = compileEffect({
+  input: backdropSource(),
+  alpha: 'preserve',
+  pipeline: [
+    dualKawaseBlur({radius: 4, passes: 2}),
+    shaderStage(loadShader('./src/effect/backdrop-fade.frag'), {
+      uniforms: {strength}, // a signal from 0 to 1
+    }),
+  ],
+});
+COMPOSITOR.effect.background_effect = computed(() => (paused() ? null : blur));
 ```
 
 ## Per-window / layer / popup effects

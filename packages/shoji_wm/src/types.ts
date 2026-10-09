@@ -996,6 +996,11 @@ export interface CompositorEffectConfig {
    * オプトインし、コンポジターがその領域の背後にのみこのエフェクトを描画します。
    * `null` で無効化。
    *
+   * May be a signal, and shader uniforms inside it may be signals too: the
+   * compositor picks up a new value on the next frame.
+   * Signal にでき、中のシェーダーユニフォームにも Signal を使えます。値が変わると
+   * 次のフレームから反映されます。
+   *
    * @example
    * ```ts
    * COMPOSITOR.effect.background_effect = compileEffect({
@@ -1004,7 +1009,7 @@ export interface CompositorEffectConfig {
    * });
    * ```
    */
-  background_effect: CompiledEffectHandle | null;
+  background_effect: MaybeSignal<CompiledEffectHandle | null>;
   /**
    * Per-window effect factory. Called once per mapped toplevel; return `null`
    * to apply no effect to that window.

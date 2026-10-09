@@ -73,6 +73,9 @@ pub enum HostMessage {
     /// Start or end the config's input grab (`COMPOSITOR.input.grab`). While
     /// it is held, input arrives as `InputRequest::InputGrab`.
     InputGrab(crate::runtime_input_grab::RuntimeInputGrabUpdate),
+    /// `COMPOSITOR.effect.background_effect` changed after it was first read
+    /// (one of its signals moved). Replaces the effect; `None` turns it off.
+    BackgroundEffect(Option<crate::ssd::BackgroundEffectConfig>),
 }
 
 /// When a runtime that keeps a clock per output (see `SchedulerTickRequest`)

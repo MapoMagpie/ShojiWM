@@ -2941,6 +2941,12 @@ impl ShojiWM {
                     self.apply_output_compositions(compositions);
                 }
                 HostMessage::InputGrab(update) => self.apply_runtime_input_grab_update(update),
+                HostMessage::BackgroundEffect(config) => {
+                    if self.configured_background_effect != config {
+                        self.configured_background_effect = config;
+                        self.schedule_redraw();
+                    }
+                }
             }
         }
         // Swap at a quiet point of the loop rather than wherever the queue
