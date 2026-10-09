@@ -47,8 +47,13 @@ use shojiwm_lib::{
     },
 };
 
+pub use shojiwm_lib::frame_pacing::FramePacing;
+
 use crate::{
     effect::{Effect, SurfaceEffects},
+    input_grab::{InputGrab, InputGrabOptions},
+    output_composition::OutputStack,
+    overlay::{Overlay, OverlayHandle},
     reactive::{ReadSignal, untrack},
     runtime::{self, Listeners, with_registry},
     view::{Composition, Rect},
@@ -431,6 +436,13 @@ impl InputController {
     pub fn keyboard_layout(&self) -> ReadSignal<Option<KeyboardLayoutSnapshot>> {
         runtime::global().keyboard_layout.read_only()
     }
+
+    /// Take all keyboard, pointer button, scroll and swipe input until
+    /// [`InputGrab::release`]; see [`crate::input_grab`]. A new grab
+    /// replaces (and cancels) the current one.
+    pub fn grab(&self, options: InputGrabOptions) -> InputGrab {
+        crate::input_grab::grab(options)
+    }
 }
 
 pub(crate) fn reconfigure_input(force: bool) {
@@ -747,9 +759,23 @@ impl WindowController {
 pub struct EffectController;
 
 impl EffectController {
-    /// `effect.background_effect`: drawn behind everything.
+    /// `effect.background_effect`: drawn behind the regions clients ask for
+    /// through `ext-background-effect-v1` (not a full-screen backdrop).
+    /// Uniforms may be signals; the compositor follows them.
     pub fn background(&self, effect: Effect) {
-        with_registry(|registry| registry.background_effect = Some(effect));
+        self.background_with(move || Some(effect.clone()));
+    }
+
+    /// `effect.background_effect = computed(() => ...)`: re-run when a
+    /// signal it reads changes; `None` turns the effect off.
+    pub fn background_with(&self, f: impl Fn() -> Option<Effect> + 'static) {
+        with_registry(|registry| registry.background_effect = Some(Rc::new(f)));
+    }
+
+    /// `effect.overlay(output, { effect, ... })`: draw an effect over a whole
+    /// output; see [`crate::overlay`].
+    pub fn overlay(&self, output: &str, overlay: Overlay) -> Result<OverlayHandle, String> {
+        crate::overlay::create(output, overlay)
     }
 
     /// `effect.layer = (layer) => ...`.
@@ -787,6 +813,25 @@ impl RenderingController {
     /// `rendering.surfacePolicy`: e.g. ignore a lying opaque region.
     pub fn surface_policy(&self, f: impl Fn(SurfaceRef<'_>) -> Option<SurfacePolicy> + 'static) {
         with_registry(|registry| registry.surface_policy = Some(Rc::new(f)));
+    }
+
+    /// `rendering.framePacing = "throughput"`: the frame pacing of every
+    /// output.
+    pub fn frame_pacing(&self, pacing: FramePacing) {
+        self.frame_pacing_with(move |_| pacing);
+    }
+
+    /// `rendering.framePacing = (output) => ...`: per output, re-read at the
+    /// end of every turn.
+    pub fn frame_pacing_with(&self, f: impl Fn(&WaylandOutputSnapshot) -> FramePacing + 'static) {
+        with_registry(|registry| registry.frame_pacing = Some(Rc::new(f)));
+    }
+
+    /// `rendering.composition = (output) => ...`: how each output is put
+    /// together; see [`crate::output_composition`]. Re-run only when signals
+    /// it reads (or the output) change.
+    pub fn composition(&self, f: impl Fn(&WaylandOutputSnapshot) -> OutputStack + 'static) {
+        with_registry(|registry| registry.output_composition = Some(Rc::new(f)));
     }
 }
 

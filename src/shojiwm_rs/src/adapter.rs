@@ -14,10 +14,10 @@ use shojiwm_lib::{
     runtime_api::{
         ConfigRuntime, DecorationRequest, EffectRequest, HostMessage, InputRequest, LaunchContext,
         ReloadPreparation, RuntimeError, RuntimeEvent, RuntimeLauncher, RuntimeReply,
-        RuntimeRequest, WindowRequest, WorkspaceRequest,
+        RuntimeRequest, SchedulerTickRequest, WindowRequest, WorkspaceRequest,
     },
     ssd::{
-        BackgroundEffectConfig, DecorationCachedEvaluationResult, DecorationEvaluationResult,
+        DecorationCachedEvaluationResult, DecorationEvaluationResult,
         DecorationHandlerInvocation, DecorationKeyBindingInvocation,
         DecorationPointerMoveAsyncInvocation, DecorationSchedulerTick,
         DecorationWindowMoveInvocation, DecorationWindowResizeInvocation,
@@ -108,6 +108,9 @@ impl ReactiveRuntime {
     pub fn start(setup: Rc<dyn Fn()>, asset_root: Option<PathBuf>, context: LaunchContext) -> Self {
         // The reactive arena is kept: rebuilding it would restart generation
         // numbers and let stale handles alias new nodes.
+        crate::published::reset();
+        crate::overlay::reset();
+        crate::input_grab::reset();
         runtime::reset();
         LAYER_OBSERVERS.with(|observers| observers.borrow_mut().clear());
         animation::reset_clock();
@@ -156,11 +159,12 @@ fn guard<R>(f: impl FnOnce() -> Result<R, RuntimeError>) -> Result<R, RuntimeErr
     }
 }
 
-/// Start of every compositor turn: advance the clock and hand queued
-/// cross-thread messages to their handlers.
-fn begin_turn(now_ms: f64) {
-    if now_ms > 0.0 {
-        animation::set_now(now_ms);
+/// Start of every compositor turn: advance the clock (`None` for a scheduler
+/// tick, which keeps its own time) and hand queued cross-thread messages to
+/// their handlers.
+fn begin_turn(now_ms: Option<f64>) {
+    if let Some(now_ms) = now_ms {
+        animation::begin_turn(now_ms);
     }
     let channels = with_registry(|registry| registry.channels.clone());
     if !channels.is_empty() {
@@ -644,11 +648,8 @@ fn window_closed(window_id: &str) {
     entry.scope.dispose();
 }
 
-fn scheduler_tick(now_ms: f64) -> DecorationSchedulerTick {
-    batch(|| {
-        animation::run_due_timers(now_ms);
-        animation::advance_animations(now_ms);
-    });
+fn scheduler_tick(tick: SchedulerTickRequest<'_>, now_ms: f64) -> DecorationSchedulerTick {
+    batch(|| animation::tick(tick.output, tick.frame_outputs, now_ms));
     let mutation = collect_mutation();
     let dirty_layer_ids: Vec<String> = if runtime::take_layer_effects_dirty() {
         compositor::COMPOSITOR.layer.list().into_iter().map(|layer| layer.id).collect()
@@ -815,6 +816,7 @@ fn set_display_state(state: BTreeMap<String, shojiwm_lib::ssd::WaylandOutputSnap
     };
     batch(|| {
         global.outputs.set(state);
+        animation::sync_output_poll_groups();
         compositor::reconfigure_outputs(false);
         emit(|listeners| listeners.output_change.clone(), |listener| listener(&event));
     });
@@ -844,6 +846,17 @@ fn set_input_state(state: BTreeMap<String, shojiwm_lib::runtime_input::RuntimeIn
         compositor::reconfigure_input(false);
         emit(|listeners| listeners.input_change.clone(), |listener| listener(&event));
     });
+}
+
+/// Send the config's pending deltas, then whatever reactive state changed.
+fn publish() {
+    if let Err(error) = guard(|| {
+        crate::published::publish();
+        Ok(())
+    }) {
+        tracing::error!(%error, "rust config failed to publish its state");
+    }
+    runtime::publish_pending();
 }
 
 /// Ask for a tick when windows went dirty outside of a request.
@@ -891,9 +904,10 @@ impl ConfigRuntime for ReactiveRuntime {
             compositor::reconfigure_outputs(true);
             compositor::reconfigure_input(true);
             compositor::COMPOSITOR.workspace.reconfigure();
-            runtime::publish_pending();
             Ok(())
-        })
+        })?;
+        publish();
+        Ok(())
     }
 
     fn prepare_reload(&mut self) -> Result<ReloadPreparation, RuntimeError> {
@@ -906,7 +920,7 @@ impl ConfigRuntime for ReactiveRuntime {
 
     fn request(&mut self, now_ms: f64, request: RuntimeRequest<'_>) -> Result<RuntimeReply, RuntimeError> {
         let reply = guard(|| {
-            begin_turn(now_ms);
+            begin_turn((!matches!(request, RuntimeRequest::SchedulerTick(_))).then_some(now_ms));
             Ok(match request {
                 RuntimeRequest::Decoration(request) => match request {
                     DecorationRequest::Evaluate { window, preview } => evaluate(window, preview)?,
@@ -935,12 +949,10 @@ impl ConfigRuntime for ReactiveRuntime {
                         RuntimeReply::Done
                     }
                 },
-                // The monotonic clock, not the raw timestamp: frame-driven ticks carry
-                // the predicted presentation time, up to a frame ahead of the
-                // wall-clock ticks between them, and stepping back would give
-                // timers and animations uneven steps.
-                RuntimeRequest::SchedulerTick(_) => {
-                    RuntimeReply::SchedulerTick(scheduler_tick(animation::now_ms()))
+                // A frame tick carries its frame's presentation time and advances
+                // only that output's clock; a timer tick carries wall-clock time.
+                RuntimeRequest::SchedulerTick(tick) => {
+                    RuntimeReply::SchedulerTick(scheduler_tick(tick, now_ms))
                 }
                 RuntimeRequest::Window(request) => match request {
                     WindowRequest::Resize { window_id, event } => {
@@ -1012,16 +1024,15 @@ impl ConfigRuntime for ReactiveRuntime {
                         let invoked = batch(|| emit(|listeners| listeners.gesture_swipe.clone(), |listener| listener(event)));
                         RuntimeReply::PointerHook(pointer_hook(invoked))
                     }
-                    // The Rust SDK does not start input grabs.
-                    InputRequest::InputGrab { .. } => RuntimeReply::Unhandled,
+                    InputRequest::InputGrab { grab_id, event } => {
+                        let invoked = batch(|| crate::input_grab::dispatch(grab_id, event));
+                        RuntimeReply::PointerHook(pointer_hook(invoked))
+                    }
                 },
                 RuntimeRequest::Effect(request) => match request {
-                    EffectRequest::Background => RuntimeReply::BackgroundEffect(
-                        with_registry(|registry| registry.background_effect.clone())
-                            .map(|effect| BackgroundEffectConfig {
-                                effect: untrack(|| effect.compile()),
-                            }),
-                    ),
+                    EffectRequest::Background => {
+                        RuntimeReply::BackgroundEffect(crate::published::background_effect())
+                    }
                     EffectRequest::Layers { output_name, layers } => {
                         RuntimeReply::LayerEffects(layer_effects(output_name, layers))
                     }
@@ -1035,13 +1046,13 @@ impl ConfigRuntime for ReactiveRuntime {
                 }
             })
         });
-        runtime::publish_pending();
+        publish();
         reply
     }
 
     fn post(&mut self, now_ms: f64, event: RuntimeEvent) {
         let result = guard(|| {
-            begin_turn(now_ms);
+            begin_turn(Some(now_ms));
             match event {
                 RuntimeEvent::DisplayState(state) => set_display_state(state),
                 RuntimeEvent::InputState(state) => set_input_state(state),
@@ -1065,7 +1076,7 @@ impl ConfigRuntime for ReactiveRuntime {
         if let Err(error) = result {
             tracing::error!(%error, "rust config failed to handle an event");
         }
-        runtime::publish_pending();
+        publish();
         wake_if_dirty();
     }
 
@@ -1080,5 +1091,7 @@ impl ConfigRuntime for ReactiveRuntime {
             Ok(())
         });
         runtime::publish_pending();
+        crate::overlay::reset();
+        crate::input_grab::reset();
     }
 }

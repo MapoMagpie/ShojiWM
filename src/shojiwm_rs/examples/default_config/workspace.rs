@@ -451,6 +451,14 @@ impl Workspace {
         }
     }
 
+    /// `set_visible` that also stops a running workspace slide/fade.
+    pub fn show_instantly(&mut self, visible: bool) {
+        for window in self.windows.clone() {
+            cancel_workspace_visual_animation(window);
+        }
+        self.set_visible(visible);
+    }
+
     pub fn prepare_workspace_transition(&mut self, offset_y: f64, opacity: f64) {
         self.visibility_animation_token += 1;
         for window in self.windows.clone() {
@@ -782,12 +790,19 @@ impl Workspace {
 
     /// "Go to this window": center it even when already visible.
     pub fn pan_to_window(&mut self, window: Window) {
+        self.pan_to_window_with(window, true);
+    }
+
+    pub fn pan_to_window_with(&mut self, window: Window, animate: bool) {
         if !self.is_tiled || !self.should_tile(window) {
             return;
         }
         self.active_window = Some(window);
         self.scroll_to_window(window, true);
-        self.apply_layout(LayoutOptions::default());
+        self.apply_layout(LayoutOptions {
+            animate: Some(animate),
+            ..LayoutOptions::default()
+        });
     }
 
     pub fn focus_window_under_pointer(&mut self, window: Window) -> Option<Window> {
@@ -985,7 +1000,8 @@ impl Workspace {
         }
         let handle = self.handle.clone();
         let id = self.id;
-        let timer = set_interval(interval, move || {
+        // The glide steps once per frame of the workspace's monitor.
+        let timer = create_poll(interval, self.monitor.clone(), move |_| {
             handle.kinetic_frame(id, token);
         });
         if let Some(kinetic) = &mut self.kinetic {

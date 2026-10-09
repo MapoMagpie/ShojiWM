@@ -132,6 +132,8 @@ impl Control {
             state.closed = Some(reason.to_owned());
             self.changed.notify_waiters();
             DIRTY.store(true, Ordering::Release);
+            // A runtime that polls (`is_closed`) instead of awaiting learns it next tick.
+            self.host.wake();
         }
     }
 
@@ -142,6 +144,7 @@ impl Control {
             state.closed = Some("Output overlay timed out".into());
             self.changed.notify_waiters();
             DIRTY.store(true, Ordering::Release);
+            self.host.wake();
         }
         state.closed.is_none()
     }
@@ -151,6 +154,19 @@ impl Control {
         state.ready = true;
         if self.persistent { state.deadline = None; }
         self.changed.notify_waiters();
+        drop(state);
+        self.host.wake();
+    }
+
+    /// The first frame with the overlay has been rendered (what `wait(false)` awaits).
+    pub fn is_ready(&self) -> bool {
+        self.state.lock().unwrap().ready
+    }
+
+    /// Disposed, replaced, timed out or its runtime stopped (what `wait(true)` awaits).
+    pub fn is_closed(&self) -> bool {
+        self.alive();
+        self.state.lock().unwrap().closed.is_some()
     }
 
     pub fn update(&self, effect: CompiledEffect) -> io::Result<()> {

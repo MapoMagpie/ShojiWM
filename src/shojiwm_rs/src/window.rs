@@ -37,6 +37,7 @@ pub(crate) struct WindowSignals {
     pub icon: Signal<Option<WindowIconSnapshot>>,
     pub interaction: Signal<DecorationInteractionSnapshot>,
     pub decoration: Signal<WindowDecorationStateSnapshot>,
+    pub output: Signal<Option<String>>,
 }
 
 impl WindowSignals {
@@ -58,6 +59,7 @@ impl WindowSignals {
             icon: scope.signal(snapshot.icon.clone()),
             interaction: scope.signal(snapshot.interaction.clone()),
             decoration: scope.signal(snapshot.decoration),
+            output: scope.signal(snapshot.output_name.clone()),
         }
     }
 
@@ -79,6 +81,7 @@ impl WindowSignals {
         self.icon.set(snapshot.icon.clone());
         self.interaction.set(snapshot.interaction.clone());
         self.decoration.set(snapshot.decoration);
+        self.output.set(snapshot.output_name.clone());
     }
 }
 
@@ -129,9 +132,22 @@ window_signals! {
     icon: Option<WindowIconSnapshot>,
     interaction: DecorationInteractionSnapshot,
     decoration: WindowDecorationStateSnapshot,
+    /// The output the window belongs to: the one containing its center, else
+    /// one it overlaps, else the nearest (`window.output`).
+    output: Option<String>,
 }
 
 impl Window {
+    /// [`create_poll`](crate::animation::create_poll) on the frames of the
+    /// window's output (`window.createPoll`); it moves with the window.
+    pub fn create_poll(
+        &self,
+        interval_ms: f64,
+        f: impl Fn(&crate::animation::PollHandle) + 'static,
+    ) -> crate::animation::PollHandle {
+        crate::animation::create_poll(interval_ms, self.output(), f)
+    }
+
     pub(crate) fn entry(&self) -> Option<Rc<WindowEntry>> {
         runtime::WINDOWS.with(|windows| windows.borrow().get(self.slot, self.generation))
     }

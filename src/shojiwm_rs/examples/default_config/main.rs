@@ -9,6 +9,7 @@
 //! Shaders and icons are shared with the TypeScript config: relative asset
 //! paths resolve against `packages/config`.
 
+mod flip_3d;
 mod island_glass;
 mod window_animation;
 mod window_manager;
@@ -34,6 +35,7 @@ use shojiwm_rs::{
 };
 
 use crate::{
+    flip_3d::Flip3D,
     island_glass::island_glass,
     window_manager::{
         TITLEBAR_HEIGHT, WINDOW_BORDER_PX, WINDOW_STATE_FULLSCREEN, WINDOW_STATE_MINIMIZE_VISUAL_IDLE,
@@ -95,10 +97,31 @@ fn setup() {
         context.client_preference.unwrap_or(WindowDecorationModeSnapshot::Server)
     });
 
+    // Triple buffering: render the next frame while the previous one waits
+    // for its vblank.
+    COMPOSITOR.rendering.frame_pacing(FramePacing::Throughput);
+
     let wm = WindowManager::new(natural_root_rect);
+    // Flip 3D window switcher (Super+Tab, see flip_3d.rs).
+    let flip = {
+        let wm = wm.clone();
+        Flip3D::new(wm.clone(), move |window| {
+            if window.state(&WINDOW_STATE_FULLSCREEN).get_untracked() {
+                FULLSCREEN_Z_INDEX
+            } else {
+                untrack(|| window_z_index(&wm, window))
+            }
+        })
+    };
+    {
+        let flip = flip.clone();
+        COMPOSITOR
+            .rendering
+            .composition(move |output| flip.compose(output).unwrap_or_else(OutputStack::default_stacking));
+    }
     let ipc = setup_ipc(&wm);
     setup_processes();
-    setup_key_bindings(&wm, &ipc);
+    setup_key_bindings(&wm, &ipc, &flip);
     setup_outputs_and_input();
     wm.with(|wm| {
         wm.configure_workspace_gesture_speed(WorkspaceGestureSpeed {
@@ -113,9 +136,9 @@ fn setup() {
             workspace_scroll_snap_breakout_px: 48.0,
         })
     });
-    setup_effects();
+    setup_effects(&flip);
     setup_events(&wm, &ipc);
-    setup_composition(&wm);
+    setup_composition(&wm, &flip);
 }
 
 /// External IPC for the bar:
@@ -344,7 +367,7 @@ fn spawn(command: &str) {
     COMPOSITOR.process.spawn(Command::shell(command));
 }
 
-fn setup_key_bindings(wm: &WindowManager, ipc: &Ipc) {
+fn setup_key_bindings(wm: &WindowManager, ipc: &Ipc, flip: &Flip3D) {
     COMPOSITOR.key.bind("terminal", "Super+T", || {
         COMPOSITOR.process.spawn(Command::exec(["kitty"]));
     });
@@ -405,6 +428,13 @@ fn setup_key_bindings(wm: &WindowManager, ipc: &Ipc) {
         });
     };
     bind("toggle-tiling-mode", "Super+S", true, |wm| wm.toggle_current_workspace_tiling());
+    {
+        let (wm, flip) = (wm.clone(), flip.clone());
+        COMPOSITOR.key.bind("flip-3d", "Super+Tab", move || {
+            let monitor = wm.with(|wm| wm.current_monitor_name());
+            flip.open(&monitor);
+        });
+    }
     bind("close-focused-window", "Super+Q", false, |wm| wm.close_focused_window());
     bind("toggle-focused-window-maximize", "Super+M", false, |wm| wm.toggle_focused_window_maximize());
     bind("toggle-focused-window-fullscreen", "Super+F", false, |wm| {
@@ -495,11 +525,37 @@ fn setup_outputs_and_input() {
     COMPOSITOR.pointer.bind_window_resize_modifier("Super");
 }
 
-fn backdrop_blur() -> Effect {
+/// Window backdrop effects end with this stage so they can fade back in
+/// after the Flip 3D switcher closes.
+fn backdrop_fade(flip: &Flip3D) -> ShaderStage {
+    shader_stage("./src/effect/backdrop-fade.frag").uniform("strength", flip.backdrop_strength())
+}
+
+fn backdrop_blur(flip: &Flip3D) -> Effect {
     Effect::new(backdrop_source())
         .capture_padding(24)
         .invalidate(Invalidate::on_source_damage_box(8))
+        .preserve_alpha()
         .stage(dual_kawase_blur(4, 2))
+        .stage(backdrop_fade(flip))
+}
+
+/// Where a (non-fullscreen) window sits in the stack; higher is on top.
+fn window_z_index(wm: &WindowManager, window: Window) -> i32 {
+    let stack_z_index = wm.window_z_index(window).get();
+    if !window.state(&WINDOW_STATE_WORKSPACE_TILED).get() {
+        return stack_z_index;
+    }
+    let offset = stack_z_index.clamp(-WINDOW_STACK_Z_INDEX_RANGE, WINDOW_STACK_Z_INDEX_RANGE);
+    if !window.state(&WINDOW_STATE_TILED).get() {
+        FLOATING_WINDOW_Z_INDEX_BASE + offset
+    } else if window.state(&WINDOW_STATE_TILE_REORDERING).get() {
+        REORDERING_TILED_WINDOW_Z_INDEX
+    } else if window.is_focused().get() {
+        FOCUSED_TILED_WINDOW_Z_INDEX
+    } else {
+        offset
+    }
 }
 
 /// The blur clipped to the surface's own alpha, so its transparency has to
@@ -518,8 +574,14 @@ fn masked_blur(mask: Source, capture_padding: i32) -> Effect {
         )
 }
 
-fn setup_effects() {
-    COMPOSITOR.effect.background(backdrop_blur());
+fn setup_effects(flip: &Flip3D) {
+    // Blur behind the regions clients ask for (ext-background-effect). Off
+    // while Flip 3D is shown, then faded back in like the window backdrops.
+    let background_blur = backdrop_blur(flip);
+    let blur_suspended = flip.blur_suspended();
+    COMPOSITOR
+        .effect
+        .background_with(move || (!blur_suspended.get()).then(|| background_blur.clone()));
 
     let layer_blur_mask = SurfaceEffect::new(masked_blur(layer_source(), 24));
     let island = island_glass();
@@ -663,8 +725,9 @@ fn setup_events(wm: &WindowManager, ipc: &Ipc) {
 }
 
 /// `COMPOSITOR.window.composition`: frame, titlebar and placement.
-fn setup_composition(wm: &WindowManager) {
+fn setup_composition(wm: &WindowManager, flip: &Flip3D) {
     let wm = wm.clone();
+    let flip = flip.clone();
     COMPOSITOR.window.composition(move |window| {
         // Read in the body on purpose: these switch the whole structure, so a
         // change re-runs this function (like the TSX version).
@@ -689,27 +752,10 @@ fn setup_composition(wm: &WindowManager) {
         // Force no corner rounding by CSD.
         let tiled = true;
 
-        let stack_z_index = wm.window_z_index(window);
-        let workspace_tiled = window.state(&WINDOW_STATE_WORKSPACE_TILED);
-        let window_tiled = window.state(&WINDOW_STATE_TILED);
-        let reordering = window.state(&WINDOW_STATE_TILE_REORDERING);
-        let z_index = memo(move || {
-            if !workspace_tiled.get() {
-                return stack_z_index.get();
-            }
-            let offset = stack_z_index
-                .get()
-                .clamp(-WINDOW_STACK_Z_INDEX_RANGE, WINDOW_STACK_Z_INDEX_RANGE);
-            if !window_tiled.get() {
-                FLOATING_WINDOW_Z_INDEX_BASE + offset
-            } else if reordering.get() {
-                REORDERING_TILED_WINDOW_Z_INDEX
-            } else if window.is_focused().get() {
-                FOCUSED_TILED_WINDOW_Z_INDEX
-            } else {
-                offset
-            }
-        });
+        let z_index = {
+            let wm = wm.clone();
+            memo(move || window_z_index(&wm, window))
+        };
         let minimize_visual_idle = window.state(&WINDOW_STATE_MINIMIZE_VISUAL_IDLE);
         let workspace_visible = window.state(&WINDOW_STATE_WORKSPACE_VISIBLE);
         let tile_dragging = window.state(&WINDOW_STATE_TILE_DRAGGING);
@@ -738,12 +784,35 @@ fn setup_composition(wm: &WindowManager) {
         let border_color = window
             .is_focused()
             .map(|focused| if *focused { hex("#d7ba7d") } else { hex("#4f5666") });
+        // A soft drop shadow under the frame; the focused window floats a bit
+        // higher. The window in front of the Flip 3D stack glows white instead
+        // (it fits in the switcher's texture margin).
+        let selected_window_id = flip.selected_window_id();
+        let window_shadow = memo(move || {
+            if selected_window_id.with(|id| id.as_deref() == Some(&*window.id())) {
+                vec![BoxShadow {
+                    spread: 4.0,
+                    ..shadow(0.0, 0.0, 28.0, hex("#ffffffd0"))
+                }]
+            } else if window.is_focused().get() {
+                vec![BoxShadow {
+                    spread: -2.0,
+                    ..shadow(0.0, 10.0, 32.0, hex("#00000090"))
+                }]
+            } else {
+                vec![BoxShadow {
+                    spread: -2.0,
+                    ..shadow(0.0, 4.0, 16.0, hex("#00000060"))
+                }]
+            }
+        });
         let frame = || {
             WindowBorder::new()
                 .style(
                     Style::new()
                         .border(WINDOW_BORDER_PX, border_color)
                         .border_radius(10.0)
+                        .box_shadow(window_shadow)
                         .background(hex("#10131900"))
                         .padding(0.0),
                 )
@@ -757,14 +826,21 @@ fn setup_composition(wm: &WindowManager) {
                 .child(frame().child(ClientWindow::new()));
         }
 
-        managed
-            .z_index(z_index)
-            .child(frame().child(Flex::row().child(decorated_contents(window, is_terminal))))
+        // No backdrop effects while the Flip 3D switcher shows the windows as
+        // textures: there is nothing under a window there to blur. Read here
+        // on purpose: it switches the structure.
+        let blur_suspended = flip.blur_suspended().get();
+        managed.z_index(z_index).child(frame().child(Flex::row().child(decorated_contents(
+            window,
+            is_terminal,
+            (!blur_suspended).then_some(&flip),
+        ))))
     });
 }
 
-/// Titlebar and client area of a server-side decorated window.
-fn decorated_contents(window: Window, is_terminal: bool) -> Element {
+/// Titlebar and client area of a server-side decorated window. Without
+/// `blur` (Flip 3D is open) there are no backdrop effects.
+fn decorated_contents(window: Window, is_terminal: bool, blur: Option<&Flip3D>) -> Element {
     let titlebar_background = window
         .is_focused()
         .map(|focused| if *focused { hex("#1f243080") } else { hex("#2a2f3a80") });
@@ -798,10 +874,15 @@ fn decorated_contents(window: Window, is_terminal: bool) -> Element {
     };
 
     if is_terminal {
+        let titlebar = Flex::row().style(titlebar_style).children(titlebar_children());
+        let Some(flip) = blur else {
+            return Flex::column().child(titlebar).child(ClientWindow::new());
+        };
         // Terminals are translucent: the whole window sits on liquid glass.
         let background = Effect::new(backdrop_source())
             .capture_padding(24)
             .invalidate(Invalidate::on_source_damage_box(8))
+            .preserve_alpha()
             .stage(dual_kawase_blur(4, 2))
             .stage(
                 shader_stage("./src/effect/liquid-glass.frag")
@@ -811,21 +892,22 @@ fn decorated_contents(window: Window, is_terminal: bool) -> Element {
                     .uniform("distortion_strength", 0.15)
                     .uniform("chromatic_shift_px", 3.0)
                     .uniform("glass_tint", 0.9),
-            );
+            )
+            .stage(backdrop_fade(flip));
         return ShaderEffect::new(background)
             .direction(Direction::Column)
-            .child(Flex::row().style(titlebar_style).children(titlebar_children()))
+            .child(titlebar)
             .child(ClientWindow::new());
     }
 
-    Flex::column()
-        .child(
-            ShaderEffect::new(backdrop_blur())
-                .direction(Direction::Row)
-                .style(titlebar_style)
-                .children(titlebar_children()),
-        )
-        .child(ClientWindow::new())
+    let titlebar = match blur {
+        Some(flip) => ShaderEffect::new(backdrop_blur(flip))
+            .direction(Direction::Row)
+            .style(titlebar_style)
+            .children(titlebar_children()),
+        None => Flex::row().style(titlebar_style).children(titlebar_children()),
+    };
+    Flex::column().child(titlebar).child(ClientWindow::new())
 }
 
 /// How long the pointer has to rest on a title bar button before its tooltip shows.

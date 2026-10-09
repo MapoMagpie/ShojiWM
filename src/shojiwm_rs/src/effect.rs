@@ -28,7 +28,7 @@ use shojiwm_lib::ssd::{
 
 use crate::{
     assets,
-    reactive::{Memo, Prop, Signal},
+    reactive::{Memo, Prop, ReadSignal, Signal},
 };
 
 /// A shader uniform value.
@@ -79,6 +79,11 @@ macro_rules! uniform_from {
         impl From<Memo<$ty>> for Prop<Uniform> {
             fn from(memo: Memo<$ty>) -> Self {
                 Prop::derive(move || memo.get().into())
+            }
+        }
+        impl From<ReadSignal<$ty>> for Prop<Uniform> {
+            fn from(signal: ReadSignal<$ty>) -> Self {
+                Prop::derive(move || signal.get().into())
             }
         }
         impl From<Prop<$ty>> for Prop<Uniform> {

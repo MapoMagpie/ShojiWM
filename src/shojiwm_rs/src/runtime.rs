@@ -14,6 +14,7 @@ use std::{
 
 use shojiwm_lib::{
     activation_environment::{RuntimeEnvOperation, RuntimeEnvUpdates},
+    frame_pacing::FramePacing,
     config::RuntimeOutputConfig,
     cursor::RuntimeCursorConfigUpdate,
     keyboard_layout::KeyboardLayoutSnapshot,
@@ -40,6 +41,7 @@ use crate::{
         DisableEvent, EnableEvent, InputChangeEvent, OutputChangeEvent, SurfaceRef,
     },
     effect::{Effect, SurfaceEffects},
+    output_composition::OutputStack,
     reactive::{Observer, Scope, Signal},
     view::{Composition, ManagedWindow, ViewContext, ViewTree},
     window::{Window, WindowSignals},
@@ -81,6 +83,8 @@ pub(crate) struct Listeners {
 }
 
 pub(crate) type EffectFn<S> = Rc<dyn Fn(&S) -> SurfaceEffects>;
+/// A value the config computes for each output.
+pub(crate) type PerOutputFn<T> = Rc<dyn Fn(&WaylandOutputSnapshot) -> T>;
 pub(crate) type SurfacePolicyFn = Rc<dyn Fn(SurfaceRef<'_>) -> Option<SurfacePolicy>>;
 /// Per-window state signals, keyed by state key name and value type.
 pub(crate) type WindowStateSlots = HashMap<(&'static str, TypeId), Rc<dyn Any>>;
@@ -128,7 +132,9 @@ pub(crate) struct Registry {
     pub desired_input: Option<RuntimeInputConfig>,
     pub workspace_configure: Option<WorkspaceConfigureFn>,
     pub desired_workspaces: Option<RuntimeWorkspaceConfigUpdate>,
-    pub background_effect: Option<Effect>,
+    pub background_effect: Option<Rc<dyn Fn() -> Option<Effect>>>,
+    pub frame_pacing: Option<PerOutputFn<FramePacing>>,
+    pub output_composition: Option<PerOutputFn<OutputStack>>,
     pub layer_effect: Option<EffectFn<WaylandLayerSnapshot>>,
     pub popup_effect: Option<EffectFn<WaylandPopupSnapshot>>,
     pub window_effect: Option<Rc<dyn Fn(Window) -> SurfaceEffects>>,
@@ -344,6 +350,12 @@ pub(crate) fn emit<L: ?Sized>(select: impl FnOnce(&Listeners) -> Vec<Rc<L>>, cal
 pub(crate) fn send(message: HostMessage) {
     if let Some(host) = host() {
         host.send(message);
+    }
+}
+
+pub(crate) fn send_all(messages: Vec<HostMessage>) {
+    if let Some(host) = host() {
+        host.send_all(messages);
     }
 }
 

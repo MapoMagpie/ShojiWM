@@ -542,6 +542,9 @@ pub struct HybridWindowManager {
     /// Last restore from minimized (wall clock), to recognise the activate
     /// that arrives in the same taskbar click.
     last_restore_at: HashMap<Window, f64>,
+    /// Set while `activate_window_by_id_instant` runs: state changes it makes
+    /// skip their animations.
+    instant_transitions: bool,
     /// Where the pointer was when a kinetic scroll started, per workspace.
     kinetic_frame_context: HashMap<u64, (Option<PointerMovePointSnapshot>, String)>,
 }
@@ -581,6 +584,7 @@ impl HybridWindowManager {
             deferred_initial_layout: HashSet::new(),
             presented_windows: HashSet::new(),
             last_restore_at: HashMap::new(),
+            instant_transitions: false,
             kinetic_frame_context: HashMap::new(),
         }
     }
@@ -1378,7 +1382,7 @@ impl HybridWindowManager {
             if minimized {
                 set(window, &WINDOW_STATE_MINIMIZE_VISUAL_IDLE, true);
             }
-            schedule_minimize_animation(window, minimized);
+            schedule_minimize_animation(window, minimized, self.instant_transitions);
         }
         if let Some(id) = workspace
             && self.workspace_by_id(id).expect("live").is_tiled
@@ -1596,6 +1600,18 @@ impl HybridWindowManager {
     /// Animated switch to `target_index` on `monitor`, sliding in the
     /// direction implied by the current index.
     pub fn switch_workspace_to(&mut self, monitor: &str, target_index: u32, focus_active_after: bool) {
+        self.switch_workspace_to_with(monitor, target_index, focus_active_after, false);
+    }
+
+    /// [`switch_workspace_to`](Self::switch_workspace_to); `instant` jumps
+    /// there without the slide.
+    pub fn switch_workspace_to_with(
+        &mut self,
+        monitor: &str,
+        target_index: u32,
+        focus_active_after: bool,
+        instant: bool,
+    ) {
         self.workspace_gesture = None;
         self.sync_workspaces();
         if monitor.is_empty() || target_index < 1 {
@@ -1620,22 +1636,31 @@ impl HybridWindowManager {
             workspace.set_visible(active);
         }
 
-        self.ws(from).animate_workspace_transition(WorkspaceTransition {
-            from_offset_y: 0.0,
-            to_offset_y: -direction * distance,
-            from_opacity: 1.0,
-            to_opacity: 0.0,
-            visible_after: false,
-        });
-        self.ws(to).prepare_workspace_transition(direction * distance, 0.0);
-        self.ws(to).apply_layout(LayoutOptions::default());
-        self.ws(to).animate_workspace_transition(WorkspaceTransition {
-            from_offset_y: direction * distance,
-            to_offset_y: 0.0,
-            from_opacity: 0.0,
-            to_opacity: 1.0,
-            visible_after: true,
-        });
+        if instant {
+            self.ws(from).show_instantly(false);
+            self.ws(to).show_instantly(true);
+            self.ws(to).apply_layout(LayoutOptions {
+                animate: Some(false),
+                ..LayoutOptions::default()
+            });
+        } else {
+            self.ws(from).animate_workspace_transition(WorkspaceTransition {
+                from_offset_y: 0.0,
+                to_offset_y: -direction * distance,
+                from_opacity: 1.0,
+                to_opacity: 0.0,
+                visible_after: false,
+            });
+            self.ws(to).prepare_workspace_transition(direction * distance, 0.0);
+            self.ws(to).apply_layout(LayoutOptions::default());
+            self.ws(to).animate_workspace_transition(WorkspaceTransition {
+                from_offset_y: direction * distance,
+                to_offset_y: 0.0,
+                from_opacity: 0.0,
+                to_opacity: 1.0,
+                visible_after: true,
+            });
+        }
         // Callers focusing a different window afterwards opt out, so the
         // resulting focus callbacks do not stomp on their pan.
         if focus_active_after {
@@ -1771,6 +1796,17 @@ impl HybridWindowManager {
     /// "Go to this window" for the dock: unminimize, switch workspace, pan,
     /// focus. Returns whether the window exists.
     pub fn activate_window_by_id(&mut self, id: &str) -> bool {
+        self.activate_window_by_id_with(id, false)
+    }
+
+    /// [`activate_window_by_id`](Self::activate_window_by_id) without the
+    /// window manager's own animations and without the minimize-raise toggle:
+    /// the caller (e.g. the Flip 3D switcher) animates the change itself.
+    pub fn activate_window_by_id_instant(&mut self, id: &str) -> bool {
+        self.activate_window_by_id_with(id, true)
+    }
+
+    fn activate_window_by_id_with(&mut self, id: &str, instant: bool) -> bool {
         let Some(window) = self.find_window_by_id(id) else {
             return false;
         };
@@ -1778,20 +1814,62 @@ impl HybridWindowManager {
             return false;
         };
         if get(window, &WINDOW_STATE_MINIMIZED) {
+            self.instant_transitions = instant;
             self.set_minimized(window, false);
-        } else if self.minimize_on_reactivate(window, Some(workspace)) {
+            self.instant_transitions = false;
+        } else if !instant && self.minimize_on_reactivate(window, Some(workspace)) {
             return true;
         }
         let (monitor, index, tiled) = {
             let ws = self.workspace_by_id(workspace).expect("live");
             (ws.monitor.clone(), ws.index, ws.is_tiled)
         };
-        self.switch_workspace_to(&monitor, index, false);
+        self.switch_workspace_to_with(&monitor, index, false, instant);
         if tiled {
-            self.ws(workspace).pan_to_window(window);
+            self.ws(workspace).pan_to_window_with(window, !instant);
         }
         window.focus();
         true
+    }
+
+    /// Every managed window across all workspaces, most recently focused
+    /// first (the focused window leads).
+    pub fn list_windows_by_recent_use(&self) -> Vec<Window> {
+        let last_use = |window: Window| {
+            if window.is_focused().get_untracked() {
+                f64::INFINITY
+            } else {
+                self.last_focused_at.get(&window.id()).copied().unwrap_or(0.0)
+            }
+        };
+        let mut windows: Vec<(usize, Window, f64)> = self
+            .list_windows()
+            .into_iter()
+            .enumerate()
+            .map(|(order, window)| (order, window, last_use(window)))
+            .collect();
+        windows.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+        windows.into_iter().map(|(_, window, _)| window).collect()
+    }
+
+    /// Whether `window` is on screen on `monitor` right now: its workspace is
+    /// the active one there and it is not minimized.
+    pub fn is_window_shown_on(&self, window: Window, monitor: &str) -> bool {
+        self.find_workspace_for_window(window)
+            .and_then(|id| self.workspace_by_id(id))
+            .is_some_and(|workspace| {
+                workspace.monitor == monitor
+                    && workspace.is_active()
+                    && !get(window, &WINDOW_STATE_MINIMIZED)
+            })
+    }
+
+    /// Every managed window across all workspaces.
+    pub fn list_windows(&self) -> Vec<Window> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| workspace.list_windows())
+            .collect()
     }
 
     pub fn activate(&mut self, monitor: &str, index: u32) {
@@ -2846,7 +2924,18 @@ fn schedule_close_animation(window: Window) {
     );
 }
 
-fn schedule_minimize_animation(window: Window, minimized: bool) {
+fn schedule_minimize_animation(window: Window, minimized: bool, instant: bool) {
+    if instant {
+        // Replace whatever the channel holds with its end pose.
+        let rest = delta(if minimized { 120.0 } else { 0.0 });
+        let opacity = if minimized { 0.0 } else { 1.0 };
+        window.schedule_animation(
+            ManagedAnimation::new(MINIMIZE_ANIMATION_CHANNEL)
+                .rect(Some(rest), rest, 1, Easing::Linear, AnimationMode::Add)
+                .opacity(Some(opacity), opacity, 1, Easing::Linear, AnimationMode::Override),
+        );
+        return;
+    }
     let duration = OPEN_CLOSE_ANIMATION_DURATION as u64;
     let (rect_from, rect_to, rect_easing) = if minimized {
         (delta(0.0), delta(120.0), WINDOW_MINIMIZE_RECT_EASING)
